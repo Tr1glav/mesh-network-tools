@@ -1002,3 +1002,105 @@ def ota_slow_test(ctx):
     ctx.check("номер чанка сбрасывается на старте сессии",
               re.search(r"otaSlowSent\s*=\s*0\s*;", start) is not None,
               "в otaSlowStart нет сброса otaSlowSent")
+
+
+# Места, которые обязаны спрашивать «идёт ли ЛЮБАЯ сессия», а не только фазу быстрого режима.
+# Список именно перечислением, а не поиском по всем файлам: каждая строка здесь — это
+# найденный способ сломать идущую медленную сессию, и добавлять её в список должен человек,
+# который понимает, чем это место опасно. Поиск «где ещё остался otaSessionActive» ниже
+# отдельной проверкой и тоже не пропустит новое место.
+#
+# (файл прошивки, имя функции или маркер, чем это опасно для сессии)
+ANY_SESSION_SITES = (
+    ("lib/meshcore/src/coordinator_tasks.cpp", "coordinatorTasksTick",
+     "рассылка времени раз в пять минут падает прямо в фазу данных «маятника»"),
+    ("lib/meshcore/src/mqtt.cpp", "/cmd/send",
+     "команда из Home Assistant выходит в эфир поверх чанка"),
+    ("lib/meshcore/src/web.cpp", "void webTick(",
+     "очередь настроек узла выходит в эфир поверх чанка"),
+    ("lib/meshcore/src/web.cpp", "void otaHandleSensorsConfig(",
+     "настройка узла со страницы уходит в эфир"),
+    ("lib/meshcore/src/web.cpp", "void otaHandleSensorsHello(",
+     "опрос узлов уходит в эфир"),
+    ("lib/meshcore/src/web.cpp", "void otaHandleFwCheck(",
+     "проверка обновлений начинает загрузку и может тронуть /ota.bin"),
+    ("lib/meshcore/src/fwupdate.cpp", "void fwUpdateTick(",
+     "автообновление делает remove + rename /ota.bin под открытым хэндлом сессии"),
+    ("lib/meshcore/src/support.cpp", "void supportPingTick(",
+     "блокирующий POST останавливает главный цикл на сотни миллисекунд"),
+)
+
+
+def any_session_test(ctx):
+    """Медленную сессию не ломает остальная прошивка.
+
+    Медленный режим намеренно не занимает otaPhase, поэтому otaSessionActive() к нему слеп.
+    Это и было главной причиной, по которой сессия не доживала до конца: её ломала рассылка
+    времени, команда из Home Assistant, автообновление и заливка образа со страницы. Сессия
+    идёт ЧАСАМИ — попасть в неё успевает почти всё.
+
+    Проверяется, что опасные места спрашивают otaAnySessionActive(), и что нигде в прошивке
+    не осталось otaSessionActive() без пояснения, почему там нужна именно фаза.
+    """
+    core_ota = (ctx.core / "src/ota.cpp").read_text(encoding="utf-8")
+    ctx.check("ядро даёт общий предикат занятости прошивки",
+              re.search(r"bool\s+otaAnySessionActive\s*\(\s*\)\s*\{", core_ota) is not None,
+              "в ota.cpp ядра нет otaAnySessionActive")
+
+    # Предикат обязан знать про все три состояния: быстрая раздача, быстрый приём, медленный
+    # режим. Без приёма он не годится для платы, которая образ ПРИНИМАЕТ, — а её страница
+    # тоже умеет писать во флеш.
+    body = ctx.grab(ctx.core / "src/ota.cpp", "bool otaAnySessionActive(")
+    for name, what in (("otaSessionActive", "быструю раздачу"),
+                       ("otaActive", "быстрый приём"),
+                       ("otaSlowOn", "медленный режим")):
+        ctx.check("общий предикат учитывает %s" % what, name in body,
+                  "otaAnySessionActive не смотрит на %s" % name)
+
+    # Предикат должен быть доступен роли-приёмнику: если он определён внутри блока
+    # отправителя, плата без раздачи его не слинкует — и проверка выше пройдёт впустую.
+    sender_block = core_ota.find("#if FEATURE_MESH_OTA_SENDER")
+    sender_end = core_ota.find("#endif // FEATURE_MESH_OTA_SENDER")
+    at = core_ota.find("bool otaAnySessionActive()")
+    ctx.check("общий предикат доступен и роли-приёмнику",
+              not (sender_block < at < sender_end),
+              "otaAnySessionActive определён внутри #if FEATURE_MESH_OTA_SENDER — плата, "
+              "которая только принимает образ, его не слинкует")
+
+    # Перечисленные места спрашивают общий предикат.
+    for rel, marker, danger in ANY_SESSION_SITES:
+        path = ctx.tree / "meshcore-fork" / rel
+        if not path.is_file():
+            continue
+        src = path.read_text(encoding="utf-8")
+        at = src.find(marker)
+        if at < 0:
+            ctx.check("место найдено: %s (%s)" % (marker, rel), False,
+                      "маркер не найден — проверка ослепла, поправьте ANY_SESSION_SITES")
+            continue
+        # Смотрим тело от маркера до конца функции (или до следующего определения).
+        chunk = src[at:at + 3000]
+        ctx.check("%s спрашивает общий предикат" % marker,
+                  "otaAnySessionActive()" in chunk, danger)
+
+    # Обратная сторона: нигде не осталось слепого предиката без объяснения. Законных мест
+    # ровно два — сам otaSessionActive в ядре и разбор ota:fail быстрой сессии, — и оба
+    # помечены словом «фаза» в комментарии рядом.
+    stray = []
+    for sub in ("meshcore-fork", "tdeck"):
+        root = ctx.tree / sub
+        if not root.is_dir():
+            continue
+        for p in sorted(list(root.glob("lib/meshcore/src/*.cpp")) + list(root.glob("src/*.cpp"))):
+            txt = p.read_text(encoding="utf-8")
+            for m in re.finditer(r"otaSessionActive\s*\(", txt):
+                line_start = txt.rfind("\n", 0, m.start()) + 1
+                # Пояснение ищем в трёх строках выше вызова.
+                before = txt[max(0, line_start - 300):line_start]
+                if "фаза" in before or "фазу" in before or "фазе" in before:
+                    continue
+                line_no = txt.count("\n", 0, m.start()) + 1
+                stray.append("%s:%d" % (p.relative_to(ctx.tree), line_no))
+    ctx.check("слепой к медленному режиму предикат нигде не остался без объяснения",
+              not stray,
+              "otaSessionActive() без пояснения про фазу быстрого режима: " + ", ".join(stray))
