@@ -1004,6 +1004,343 @@ def ota_slow_test(ctx):
               "в otaSlowStart нет сброса otaSlowSent")
 
 
+def _block_after(src, needle):
+    """Текст блока в фигурных скобках, открывающегося сразу за первым вхождением needle.
+
+    Нужно там, где проверяется не функция, а кусок внутри неё: у otaSlowRxStart ветка «приём
+    уже идёт» обязана выйти раньше otaSlowStreamBegin, и по всему исходнику это не различить.
+    """
+    at = src.find(needle)
+    if at < 0:
+        return None
+    start = src.find("{", at)
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+    return None
+
+
+def ota_slow_recovery_test(ctx):
+    """Медленная сессия переживает потерю одной посылки.
+
+    Три ошибки, из-за которых одна потерянная посылка стоила всей сессии, а медленный режим
+    бывает единственным способом дотянуться до дальнего узла:
+
+    1. объявление `ota:slow:` уходило одной посылкой навсегда — потерялось, и узел не в
+       сессии: чанки для него чужие сообщения, он выбрасывает их молча, а ведущий двадцать
+       раз повторяет окно в пустоту;
+    2. узел отвечал только на чанк с номером БОЛЬШЕ ожидаемого, то есть на повтор уже
+       записанного молчал: одно потерянное подтверждение вешало сессию намертво;
+    3. повторное объявление того же образа звало otaSlowStreamBegin → Update.begin() поверх
+       открытой сессии, и узел уходил в отказ вместо продолжения. С правкой 1 повторные
+       объявления стали штатными, то есть без этой правки ломается всё, что чинит первая.
+
+    Проверяется устройство кода, а не поведение — как в ota_slow_test: сессия идёт часами,
+    трогает флеш и радио, и прогнать её на хосте нельзя. Но каждая ошибка видна в исходнике
+    однозначно, и на каждую проверку ниже есть свой откат.
+    """
+    src_path = ctx.core / "src/ota_slow.cpp"
+    if not src_path.is_file():
+        ctx.check("ota_slow.cpp найден", False, str(src_path))
+        return
+    src = src_path.read_text(encoding="utf-8")
+    start = ctx.grab(src_path, "bool otaSlowStart(")
+    tick = ctx.grab(src_path, "void otaSlowTick(")
+
+    # --- 1. Объявление сессии зовётся из двух мест ---
+    # Второе место — повтор окна, и без него правка 1 не работает: потерянный старт
+    # по-прежнему теряется, просто вместе с первым окном.
+    send = ctx.grab(src_path, "static void otaSlowSendStart(") \
+        if "static void otaSlowSendStart(" in src else ""
+    ctx.check("объявление сессии вынесено в отдельную функцию", bool(send),
+              "в ota_slow.cpp нет otaSlowSendStart — повторять объявление нечем, кроме как "
+              "запятан второй копией snprintf в otaSlowStart и otaSlowTick")
+    if send:
+        ctx.check("старт сессии уходит через otaSlowSendStart()",
+                  "otaSlowSendStart()" in start and "OTA_SLOW_MSG_START" not in start,
+                  "otaSlowStart зовёт otaSlowSendStart()=%s, а формат объявления в нём сам=%s "
+                  "— значит объявление уходит дважды или одной из двух сборок нет"
+                  % ("otaSlowSendStart()" in start, "OTA_SLOW_MSG_START" in start))
+
+    call_at = tick.find("otaSlowSendStart()")
+    ctx.check("повтор окна объявляет сессию заново", call_at >= 0,
+              "в otaSlowTick нет вызова otaSlowSendStart(): потерянный ota:slow: больше не "
+              "повторяется, и узел, его не услышавший, не входит в сессию никогда")
+    if call_at >= 0:
+        # Именно в ветке повтора окна, а не в пути отправки: повторять объявление перед
+        # каждым окном — значит лишний трафик в эфире, а ветка повтора и есть «окно не
+        # подтвердили». Конец ветки ищем скобками, а не первым же `return;`: первым внутри
+        # неё стоит ранний выход по «окно ещё не истекло».
+        retry = _block_after(tick, "if (otaSlowAckMs != 0)")
+        retry_at = tick.find(retry) if retry else -1
+        inside = retry is not None and retry_at <= call_at < retry_at + len(retry)
+        ctx.check("объявление повторяется в ветке повтора окна, а не перед отправкой",
+                  inside and tick.count("otaSlowSendStart()") == 1,
+                  "вызов otaSlowSendStart() в otaSlowTick стоит не в ветке неподтверждённого "
+                  "окна либо вызывается больше одного раза (в ветке: %s, вызовов: %d) — "
+                  "объявление либо уходит в каждом окне, либо дважды на повторе"
+                  % (inside, tick.count("otaSlowSendStart()")))
+        # Пока узел не отозвался. Иначе объявление уходит в каждом окне — узел-то уже в
+        # сессии, и повторные ota:slow: только занимают эфир.
+        ctx.check("объявление повторяется только пока узел не отозвался",
+                  re.search(r"if\s*\(\s*!\s*otaSlowHeard\s*\)\s*otaSlowSendStart\s*\(\s*\)\s*;",
+                            tick) is not None,
+                  "вызов otaSlowSendStart() в otaSlowTick не под условием !otaSlowHeard — "
+                  "после первого ответа узла объявление уходит в каждом окне впустую")
+
+    # --- 2. Признак «узел отзывался» живёт всю сессию ---
+    # Считать по otaSlowAcked нельзя: узел, ответивший «жду 0», оставляет его нулём, и
+    # признак не поднимается никогда — то есть объявление повторялось бы до отказа.
+    ctx.check("признак «узел отзывался» объявлен на уровне файла",
+              re.search(r"^static\s+bool\s+otaSlowHeard\b", src, re.M) is not None,
+              "otaSlowHeard не объявлен на уровне файла static — otaSlowTick и "
+              "otaSlowOnAck не увидят одно и то же значение")
+    ctx.check("признак «узел отзывался» сбрасывается на старте сессии",
+              re.search(r"otaSlowHeard\s*=\s*false\s*;", start) is not None,
+              "в otaSlowStart нет `otaSlowHeard = false;` — вторая сессия унаследует признак "
+              "от первой и не станет повторять объявление, даже если узел её не услышал")
+    ack = ctx.grab(src_path, "void otaSlowOnAck(")
+    m = re.search(r"otaSlowHeard\s*=\s*true\s*;", ack)
+    ctx.check("любое подтверждение от узла помечает его услышанным", m is not None,
+              "в otaSlowOnAck нет `otaSlowHeard = true;` — объявление будет повторяться и "
+              "после ответов узла, то есть признак не работает вовсе")
+    if m is not None:
+        # Отметка ДО разбора номера. Первый ответ узла — это «жду 0», он окно не двигает,
+        # и признак, поставленный ниже разбора, не поднялся бы в самой первой сессии.
+        ctx.check("отметка ставится ДО разбора номера подтверждения",
+                  m.start() < ack.find("next > otaSlowSeq"),
+                  "otaSlowHeard помечается после разбора номера: ответ «жду 0» окно не "
+                  "двигает, и признак останется снятым на весь первый пакет сессии")
+
+    # --- 3. Узел отвечает на ЛЮБОЕ несовпадение номера чанка ---
+    # Как переподтверждает дубликат в TCP: повтор чанка и есть сигнал «он не знает, где я».
+    rxdata = ctx.grab(src_path, "void otaSlowRxData(")
+    ctx.check("узел отвечает на ЛЮБОЕ несовпадение номера чанка",
+              re.search(r"if\s*\(\s*seq\s*!=\s*slowRxExpect\s*\)\s*\{\s*slowRxAckLater\s*\(\s*\)"
+                        r"\s*;\s*return\s*;\s*\}", rxdata) is not None,
+              "в otaSlowRxData ветка `seq != slowRxExpect` не отвечает через slowRxAckLater() "
+              "и выходит — на повтор уже записанного чанка узел молчит, и одно потерянное "
+              "подтверждение вешает сессию до отказа по числу повторов")
+    ctx.check("старое сужение «отвечаем только на будущем чанке» убрано",
+              "seq > slowRxExpect" not in rxdata,
+              "в otaSlowRxData осталось условие seq > slowRxExpect: на повтор уже записанного "
+              "чанка узел по-прежнему молчит")
+    # Ответ отложенный, и заявка не двигается вперёд: иначе переотправленное окно из
+    # OTA_SLOW_WINDOW чанков дало бы столько же ответов и забило эфир.
+    later = ctx.grab(src_path, "static void slowRxAckLater(")
+    ctx.check("отложенное подтверждение не передвигается вперёд повторными заявками",
+              re.search(r"if\s*\(\s*slowRxAckDueMs\s*!=\s*0\s*\)\s*return\s*;", later) is not None,
+              "в slowRxAckLater нет выхода по уже стоящей заявке: каждое несовпадение "
+              "номера в переотправленном окне поставит свою заявку, и узел ответит "
+              "OTA_SLOW_WINDOW раз на окно")
+
+    # --- 4. Повторное объявление того же образа продолжает приём ---
+    rxstart = ctx.grab(src_path, "void otaSlowRxStart(")
+    ctx.check("повторный старт видит, что приём уже идёт",
+              re.search(r"if\s*\(\s*slowRxOn\s*\)", rxstart) is not None,
+              "otaSlowRxStart не смотрит на slowRxOn и зовёт otaSlowStreamBegin поверх "
+              "открытой сессии: Update.begin() вернёт «уже идёт», и узел уйдёт в отказ")
+    same = _block_after(rxstart, "if (slowRxOn)")
+    if same is not None:
+        ctx.check("повтор объявления того же образа продолжает, а не начинает заново",
+                  "slowRxAckLater()" in same and "return;" in same
+                  and "otaSlowStreamBegin" not in same,
+                  "ветка «приём уже идёт» в otaSlowRxStart не отвечает через slowRxAckLater() "
+                  "с выходом, либо трогает otaSlowStreamBegin — часы уже принятого выбрасываются")
+        # Сверяются все три поля образа. Узел, у которого сверкают не тем полем, объявление
+        # СВОЕГО образа посчитает чужим и молча закроет приём.
+        pairs = set(re.findall(r"(\w+)\s*==\s*(otaSlow\w+)", same))
+        want = {("total", "otaSlowTotal"), ("crc", "otaSlowCrc"), ("chunks", "otaSlowChunks")}
+        ctx.check("приёмник сверяет все три поля объявления образа", want <= pairs,
+                  "в ветке «приём уже идёт» сравниваются не все поля образа: %s; нет %s"
+                  % (", ".join("%s == %s" % p for p in sorted(pairs)) or "ничего",
+                     ", ".join("%s == %s" % p for p in sorted(want - pairs))))
+    if send and same is not None:
+        # Объявление и сверка обязаны говорить об одном образе: поле, добавленное в формат
+        # и забытое в сверке, превращает повтор СВОЕГО объявления в объявление чужого.
+        # Берём аргументы snprintf и отбрасываем и поля через точку (otaSlowTarget.c_str()),
+        # и приведения типа ((unsigned)otaSlowTotal) — нужны только голые имена.
+        call = re.search(r"snprintf\s*\((.*?)\)\s*;", send, re.S)
+        args = call.group(1) if call else ""
+        announced = set(re.findall(r"(?<![\w.])otaSlow\w+\b(?!\s*\.)", args))
+        compared = {b for _, b in pairs}
+        ctx.check("объявление несёт ровно те поля образа, что сверяет приёмник",
+                  bool(announced) and announced == compared,
+                  "в otaSlowSendStart в объявление идут %s, а приёмник сверяет %s"
+                  % (", ".join(sorted(announced)) or "ничего",
+                     ", ".join(sorted(compared)) or "ничего"))
+
+    # --- 5. Размер приходит из эфира, а не из доверенного места ---
+    limit = re.search(r"if\s*\(\s*total\s*>\s*OTA_MAX_FW_BYTES\s*\)", rxstart)
+    ctx.check("объявленный размер сверяется с пределом", limit is not None,
+              "в otaSlowRxStart нет `total > OTA_MAX_FW_BYTES`: размер приходит из эфира, и "
+              "с заведомо невозможным числом Update.begin() откажет — но по журналу будет "
+              "непонятно, отказала память или образ объявлен чужой")
+    begin = rxstart.find("otaSlowStreamBegin(")
+    if limit is not None and begin >= 0:
+        ctx.check("предел проверяется ДО открытия раздела", limit.start() < begin,
+                  "otaSlowStreamBegin() в otaSlowRxStart стоит раньше проверки предела — "
+                  "проверка не защищает ничего")
+    # Предел обязан быть тот же, что у быстрого режима: «тот же» в комментарии не считается.
+    # Поэтому сверяем не наличие проверки, а ИМЯ макроса в обоих местах и то, что он задан
+    # числом в конфиге: свой литерал рядом с чужим макросом — это уже два разных предела.
+    fast = (ctx.core / "src/ota_receiver.cpp").read_text(encoding="utf-8")
+    fast_limit = re.search(r"total\s*>\s*(\w+)", fast)
+    slow_limit = re.search(r"total\s*>\s*(\w+)", rxstart)
+    cfg_src = (ctx.core / "include/config.h").read_text(encoding="utf-8")
+    defined = re.search(r"^#define\s+OTA_MAX_FW_BYTES\s+\(?\s*\d", cfg_src, re.M) is not None
+    ctx.check("предел размера общий с быстрым приёмом",
+              fast_limit is not None and slow_limit is not None
+              and fast_limit.group(1) == slow_limit.group(1) == "OTA_MAX_FW_BYTES"
+              and defined,
+              "быстрый приём сверяет с %s, медленный — с %s, задано числом в config.h: %s"
+              % (fast_limit.group(1) if fast_limit else "ничем",
+                 slow_limit.group(1) if slow_limit else "ничем", defined))
+
+    cfg = (ctx.core / "include/config.h").read_text(encoding="utf-8")
+
+    def const(name):
+        m = re.search(r"^#define\s+%s\s+(\d+)\b" % name, cfg, re.M)
+        return int(m.group(1)) if m else 0
+
+    print("     сводка: окно %d чанков по %d Б, повторов окна до отказа %d, узел отвечает "
+          "через ~%d мс" % (const("OTA_SLOW_WINDOW"), const("OTA_SLOW_CHUNK_BYTES"),
+                            const("OTA_SLOW_MAX_RETRIES"), const("OTA_SLOW_ACK_DELAY_MS")))
+
+
+def ota_slow_applied_test(ctx):
+    """Потерянный `ota:sdone` больше не выглядит провалом.
+
+    Узел принял последний чанк, проверил образ, отправил `ota:sdone` и перезагрузился в новую
+    прошивку. Подтверждение идёт через флуд в момент, когда канал busiest за всю сессию, и
+    теряется довольно часто. Дальше ведущий двадцать повторов ждал подтверждения и заканчивал
+    «узел не подтверждает»: успешная прошивка докладывалась как провал, а следующая попытка
+    шла заново на уже прошитый узел — который после первой попытки ещё и не в сессии, потому
+    что перезагрузился.
+
+    Единственное доказательство, что всё сошлось, — heartbeat: узел шлёт привет сразу после
+    включения, то есть сразу после применения образа, и версия в нём уже новая. Формат
+    сообщений при этом не меняется ни на байт.
+    """
+    src_path = ctx.core / "src/ota_slow.cpp"
+    if not src_path.is_file():
+        ctx.check("ota_slow.cpp найден", False, str(src_path))
+        return
+    start = ctx.grab(src_path, "bool otaSlowStart(")
+    tick = ctx.grab(src_path, "void otaSlowTick(")
+
+    # --- 1. Хук heartbeat'а стоит там, где версия уже разобрана ---
+    # В otaSlowTick версии нет: она живёт в lastHello, который наполняет sensorRegistryNote.
+    # Если вызов уедет из этого места, он либо не скомпилируется, либо (хуже) будет читать
+    # предыдущее сообщение — и выдавать чужую версию за версию цели.
+    rx = (ctx.core / "src/mesh_rx.cpp").read_text(encoding="utf-8")
+    hook_at = rx.find("otaSlowOnHello()")
+    note_at = rx.find("sensorRegistryNote()")
+    ctx.check("heartbeat цели попадает в сессию из разбора канала",
+              hook_at >= 0 and note_at >= 0 and hook_at > note_at,
+              "в mesh_rx.cpp вызов otaSlowOnHello() стоит %s, а разбор реестра — %s: версия "
+              "должна браться уже разобранной" % (hook_at, note_at))
+    hook = ctx.grab(src_path, "void otaSlowOnHello(")
+    ctx.check("хук берёт версию из разобранного heartbeat",
+              "lastHello.isHello" in hook and "lastHello.ver" in hook,
+              "otaSlowOnHello не смотрит lastHello — версию откуда тогда?")
+    # Чужое в канале есть всегда: heartbeat шлёт каждый узел, и не один.
+    ctx.check("хук принимает heartbeat только от цели",
+              re.search(r"if\s*\(\s*lastSender\s*!=\s*otaSlowTarget\s*\)\s*return\s*;", hook)
+              is not None,
+              "otaSlowOnHello не отбрасывает чужие сообщения: версию соседнего узла можно "
+              "принять за версию цели, и прошивка объявится успешной на пустом месте")
+    # Узел постарше шлёт в heartbeat просто «hello»: пустой версии там нет смысла читать.
+    ctx.check("пустая версия в heartbeat не считается версией",
+              re.search(r"lastHello\.ver\.length\(\)\s*==\s*0", hook) is not None,
+              "otaSlowOnHello не отбрасывает heartbeat без версии — «hello» без полей "
+              "сравнивается с базовой версией и выдаёт чужой успех")
+    # Решение — не здесь. Здесь версия запоминается, а вывод делает otaSlowTick, где известно
+    # главное условие «весь образ сдан». Решать в хуке нельзя: heartbeat может прийти ДО
+    # последнего подтверждения, и тогда успех объявился бы на недокачанном образе.
+    ctx.check("хук только запоминает версию, решение принимает не он",
+              "otaSlowSeenVer" in hook and "otaSlowDone(" not in hook,
+              "otaSlowOnHello зовёт otaSlowDone — решение уехало в разбор heartbeat, где "
+              "неизвестно, сдан ли образ целиком")
+
+    # --- 2. Вердикт: одна функция, и она сравнивает с тем, что было ДО сессии ---
+    verdict = ctx.grab(src_path, "static bool otaSlowAppliedByHello(")
+    for name, field, what in (
+            ("otaSlowTargetVer.length() == 0", "otaSlowTargetVer",
+             "до сессии версия цели не была известна — сравнивать не с чем"),
+            ("otaSlowSeenVer.length() == 0", "otaSlowSeenVer",
+             "heartbeat от цели в этой сессии ещё не был")):
+        ctx.check("вердикт отказывает, если %s" % what,
+                  re.search(re.escape(name) + r"\s*\)\s*return\s+false\s*;", verdict) is not None,
+                  "в otaSlowAppliedByHello нет `%s → false`: без этой оговорки признак "
+                  "сравнения строк срабатывает на пустых значениях" % name)
+    ctx.check("вердикт сравнивает версию ДО сессии с услышанной в сессии",
+              re.search(r"return\s+otaSlowSeenVer\s*!=\s*otaSlowTargetVer\s*;", verdict)
+              is not None,
+              "otaSlowAppliedByHello не возвращает otaSlowSeenVer != otaSlowTargetVer — "
+              "значит сравниваются не те поля или направление инвертировано")
+
+    # Обе версии обязаны быть привязаны к сессии: база берётся на старте, а услышанная
+    # обнуляется. Унаследованная от прошлой сессии версия объявила бы успех сразу.
+    ctx.check("базовая версия цели берётся из реестра на старте сессии",
+              re.search(r"otaSlowTargetVer\s*=\s*sensorVersionOf\s*\(", start) is not None,
+              "в otaSlowStart нет `otaSlowTargetVer = sensorVersionOf(...)`: сравнивать "
+              "не с чем, и вердикт всегда ложь")
+    ctx.check("услышанная версия обнуляется на старте сессии",
+              re.search(r"otaSlowSeenVer\s*=\s*(\"\"|String\s*\(\s*\))\s*;", start) is not None,
+              "в otaSlowStart нет сброса otaSlowSeenVer — версия прошлой сессии переживёт "
+              "новую, и первое же подтверждение… то есть первое же сравнение объявит успех")
+
+    # --- 3. Вердикт зовётся там, где образ уже сдан ---
+    wait = _block_after(tick, "if (otaSlowSeq >= otaSlowChunks)")
+    ctx.check("вердикт зовётся в ветке «весь образ сдан и подтверждён»",
+              wait is not None and "otaSlowAppliedByHello()" in wait
+              and "otaSlowDone(true" in wait,
+              "в otaSlowTick ветка `otaSlowSeq >= otaSlowChunks` не зовёт otaSlowAppliedByHello() "
+              "с otaSlowDone(true) — вывод есть, а применить его некому")
+    # Считаем ВЫЗОВЫ, а не вхождения подстроки: о вердикте написано в комментарии, и такой
+    # подсчёт ругался бы на верный код.
+    calls = re.findall(r"(?m)^[ \t]*(?:if\s*\(\s*)?otaSlowAppliedByHello\s*\(\s*\)", tick)
+    ctx.check("вердикт не зовётся вне этой ветки", len(calls) == 1,
+              "otaSlowAppliedByHello() вызывается из otaSlowTick %d раз: вывод обязан "
+              "делаться один раз и после сдачи образа, иначе успех объявится на недокачанном "
+              "образе" % len(calls))
+
+    # --- 4. Чтение версии не заводит запись в реестре ---
+    reg = ctx.grab(ctx.core / "src/sensor_registry.cpp", "String sensorVersionOf(")
+    ctx.check("чтение версии не заводит запись в реестре",
+              "sensorSlot(" not in reg,
+              "sensorVersionOf зовёт sensorSlot(), а тот ЗАВОДИТ запись: чтение версии у узла, "
+              "которого в реестре нет, создаст фантом на странице и в MQTT, а в полном "
+              "реестре ещё и вытеснит кого-то живого")
+    ctx.check("чтение версии объявлено в заголовке ядра",
+              re.search(r"String\s+sensorVersionOf\s*\(",
+                        (ctx.core / "include/mesh.h").read_text(encoding="utf-8")) is not None,
+              "в include/mesh.h ядра нет объявления sensorVersionOf")
+
+    # --- 5. Журнал говорит, ЧЕМ подтверждён успех ---
+    # Без этой строки рядом с «ГОТОВО» стоял бы отладочный «[SLOW] старт» получателя, и
+    # по журналу выглядело бы так, будто узел подтвердил сессию сам собой.
+    done = ctx.grab(src_path, "void otaSlowDone(")
+    ctx.check("на успехе журнал говорит, чем подтверждён итог",
+              re.search(r"if\s*\(\s*why\s*&&\s*\*\s*why\s*\)", done) is not None,
+              "otaSlowDone на успехе игнорирует why: сессия, завершившаяся по потерянному "
+              "ota:sdone, выглядит в журнале так же, как подтверждённая узлом")
+
+    cfg = (ctx.core / "include/config.h").read_text(encoding="utf-8")
+    retries = re.search(r"^#define\s+OTA_SLOW_MAX_RETRIES\s+(\d+)", cfg, re.M)
+    print("     сводка: сессия ждёт ota:sdone до %s повторов окна, узел отмечается сразу "
+          "после включения — запасной путь успевает сработать задолго до отказа"
+          % (retries.group(1) if retries else "?"))
+
+
 # Места, которые обязаны спрашивать «идёт ли ЛЮБАЯ сессия», а не только фазу быстрого режима.
 # Список именно перечислением, а не поиском по всем файлам: каждая строка здесь — это
 # найденный способ сломать идущую медленную сессию, и добавлять её в список должен человек,
@@ -1104,3 +1441,369 @@ def any_session_test(ctx):
     ctx.check("слепой к медленному режиму предикат нигде не остался без объяснения",
               not stray,
               "otaSessionActive() без пояснения про фазу быстрого режима: " + ", ".join(stray))
+
+
+def weak_hooks_test(ctx):
+    """Хук ядра не должен молча остаться заглушкой.
+
+    Ядро зовёт платформенные хуки (`mcUiOtaProgress`, `supportJobStart`, ...), а реализации
+    по умолчанию — no-op из `src/mc_platform.cpp`. Если прошивка включила функцию, но хук не
+    переопределила, сборка проходит без единого предупреждения, а на плате работает пустышка:
+    прогресс OTA не рисуется, «узел занят» всегда «нет». Проверки, которая бы это ловила,
+    не было.
+
+    Ловушка тут вовсе не в слове `weak` — с ним всё честно: переопределение честно и
+    перекрывает заглушку. Ловушка в трёх местах по соседству:
+
+    - **нет прототипа в `mc_platform.h`.** Фирма пишет свою функцию с тем же именем, но
+      ядро о ней не знает: линкер берёт слабую заглушку, а функция прошивки остаётся мёртвым
+      кодом. Ни ошибки, ни предупреждения — «работает пустышка»;
+    - **своё переопределение помечено `weak`.** Две слабые реализации с одним именем: линкер
+      берёт любую. На столе это работает, на плате может не работать, и разница видна только
+      в порядке линковки;
+    - **вызов есть, а переопределения нет.** Фирма позвала хук в своём коде, но забыла
+      переопределить: вызов молча уходит в no-op.
+
+    Плюс список хуков, которые переопределять ОБЯЗАНЫ обе прошивки: экран, прогресс OTA и
+    батарея есть у любой платы, и оставленная заглушка здесь — не «фича выключена», а
+    сломанный интерфейс. Списка из «обязаны» намеренно нет: GPS есть только у T-Deck, WiFi
+    только у форка, и требовать их от обеих плат нельзя.
+    """
+    hdr_path = ctx.core / "include/mc_platform.h"
+    src_path = ctx.core / "src/mc_platform.cpp"
+    for p in (hdr_path, src_path):
+        if not p.is_file():
+            ctx.check("хук ядра на месте: %s" % p.relative_to(ctx.tree), False, str(p))
+            return
+    hdr = hdr_path.read_text(encoding="utf-8")
+    src = src_path.read_text(encoding="utf-8")
+    hooks_in_src = _hook_defs(src)
+    hooks_in_hdr = _hook_decls(hdr)
+    ctx.check("хуков в заглушках не меньше, чем в заголовке",
+              hooks_in_hdr and hooks_in_hdr <= set(hooks_in_src),
+              "объявлено в mc_platform.h, но заглушки нет: %s"
+              % ", ".join(sorted(hooks_in_hdr - set(hooks_in_src)) or "—"))
+    ctx.check("каждый хук заглушек помечен weak",
+              len(_weak_hooks(src)) == len(hooks_in_src),
+              "заглушек %d, помечено weak %d: без признака переопределение из прошивки даст "
+              "ошибку линковки вместо тихой подмены" % (len(hooks_in_src), len(_weak_hooks(src))))
+
+    for sub in ("meshcore-fork", "tdeck"):
+        files = _own_sources(ctx, sub)
+        if not files:
+            ctx.check("прошивка на месте: %s" % sub, False,
+                      "нет ни src/, ни lib/meshcore/src/ у %s" % sub)
+            continue
+        strong, weak = set(), set()
+        for p in files:
+            txt = p.read_text(encoding="utf-8")
+            for h in _hook_defs(txt):
+                strong.add(h)
+                # Признак `weak` идёт строкой выше определения, поэтому смотрим окно перед ним.
+                at = txt.find(h)
+                if "__attribute__((weak))" in txt[max(0, at - 200):at]:
+                    weak.add(h)
+        # Переопределение без прототипа — самая дорогая из трёх ловушек: молча, без ошибки.
+        # Смотрим только пространство имён ядра (`mc*` и `screenWake`). Префикс `support*`
+        # — собственное пространство прикладного кода прошивки (`supportPingTick`,
+        # `supportJobTotal`, ...), и его функции хуками ядра не являются: первая версия
+        # проверки считала их хуками и объявляла прошивку с ними «переопределяющей то, чего
+        # нет в заголовке» — то есть врала, и проверку пришлось бы отключить.
+        ctx.check("%s: каждое переопределение объявлено в mc_platform.h" % sub,
+                  _reserved_hooks(files) <= hooks_in_hdr,
+                  "прошивка переопределяет хуки, которых нет в заголовке ядра: %s — ядро "
+                  "линкует свою заглушку, а эти функции остаются мёртвым кодом"
+                  % ", ".join(sorted(_reserved_hooks(files) - hooks_in_hdr)))
+        ctx.check("%s: переопределения хуков не слабые" % sub, not weak,
+                  "помечено weak: %s — линкер возьмёт любую из двух реализаций"
+                  % ", ".join(sorted(weak)))
+        # Подпись переопределения против прототипа. Именно этот случай для хуков ядра не
+        # поймать иначе: у шести хуков префикс `support*` общий с прикладным кодом, отличить
+        # их по имени нельзя (см. `_reserved_hooks`), а несовпадение подписи — это ровно то
+        # молчаливое откатывание к заглушке, ради которого проверка и написана: имя другое
+        # после компиляции, линкер берёт ядро, а функция прошивки остаётся мёртвым кодом без
+        # единого предупреждения.
+        bad_sig = _sig_mismatch(files, hooks_in_hdr, hdr)
+        ctx.check("%s: подписи переопределений совпадают с mc_platform.h" % sub,
+                  not bad_sig,
+                  "подпись не та: %s — линкер не узнает функцию и возьмёт заглушку ядра"
+                  % ", ".join(sorted(bad_sig)))
+        # Вызов без переопределения: прошивка сама позвала хук и забыла его закрыть.
+        called = set()
+        for p in files:
+            if p.name == "mc_platform.cpp":
+                continue
+            txt = p.read_text(encoding="utf-8")
+            called |= {h for h in hooks_in_hdr if re.search(r"\b%s\s*\(" % h, txt)}
+        ctx.check("%s: у вызываемых хуков есть переопределение" % sub,
+                  called <= strong,
+                  "вызывается, но не переопределено: %s — вызов уходит в заглушку"
+                  % ", ".join(sorted(called - strong)))
+
+    # Экран, прогресс OTA и батарея — у любой платы. Заглушка здесь означает сломанный
+    # интерфейс, а не выключенную функцию, поэтому обе прошивки обязаны их закрыть.
+    must = ("mcUiIncoming", "mcUiSensorRx", "mcUiHexScreen", "mcUiSetBrightness",
+            "mcUiOtaProgress", "mcUiOtaDone", "mcUiOtaAbort",
+            "mcUiOtaSensorProgress", "mcUiOtaSensorAbort",
+            "mcBatteryPresent", "mcBatteryPercent", "mcBatteryVoltage")
+    for sub in ("meshcore-fork", "tdeck"):
+        strong = set()
+        files = _own_sources(ctx, sub)
+        for p in files:
+            strong |= _hook_defs(p.read_text(encoding="utf-8"))
+        ctx.check("%s закрывает все обязательные хуки" % sub,
+                  set(must) <= strong,
+                  "не переопределены: %s" % ", ".join(sorted(set(must) - strong)))
+
+    print("     сводка: хуков объявлено ядром %d, из них обязательных для обеих прошивок %d; "
+          "закрыто форком %d, tdeck — %d"
+          % (len(hooks_in_hdr), len(must),
+             len(hooks_in_hdr & _own_hooks(ctx, "meshcore-fork")),
+             len(hooks_in_hdr & _own_hooks(ctx, "tdeck"))))
+
+
+def _own_hooks(ctx, sub):
+    out = set()
+    for p in _own_sources(ctx, sub):
+        out |= _hook_defs(p.read_text(encoding="utf-8"))
+    return out
+
+
+def _own_sources(ctx, sub):
+    """Свои исходники прошивки: и src/, и lib/meshcore/src/.
+
+    Не только `src/`: экран и кнопки у обеих проших прошивок лежат в `lib/meshcore/src/`
+    (это их прикладной код, названный так исторически), и первая версия этой проверки смотрела
+    только на `src/`. На этом она объявила `screenWake()` незакрытым хуком, хотя он
+    переопределён — то есть проверка врала в обе стороны: и ложно ругалась, и пропускала бы
+    настоящую пустышку в `lib/`.
+    """
+    out = []
+    for sub_dir in ("src", "lib/meshcore/src"):
+        d = ctx.tree / sub / sub_dir
+        if d.is_dir():
+            out += sorted(d.glob("*.cpp")) + sorted(d.glob("*.c"))
+    return out
+
+
+def _hook_defs(txt):
+    """Имена функций-хуков, ОПРЕДЕЛЁННЫХ в тексте (тело с фигурной скобкой).
+
+    Широкий список: и ядро, и прикладной код обеих проших прошивок. Слова `support*` здесь
+    ловят и хуки (`supportBusy`), и собственные функции прикладного кода — их полезно знать
+    для проверки «вызов есть, а переопределения нет», но НЕЛЬЗЯ считать их хуками ядра: см.
+    `_reserved_hooks`.
+    """
+    return set(re.findall(r"(?m)^\s*(?:void|bool|int|float|String|uint32_t|size_t)\s+"
+                          r"((?:mc[A-Z]\w*)|(?:support[A-Z]\w*)|screenWake)\s*\([^;{]*\)\s*\{",
+                          txt))
+
+
+def _sig_mismatch(files, hooks_in_hdr, hdr):
+    """Хуки, у которых подпись определения в прошивке разошлась с прототипом в ядре.
+
+    Сравниваются ТИПЫ параметров, а не текст: имена параметров в заголовке и в определении
+    различаться могут (в T-Deck `mcBoardPosition` объявлен как `latUdeg/lonUdeg`, а определён
+    как `lat/lon`), и это ничего не меняет — имя параметра после компиляции функции не
+    различает. Значение по умолчанию в прототипе расхождением тоже не считается: его нельзя
+    повторять в определении (ошибка компиляции), так что отсутствие там положено.
+    """
+    protos = {}
+    for name, args in re.findall(
+            r"(?m)^\s*(?:void|bool|int|float|String|uint32_t|size_t)\s+(\w+)\s*\(([^;{)]*)\)\s*;",
+            hdr):
+        protos[name] = _arg_types(args)
+    out = set()
+    for p in files:
+        txt = p.read_text(encoding="utf-8")
+        for m in re.finditer(
+                r"(?m)^\s*(?:void|bool|int|float|String|uint32_t|size_t)\s+(\w+)\s*\(([^;{)]*)\)\s*\{",
+                txt):
+            name, args = m.group(1), m.group(2)
+            if name not in protos:
+                continue
+            if _arg_types(args) != protos[name]:
+                out.add(name)
+    return out
+
+
+_TYPES = ("void", "bool", "int", "float", "double", "char", "String", "size_t",
+          "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t",
+          "uint64_t", "const")
+
+
+def _arg_types(args):
+    """Типы параметров в каноническом виде: без имён, значений по умолчанию и пробелов."""
+    out = []
+    for a in args.split(","):
+        a = a.split("=")[0].strip()
+        # `void` в одиночку — это пустой список параметров, а не параметр типа void.
+        if not a or a == "void":
+            continue
+        # Имя параметра — последний идентификатор, перед которым стоит не ключевое слово.
+        # У `const String& text` это `text`, у `int32_t* latUdeg` — `latUdeg`.
+        toks = re.findall(r"\w+|[&*]", a)
+        name = ""
+        for i, t in enumerate(toks):
+            if t in _TYPES or t in "&*":
+                continue
+            name = t
+        left = a
+        if name:
+            left = re.sub(r"\b%s\b" % re.escape(name), "", left, count=1)
+        left = re.sub(r"\bconst\b", "", left)
+        out.append(re.sub(r"\s+", "", left))
+    return tuple(sorted(out))
+
+
+def _reserved_hooks(files):
+    """Из определений прошивки — только те, что ядро имеет право перекрывать.
+
+    Фильтр нужен для одной проверки: «переопределение обязано быть объявлено в
+    mc_platform.h». Без него она ругалась бы на прикладные функции `support*`
+    (`supportPingTick`, `supportJobTotal` и подобные): ядро их не знает, и заголовком они не
+    описываются. Переименуй кто-нибудь прикладную функцию в `mc*` — она тихо переживёт
+    появление одноимённого хука в ядре и станет дубликатом символа; поэтому `mc*` и
+    `screenWake` в фильтр входят целиком, а не «если есть в заголовке».
+
+    Чего этот фильтр НЕ проверяет и почему это не чинится: шесть хуков ядра живут на префиксе
+    `support*` (`supportBusy`, `supportIndexFor`, `supportIndexForAny`, `supportPresent`,
+    `supportJobStart`, `supportJobFinished` — `mc_platform.h`, строки 104–117), и прикладной код
+    использует тот же префикс. Отличить переопределение хука от собственной функции по имени
+    нельзя — единственный признак, что это хук, это наличие его в заголовке, а это ровно то,
+    что проверяется. Сузить по нему значит сделать проверку тавтологией: «объявлено в
+    заголовке» == «взято из заголовка». Поэтому сверка подписей у `support*` не ловится здесь и
+    сделана с другой стороны: каждый хук из заголовка обязан иметь заглушку в ядре, а вызов
+    без переопределения ловится проверкой «у вызываемых хуков есть переопределение».
+    """
+    out = set()
+    for p in files:
+        txt = p.read_text(encoding="utf-8")
+        out |= set(re.findall(r"(?m)^\s*(?:void|bool|int|float|String|uint32_t|size_t)\s+"
+                              r"((?:mc[A-Z]\w*)|screenWake)\s*\([^;{]*\)\s*\{", txt))
+    return out
+
+
+def _hook_decls(txt):
+    """Имена функций-хуков, ОБЪЯВЛЕННЫХ в тексте (прототип с `;`)."""
+    return set(re.findall(r"(?m)^\s*(?:void|bool|int|float|String|uint32_t|size_t)\s+"
+                          r"((?:mc[A-Z]\w*)|(?:support[A-Z]\w*)|screenWake)\s*\([^;{]*\)\s*;",
+                          txt))
+
+
+def _weak_hooks(txt):
+    out = set()
+    for m in re.finditer(r"__attribute__\(\(weak\)\)", txt):
+        after = txt[m.end():m.end() + 200]
+        mm = re.search(r"(?m)^\s*(?:void|bool|int|float|String|uint32_t|size_t)\s+"
+                       r"((?:mc[A-Z]\w*)|(?:support[A-Z]\w*)|screenWake)\s*\(", after)
+        if mm:
+            out.add(mm.group(1))
+    return out
+
+
+def _own_hook_count(ctx, sub):
+    return len(_own_hooks(ctx, sub) & _hook_decls(
+        (ctx.core / "include/mc_platform.h").read_text(encoding="utf-8")))
+
+
+def ota_screen_progress_test(ctx):
+    """На экране прошивки видно, сколько пакетов получено из скольких, и он не гаснет.
+
+    Две беды, обе выросли из того, что экранный код писали под быстрый режим.
+
+    Первая — экран. `screenTick()` держит панель зажжённой, пока идёт сессия, и спрашивал про
+    это `otaActive`: признак БЫСТРОГО приёма. Медленный режим намеренно не занимает
+    `otaPhase`, поэтому на медленной сессии этот признак равен нулю все эти часы, и через две
+    минуты панель гасла — ровно тогда, когда на неё и нужно смотреть. Признак прогресса для
+    этого и не помогал: он обновляет экран, но не мешает гасить.
+
+    Вторая — сам прогресс. На экране показывался процент и счётчик СЫРЫХ КАДРОВ эфира, то
+    есть вместе с повторами. «37%» на часовой сессии не говорит ни о чём, а кадры отвечают
+    на другой вопрос. Просили «сколько получено из скольких» — теперь это и написано, и
+    единицей приёма выбран чанк: повторы в счётчик не попадают, потому что чанк с неверным
+    номером отбрасывается до записи, так что число монотонно и равно «уже у нас на флеше».
+
+    Знаменатель берётся у ядра (`otaSlowRxChunksTotal`), и это не перестраховка: единицу
+    приёма знает только ядро, а `otaGot`/`otaTotal` — это БАЙТЫ, а `pkts` — кадры. Спросить
+    неоткуда, значит и показать нечего.
+    """
+    # --- экран не гаснет во время сессии ---
+    for sub in ("meshcore-fork", "tdeck"):
+        rel = "lib/meshcore/src/display.cpp"
+        path = ctx.tree / sub / rel
+        if not path.is_file():
+            ctx.check("экранный код на месте: %s" % sub, False, str(path))
+            continue
+        src = path.read_text(encoding="utf-8")
+        tick = ctx.grab(path, "void screenTick(")
+        # Именно ВЫЗОВ, а не любое упоминание имени: иначе проверку удовлетворяет комментарий
+        # рядом — а комментарий можно написать и вместе с откатом к otaActive, и проверка
+        # останется зелёной на неверном коде. (Так и вышло при первом откате.)
+        ctx.check("%s: экран не гаснет во время ЛЮБОЙ сессии" % sub,
+                  re.search(r"(?m)^[ \t]*if\s*\(\s*otaAnySessionActive\s*\(\s*\)\s*\)"
+                            r"[ \t]*\{[ \t]*screenWakeMs", tick) is not None,
+                  "screenTick() не спрашивает otaAnySessionActive() в своём теле: медленный "
+                  "режим не занимает otaPhase, поэтому otaActive на нём нулевой и панель "
+                  "гаснет через две минуты после начала сессии")
+        # Предикат живёт в ota.h. Без этого заголовка проверка выше прошла бы на тексте, а
+        # сборка упала бы — ровно тот случай, ради которого проверки и пишутся.
+        ctx.check("%s: экранный код видит объявление предиката" % sub,
+                  '#include "ota.h"' in src,
+                  "в %s нет #include \"ota.h\", а screenTick() зовёт otaAnySessionActive() — "
+                  "сборка упадёт" % rel)
+
+    # --- «получено из скольких» на экране приёмника ---
+    slow_src = (ctx.core / "src/ota_slow.cpp").read_text(encoding="utf-8")
+    got_body = ctx.grab(ctx.core / "src/ota_slow.cpp", "uint32_t otaSlowRxChunksGot(")
+    total_body = ctx.grab(ctx.core / "src/ota_slow.cpp", "uint32_t otaSlowRxChunksTotal(")
+    ctx.check("ядро отдаёт экрану принятые чанки", "slowRxExpect" in got_body,
+              "otaSlowRxChunksGot() не берёт slowRxExpect — это единственный счётчик принятых "
+              "чанков в приёмнике, и вместо него показывать нечего")
+    ctx.check("ядро отдаёт экрану объявленное число чанков", "otaSlowChunks" in total_body,
+              "otaSlowRxChunksTotal() не берёт otaSlowChunks — это число чанков из объявления "
+              "сессии, то есть единственный знаменатель «из скольких»")
+    # Счётчик, который никто не двигает, — тоже «показывает не то»: проверка на откате
+    # поймала бы это, но по-человечески видно сразу.
+    for name, body in (("otaSlowRxChunksGot", got_body), ("otaSlowRxChunksTotal", total_body)):
+        ctx.check("%s() не возвращает константу" % name,
+                  not re.search(r"return\s+(0|1)\s*;", body),
+                  "%s() возвращает константу: экран будет показывать одно и то же всю "
+                  "сессию" % name)
+
+    for sub, rel in (("meshcore-fork", "src/mc_platform.cpp"),
+                     ("tdeck", "src/mc_platform.cpp")):
+        path = ctx.tree / sub / rel
+        if not path.is_file():
+            ctx.check("переопределение хука прогресса на месте: %s" % sub, False, str(path))
+            continue
+        body = ctx.grab(path, "void mcUiOtaSensorProgress(")
+        has_both = ("otaSlowRxChunksGot()" in body and "otaSlowRxChunksTotal()" in body)
+        ctx.check("%s: экран приёмника печатает «получено из скольких»" % sub, has_both,
+                  "mcUiOtaSensorProgress не печатает otaSlowRxChunksGot()/Total(): на экране "
+                  "остаётся только процент и счётчик кадров — «37%%» на часовой сессии")
+        # Знаменатель обязателен: «получено 812» без «из 2400» — это не ответ на вопрос.
+        pct_line = re.search(r"printf\(\s*\"[^\"]*%%[^\"]*\",[^;]*\);", body)
+        ctx.check("%s: «из скольких» идёт в том же поле, что и «получено»" % sub,
+                  has_both and re.search(r"printf\(\s*\"Pkt\s*%u/%u\"", body) is not None,
+                  "в mcUiOtaSensorProgress нет формата вида `Pkt %u/%u`: либо напечатан только "
+                  "полученный счётчик, либо разделитель не тот")
+
+    # T-Deck рисует прошивку проект платы, а не общий хук: там своя ячейка, и её надо проверить
+    # отдельно, иначе правка пройдёт мимо.
+    ui = (ctx.tree / "tdeck/src/tdeck_ui.cpp").read_text(encoding="utf-8")
+    draw = (ctx.tree / "tdeck/src/tdeck_ui_draw.cpp").read_text(encoding="utf-8")
+    ctx.check("tdeck: состояние экрана несёт счётчик пакетов из ядра",
+              re.search(r"otaPktsGot\s*=\s*otaSlowRxChunksGot\s*\(\s*\)\s*;", ui) is not None
+              and re.search(r"otaPktsTotal\s*=\s*otaSlowRxChunksTotal\s*\(\s*\)\s*;", ui)
+              is not None,
+              "tdeck_ui.cpp не заполняет otaPktsGot/otaPktsTotal из ядра — ячейка на панели "
+              "покажет нули всю сессию")
+    ctx.check("tdeck: ячейка RECEIVED на медленной сессии показывает пакеты",
+              re.search(r"otaSlow[\s\S]{0,400}PACKETS", draw) is not None
+              and "otaPktsTotal" in draw,
+              "в drawOta нет ветки «медленная сессия → пакеты»: на панели так и останутся "
+              "килобайты, а не «получено N из M»")
+
+    print("     сводка: экран держится на otaAnySessionActive(), счётчик пакетов один на "
+          "все три экрана (две прошивки и проект платы T-Deck)")
