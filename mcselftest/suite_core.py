@@ -1489,10 +1489,17 @@ def weak_hooks_test(ctx):
               "ошибку линковки вместо тихой подмены" % (len(hooks_in_src), len(_weak_hooks(src))))
 
     for sub in ("meshcore-fork", "tdeck"):
+        # Прошивки может рядом не быть ВООБЩЕ: CI клонирует одну прошивку рядом с ядром, и
+        # вторая просто не лежит на диске. Тогда у этой проверки для неё предмета нет — молчание
+        # честнее выдуманного «OK» (так и написано в targets.py). А вот прошивка, которая
+        # есть, но потеряла обе папки с исходниками, — это поломка, и о ней сказать надо.
+        if not (ctx.tree / sub).is_dir():
+            ctx.note("     %s рядом нет — хуки не проверяются" % sub)
+            continue
         files = _own_sources(ctx, sub)
         if not files:
             ctx.check("прошивка на месте: %s" % sub, False,
-                      "нет ни src/, ни lib/meshcore/src/ у %s" % sub)
+                      "каталог %s есть, но нет ни src/, ни lib/meshcore/src/" % sub)
             continue
         strong, weak = set(), set()
         for p in files:
@@ -1547,6 +1554,8 @@ def weak_hooks_test(ctx):
             "mcUiOtaSensorProgress", "mcUiOtaSensorAbort",
             "mcBatteryPresent", "mcBatteryPercent", "mcBatteryVoltage")
     for sub in ("meshcore-fork", "tdeck"):
+        if not (ctx.tree / sub).is_dir():
+            continue  # см. выше: прошивки рядом может не быть вовсе
         strong = set()
         files = _own_sources(ctx, sub)
         for p in files:
@@ -1555,11 +1564,12 @@ def weak_hooks_test(ctx):
                   set(must) <= strong,
                   "не переопределены: %s" % ", ".join(sorted(set(must) - strong)))
 
-    print("     сводка: хуков объявлено ядром %d, из них обязательных для обеих прошивок %d; "
-          "закрыто форком %d, tdeck — %d"
-          % (len(hooks_in_hdr), len(must),
-             len(hooks_in_hdr & _own_hooks(ctx, "meshcore-fork")),
-             len(hooks_in_hdr & _own_hooks(ctx, "tdeck"))))
+    if (ctx.tree / "meshcore-fork").is_dir() and (ctx.tree / "tdeck").is_dir():
+        print("     сводка: хуков объявлено ядром %d, из них обязательных для обеих прошивок %d; "
+              "закрыто форком %d, tdeck — %d"
+              % (len(hooks_in_hdr), len(must),
+                 len(hooks_in_hdr & _own_hooks(ctx, "meshcore-fork")),
+                 len(hooks_in_hdr & _own_hooks(ctx, "tdeck"))))
 
 
 def _own_hooks(ctx, sub):
@@ -1730,10 +1740,17 @@ def ota_screen_progress_test(ctx):
     """
     # --- экран не гаснет во время сессии ---
     for sub in ("meshcore-fork", "tdeck"):
+        # Прошивки рядом может не быть: CI клонирует одну прошивку рядом с ядром, и второй на
+        # диске просто нет. Молчание честнее выдуманного «OK» (см. targets.py). Есть
+        # прошивка, но нет в ней экрана — другое дело, об этом сказать надо.
+        if not (ctx.tree / sub).is_dir():
+            ctx.note("     %s рядом нет — экран не проверяется" % sub)
+            continue
         rel = "lib/meshcore/src/display.cpp"
         path = ctx.tree / sub / rel
         if not path.is_file():
-            ctx.check("экранный код на месте: %s" % sub, False, str(path))
+            ctx.check("экранный код на месте: %s" % sub, False,
+                      "%s есть, а экрана нет: %s" % (sub, str(path)))
             continue
         src = path.read_text(encoding="utf-8")
         tick = ctx.grab(path, "void screenTick(")
@@ -1773,9 +1790,12 @@ def ota_screen_progress_test(ctx):
 
     for sub, rel in (("meshcore-fork", "src/mc_platform.cpp"),
                      ("tdeck", "src/mc_platform.cpp")):
+        if not (ctx.tree / sub).is_dir():
+            continue  # прошивки рядом нет — см. выше
         path = ctx.tree / sub / rel
         if not path.is_file():
-            ctx.check("переопределение хука прогресса на месте: %s" % sub, False, str(path))
+            ctx.check("переопределение хука прогресса на месте: %s" % sub, False,
+                      "%s есть, а переопределения нет: %s" % (sub, str(path)))
             continue
         body = ctx.grab(path, "void mcUiOtaSensorProgress(")
         has_both = ("otaSlowRxChunksGot()" in body and "otaSlowRxChunksTotal()" in body)
@@ -1783,7 +1803,6 @@ def ota_screen_progress_test(ctx):
                   "mcUiOtaSensorProgress не печатает otaSlowRxChunksGot()/Total(): на экране "
                   "остаётся только процент и счётчик кадров — «37%%» на часовой сессии")
         # Знаменатель обязателен: «получено 812» без «из 2400» — это не ответ на вопрос.
-        pct_line = re.search(r"printf\(\s*\"[^\"]*%%[^\"]*\",[^;]*\);", body)
         ctx.check("%s: «из скольких» идёт в том же поле, что и «получено»" % sub,
                   has_both and re.search(r"printf\(\s*\"Pkt\s*%u/%u\"", body) is not None,
                   "в mcUiOtaSensorProgress нет формата вида `Pkt %u/%u`: либо напечатан только "
@@ -1791,19 +1810,24 @@ def ota_screen_progress_test(ctx):
 
     # T-Deck рисует прошивку проект платы, а не общий хук: там своя ячейка, и её надо проверить
     # отдельно, иначе правка пройдёт мимо.
-    ui = (ctx.tree / "tdeck/src/tdeck_ui.cpp").read_text(encoding="utf-8")
-    draw = (ctx.tree / "tdeck/src/tdeck_ui_draw.cpp").read_text(encoding="utf-8")
-    ctx.check("tdeck: состояние экрана несёт счётчик пакетов из ядра",
-              re.search(r"otaPktsGot\s*=\s*otaSlowRxChunksGot\s*\(\s*\)\s*;", ui) is not None
-              and re.search(r"otaPktsTotal\s*=\s*otaSlowRxChunksTotal\s*\(\s*\)\s*;", ui)
-              is not None,
-              "tdeck_ui.cpp не заполняет otaPktsGot/otaPktsTotal из ядра — ячейка на панели "
-              "покажет нули всю сессию")
-    ctx.check("tdeck: ячейка RECEIVED на медленной сессии показывает пакеты",
-              re.search(r"otaSlow[\s\S]{0,400}PACKETS", draw) is not None
-              and "otaPktsTotal" in draw,
-              "в drawOta нет ветки «медленная сессия → пакеты»: на панели так и останутся "
-              "килобайты, а не «получено N из M»")
+    tdeck_dir = ctx.tree / "tdeck"
+    if not tdeck_dir.is_dir():
+        ctx.note("     tdeck рядом нет — ячейка RECEIVED не проверяется")
+    else:
+        ui = (tdeck_dir / "src/tdeck_ui.cpp").read_text(encoding="utf-8")
+        draw = (tdeck_dir / "src/tdeck_ui_draw.cpp").read_text(encoding="utf-8")
+        ctx.check("tdeck: состояние экрана несёт счётчик пакетов из ядра",
+                  re.search(r"otaPktsGot\s*=\s*otaSlowRxChunksGot\s*\(\s*\)\s*;", ui)
+                  is not None
+                  and re.search(r"otaPktsTotal\s*=\s*otaSlowRxChunksTotal\s*\(\s*\)\s*;", ui)
+                  is not None,
+                  "tdeck_ui.cpp не заполняет otaPktsGot/otaPktsTotal из ядра — ячейка на панели "
+                  "покажет нули всю сессию")
+        ctx.check("tdeck: ячейка RECEIVED на медленной сессии показывает пакеты",
+                  re.search(r"otaSlow[\s\S]{0,400}PACKETS", draw) is not None
+                  and "otaPktsTotal" in draw,
+                  "в drawOta нет ветки «медленная сессия → пакеты»: на панели так и останутся "
+                  "килобайты, а не «получено N из M»")
 
     print("     сводка: экран держится на otaAnySessionActive(), счётчик пакетов один на "
           "все три экрана (две прошивки и проект платы T-Deck)")

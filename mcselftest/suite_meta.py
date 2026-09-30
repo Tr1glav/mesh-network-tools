@@ -11,7 +11,12 @@
 кем-то вызвана, и каждая цель обязана быть запускаемой.
 """
 import ast
+import contextlib
+import io
 import pathlib
+import tempfile
+
+from . import harness, suite_core
 
 
 def _defined_tests(path):
@@ -92,3 +97,51 @@ def shims_test(ctx, tree):
         ctx.check("обёртка %s запускает цель %s" % (sub, target),
                   '"--target", "%s"' % target in txt,
                   "в %s не найдена цель %s" % (shim, target))
+
+
+def solo_tree_test(ctx, tree):
+    """Проверка ядра не имеет права читать прошивку, которой рядом нет.
+
+    CI клонирует ОДНУ прошивку рядом с ядром — ту, чью ветку и собрали. Второй прошивки на
+    диске нет, и проверка ядра, читающая её напрямую, падает там, где у разработчика всё
+    зелёное: у него рядом лежат все три репозитория.
+
+    Именно так и вышло: `weak_hooks_test` и `ota_screen_progress_test` требовали обе прошивки
+    безусловно, локально проходили, а релизная сборка `meshcore-fork` упала на шаге
+    «Проверки на ПК». Правило записано в `targets.py` («ни одной прошивки рядом может и не
+    быть»), но чем оно обеспечено — ничем: нарушение видно только в CI.
+
+    Здесь оно обеспечивается запуском: поднимается временное дерево, где лежат ядро и РОВНО
+    ОДНА прошивка, и кросс-репозиторные проверки ядра прогоняются по нему. Падать не на чему —
+    второй прошивки физически нет.
+    """
+    tree = pathlib.Path(tree)
+    for sub in ("meshcore-fork", "tdeck"):
+        src = tree / sub
+        if not src.is_dir():
+            continue  # прошивки нет рядом — проверять нечего
+        with tempfile.TemporaryDirectory(prefix="solo-") as tmp:
+            root = pathlib.Path(tmp)
+            (root / sub).symlink_to(src, target_is_directory=True)
+            # Ядро кладём рядом ССЫЛКОЙ: корень дерева указывает на каталог ядра (как в
+            # selftest.py), а копия в 40 МБ ради проверки ни к чему.
+            (root / "mesh-network-core").symlink_to(tree / "mesh-network-core",
+                                                     target_is_directory=True)
+            solo = harness.Ctx(root / sub, tree / "mesh-network-core", "fork", tree=root)
+            # Тишина: прогон внутри проверки не должен выглядеть как ещё одна проверка.
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    suite_core.weak_hooks_test(solo)
+                    suite_core.ota_screen_progress_test(solo)
+                    suite_core.any_session_test(solo)
+            except Exception as e:  # noqa: BLE001 — падение здесь и есть ложь проверки
+                ctx.check("проверки ядра живут без второй прошивки (%s)" % sub, False,
+                          "%s: %s: %s" % (type(e).__name__, e,
+                                          (buf.getvalue() or "").strip()[-400:]))
+                continue
+            ctx.check("проверки ядра живут без второй прошивки (%s)" % sub,
+                      not solo.failures,
+                      "упали без второй прошивки на диске: %s — по правилу из targets.py "
+                      "молчание честнее выдуманного «OK»"
+                      % ", ".join(solo.failures[:6]))
