@@ -574,6 +574,66 @@ int main() {
 """
 
 
+def ota_first_burst_test(ctx):
+    """Потерянная первая пачка быстрого режима повторяется, и повтор не вечен.
+
+    Проверяется устройство кода: сессия идёт по радио, на хосте её не прогнать. Но обе
+    ошибки видны в исходнике однозначно.
+
+    Ошибка была в том, что ветка повтора стояла под otaChunksSent == 0 — счётчиком
+    ОТПРАВЛЕННЫХ кадров, который растёт в otaSendBurst. Первая пачка уходит из otaHandleAck
+    ещё до любого таймаута, поэтому к проверке счётчик равен числу кадров пачки, и ветка не
+    выполнялась никогда. Условие обязано спрашивать ПОДТВЕРЖДЁННОЕ: окно на нуле и маска
+    принятого пуста."""
+    src = (ctx.core / "src" / "ota.cpp").read_text(encoding="utf-8")
+
+    # Ветка повтора — та, что зовёт otaSendBurst внутри otaBotTick (в фазе DATA). Ищем её по
+    # вызову, а условие берём из ближайшего if сверху: сама ветка короткая и целиком в нём.
+    tick = src[src.index("void otaBotTick()"):]
+    call = tick.find("otaSendBurst();")
+    ctx.check("сторож фазы DATA умеет повторить пачку", call != -1,
+              "в otaBotTick нет вызова otaSendBurst — повторять потерянную пачку нечем")
+    if call == -1:
+        return
+    # Ворота ветки — внешний if, а не ближайший сверху: внутри ветки стоит
+    # `if (otaRetries > OTA_MAX_RETRIES)`, и поиск «ближайшего if» находил именно его,
+    # объявляя верный код неверным. Берём последний if с отступом МЕНЬШЕ, чем у вызова.
+    lines = tick[:call].splitlines()
+    depth = len(lines[-1]) - len(lines[-1].lstrip())
+    gate = next((l for l in reversed(lines)
+                 if l.lstrip().startswith("if (") and (len(l) - len(l.lstrip())) < depth), "")
+
+    ctx.check("повтор пачки не зависит от числа ОТПРАВЛЕННЫХ кадров",
+              "otaChunksSent" not in gate,
+              "ветка снова под otaChunksSent — она не выполнится никогда")
+    ctx.check("повтор пачки идёт по неподтверждённому окну", "otaSeq" in gate,
+              "условие повтора не смотрит на otaSeq: " + gate.strip())
+    ctx.check("повтор пачки смотрит и на маску принятых чанков", "otaWinAcked" in gate,
+              "условие не смотрит на otaWinAcked: подтверждённый чанк в нулевом окне "
+              "снова считался бы «ничего не дошло»")
+
+    # Вторая половина: повтор обязан стоить ретрая. otaSendBurst не ставит otaPolledMs, а
+    # ретраи в otaBotTick копятся только по висящему POLL — без явного счёта ветка крутилась
+    # бы вечно, повторяя пачку в мёртвый эфир.
+    body = tick[tick.rindex(gate, 0, call):call] if gate else ""
+    ctx.check("повтор пачки тратит ретрай", "otaRetries++" in body,
+              "ветка повтора не увеличивает otaRetries — цикл без выхода")
+    ctx.check("повтор пачки ограничен бюджетом ретраев", "OTA_MAX_RETRIES" in body,
+              "ветка повтора не сверяется с OTA_MAX_RETRIES")
+    ctx.check("исчерпанный бюджет обрывает сессию", "otaBotAbort" in body,
+              "по исчерпании ретраев ветка не зовёт otaBotAbort")
+
+    # Условие означает «ни один чанк не подтверждён В ЭТОЙ СЕССИИ» только если оба поля
+    # обнуляются на входе в фазу данных.
+    ack = src[src.index("void otaHandleAck()"):]
+    ack = ack[:ack.index("\n}")]
+    for field in ("otaSeq", "otaWinAcked"):
+        ctx.check("%s обнуляется при входе в фазу данных" % field,
+                  re.search(r"\b%s\s*=\s*0\s*;" % field, ack) is not None,
+                  "otaHandleAck не сбрасывает %s — условие повтора считало бы чужую сессию"
+                  % field)
+
+
 def relay_default_off_test(ctx):
     """Ретранслятором не должен быть никто: FEATURE_RELAY по умолчанию 0.
 
@@ -703,6 +763,46 @@ def build_commits_test(ctx):
                       "%s не глушит отправку — push из Actions запустит workflow заново" % wf)
     if not seen:
         ctx.note("SKIP build_commits_test: прошивок рядом нет")
+
+
+def features_defined_test(ctx):
+    """Каждый признак, по которому ветвится ЯДРО, определён в features.h каждой прошивки.
+
+    Неопределённое имя в `#if` молча считается нулём. Поэтому ненаписанный `#define` и
+    опечатка в имени дают одно и то же — выключенную ветку и полное молчание сборки. Так и
+    было: комментарий в начале features.h T-Deck обещает «они всегда определены, но могут
+    быть равны нулю», а FEATURE_MQTT, FEATURE_MESH_OTA_SENDER и FEATURE_COMPANION не были
+    определены нигде. Поведение совпадало с задуманным по совпадению.
+
+    Напрашивающийся `-Wundef` в build_flags эту работу не делает: он включается на весь
+    проект вместе с заголовками ESP-IDF и даёт около двухсот предупреждений на файл
+    (CONFIG_IDF_TARGET_ESP32, CONFIG_LOG_COLORS и прочие), в которых наше одно не найти.
+    Проверено на сборке T-Deck — флаг снят именно поэтому.
+
+    Исключение одно: FEATURE_RELAY. Его значение по умолчанию задаёт ядро, и `#define` в
+    прошивке перебил бы `#ifndef` ядра — за этим следит relay_default_off_test."""
+    names = set()
+    for d in (ctx.core / "src", ctx.core / "include"):
+        for f in sorted(d.rglob("*.cpp")) + sorted(d.rglob("*.h")):
+            names |= set(re.findall(r"\bFEATURE_[A-Z0-9_]+", f.read_text(encoding="utf-8")))
+    names -= {"FEATURE_RELAY"}
+    ctx.check("признаки ядра найдены", len(names) >= 3,
+              "в исходниках ядра нашлось всего %d признаков — проверка смотрит не туда"
+              % len(names))
+
+    seen = 0
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        path = ctx.tree / sub / "lib" / "meshcore" / "include" / "features.h"
+        if not path.is_file():
+            continue
+        seen += 1
+        txt = path.read_text(encoding="utf-8")
+        missing = sorted(n for n in names
+                         if not re.search(r"^\s*#\s*define\s+%s\b" % n, txt, re.M))
+        ctx.check("features.h %s определяет все признаки ядра" % name, not missing,
+                  "не определены: " + ", ".join(missing) + " — #if сочтёт их нулём молча")
+    if not seen:
+        ctx.note("SKIP features_defined_test: прошивок рядом нет")
 
 
 def relay_queue_test(ctx):
@@ -840,21 +940,25 @@ def handshake_budget_test(ctx):
 
 
 def fast_rx_isolation_test(ctx):
-    """Сырой кадр быстрого OTA и разбор meshcore-кадра — разные ветви, и это не стиль,
-    а работоспособность прошивки по быстрому каналу.
+    """В быстром режиме meshcore недостижим — ни для какого принятого кадра.
 
-    Было `if (быстрый кадр) {...} else if (checkAndMarkSeen(...)) {...} else {...}`: цепочка
-    дедупа и разбора пропускалась для сырого кадра. При переносе ретрансляции выше дедупа
-    цепочка осталась снаружи `else` и стала общей: каждый принятый кусок образа проходил
-    checkAndMarkSeen (он попадал в общий кольцевой буфер дедупа) и parseMeshCorePacket, а
-    в конце звался radio.startReceive() — в том числе поверх ещё не ушедшего в эфир WACK.
-    Приёмник переподписывался, не дождавшись конца собственной передачи, сенсор переставал
-    подтверждать пачки, а бот уходил в otaBotAbort("no progress") и возвращал обычный
-    конфиг радио. Симптом на железе: «отправитель не дожидается и переключается обратно».
+    Две поломки подряд родились в этом месте, и обе стоили работоспособности прошивки по
+    быстрому каналу.
 
-    Проверяем структурно: обе ветви обязаны быть альтернативами одного `if`, то есть
-    дедуп не может лежать на глубине тела «быстрой» ветви и не может идти после неё
-    отдельным оператором."""
+    Первая: было `if (быстрый кадр) {...} else if (checkAndMarkSeen(...)) {...}`, потом
+    ретрансляцию подняли выше дедупа, цепочка вышла из else и стала общей. Каждый кусок
+    образа проходил checkAndMarkSeen (попадал в общий кольцевой буфер дедупа) и
+    parseMeshCorePacket, а в конце звался radio.startReceive() — в том числе поверх ещё не
+    ушедшего в эфир WACK. Сенсор переставал подтверждать пачки, бот уходил в
+    otaBotAbort("no progress").
+
+    Вторая: развилка осталась плоской — `pktLen >= 9 && otaFastMode && магия`. Кадр,
+    принятый В БЫСТРОМ РЕЖИМЕ, но короче девяти байт или без магии (битый приём на FSK),
+    в неё не попадал и уходил в тот же else, к дедупу и startReceive. То есть дыра была
+    закрыта только для целых кадров.
+
+    Поэтому проверяется не порядок условий, а достижимость: внешняя развилка — по
+    otaFastMode, и всё meshcore-овское лежит в её else, куда из быстрого режима хода нет."""
     body = ctx.span(ctx.core / "src/radio_rx.cpp", "void radioRxTick()", "\n}\n")
     # комментарии выкидываем: в них и braces, и слова «else» встречаются свободно
     lines = []
@@ -863,43 +967,69 @@ def fast_rx_isolation_test(ctx):
         lines.append((raw if i < 0 else raw[:i]).strip())
     lines = [ln for ln in lines if ln]
 
-    # Глубина скобок ПЕРЕД каждой строкой: у «} else {» она на уровень больше тела
-    # ветви, поэтому именно так и узнаётся else того самого if.
+    # Глубина скобок ПЕРЕД каждой строкой: у «} else {» она на уровень больше тела ветви,
+    # поэтому именно так и узнаётся else того самого if.
     depths = []
     d = 0
     for ln in lines:
         depths.append(d)
         d += ln.count("{") - ln.count("}")
 
-    def find(pred):
-        for i, ln in enumerate(lines):
-            if pred(ln):
+    def find(pred, start=0):
+        for i in range(start, len(lines)):
+            if pred(lines[i]):
                 return i
         return -1
 
-    # условие занимает две строки, поэтому ищем по «pktLen >= 9 && otaFastMode»
-    cond_at = find(lambda ln: "pktLen >= 9 && otaFastMode" in ln)
-    dedup_at = find(lambda ln: ln.startswith("if (checkAndMarkSeen("))
-    if cond_at < 0 or dedup_at < 0:
-        ctx.check("сырой кадр быстрого OTA не попадает в дедуп и разбор meshcore", False,
-              "не нашли ветку быстрого кадра или checkAndMarkSeen в radioRxTick")
+    # Ровно `if (otaFastMode) {`, с открывающей скобкой: ниже в той же функции есть
+    # однострочный `if (otaFastMode) fastRxErrors++;` в ветке сорванного захвата, и по
+    # префиксу проверка цеплялась за него — то есть могла считать развилку целой, когда её
+    # уже нет.
+    gate = find(lambda ln: ln == "if (otaFastMode) {")
+    ctx.check("быстрый режим отделён внешней развилкой", gate >= 0,
+              "в radioRxTick нет `if (otaFastMode)` отдельным условием: развилка снова плоская, "
+              "и битый кадр быстрого канала уйдёт в meshcore")
+    if gate < 0:
+        return
+    D = depths[gate]
+
+    # else внешней развилки: всё, что ниже него, к быстрому режиму отношения не имеет.
+    alt = find(lambda ln: ln.startswith("} else {"), gate + 1)
+    while alt >= 0 and depths[alt] != D + 1:
+        alt = find(lambda ln: ln.startswith("} else {"), alt + 1)
+    ctx.check("у развилки по быстрому режиму есть else для обычного", alt >= 0,
+              "не нашли `} else {` внешней развилки")
+    if alt < 0:
         return
 
-    # Дедуп обязан лежать ВНУТРИ else-тела «быстрого» кадра: на уровень глубже самого if
-    # и после закрывающей `} else {`. Когда цепочка дедупа стояла рядом с else отдельным
-    # оператором, глубина была та же — и код выполнялся для сырых кадров тоже.
-    D = depths[cond_at]
-    ok = depths[dedup_at] == D + 1
-    detail = ""
-    if not ok:
-        detail = ("дедуп на глубине %d, а тело else-ветки на %d: цепочка дедупа выпала "
-                  "из else и достаёт сырые кадры" % (depths[dedup_at], D + 1))
-    else:
-        has_else = any(lines[i].startswith("} else {") and depths[i] == D + 1
-                       for i in range(cond_at + 1, dedup_at))
-        if not has_else:
-            ok, detail = False, "между быстрым кадром и дедупом нет else того же if"
-    ctx.check("сырой кадр быстрого OTA не попадает в дедуп и разбор meshcore", ok, detail)
+    # Сырой кадр разбирается ВНУТРИ быстрой ветви, а не после неё.
+    raw_at = find(lambda ln: "RAW_MAGIC0" in ln)
+    ctx.check("сырой кадр разбирается внутри быстрой ветви",
+              raw_at >= 0 and gate < raw_at < alt and depths[raw_at] >= D + 1,
+              "разбор сырого кадра стоит вне `if (otaFastMode)`")
+
+    # Главное: ни дедупа, ни разбора meshcore в быстрой ветви нет ни на какой глубине.
+    for name, needle in (("дедуп", "checkAndMarkSeen("),
+                         ("разбор meshcore", "parseMeshCorePacket("),
+                         ("ретрансляция", "maybeQueueRelay(")):
+        inside = [i for i in range(gate + 1, alt) if needle in lines[i]]
+        ctx.check("в быстром режиме недостижим %s" % name, not inside,
+                  "%s вызывается внутри ветки быстрого режима (строка %r)"
+                  % (name, lines[inside[0]] if inside else ""))
+        after = [i for i in range(alt + 1, len(lines)) if needle in lines[i]]
+        ctx.check("вне быстрого режима %s на месте" % name, bool(after),
+                  "%s не нашёлся и в обычной ветке — проверка смотрит не туда" % name)
+
+    # Кадр, выброшенный в быстром режиме, обязан оставить приёмник подписанным: мы ничего
+    # не передавали, и без startReceive радио замолчало бы до конца сессии.
+    drop = find(lambda ln: ln.startswith("} else {"), raw_at if raw_at > 0 else gate)
+    drop = drop if 0 <= drop < alt else -1
+    ctx.check("выброшенный кадр быстрого канала переподписывает приём",
+              drop >= 0 and any("radio.startReceive()" in lines[i] for i in range(drop, alt)),
+              "в ветке «не сырой кадр» нет radio.startReceive() — приёмник оглохнет")
+    ctx.check("выброшенный кадр быстрого канала считается",
+              drop >= 0 and any("fastRxErrors++" in lines[i] for i in range(drop, alt)),
+              "мусор на быстром канале нигде не считается — диагностики не будет")
 
 
 def timing_budgets_test(ctx):
