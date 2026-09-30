@@ -165,6 +165,45 @@ int main() {
     }
     expect(parseFixed(" -3,5") < -3.4f && parseFixed(" -3,5") > -3.6f, "parseFixed: запятая и пробел");
 
+    // --- fmtUdeg: микроградусы в строку, включая границы типа ---
+    // INT32_MIN — не теоретическая придирка: значение приходит из NMEA и из настроек, то есть
+    // извне. Раньше знак снимался через udeg = -udeg, а у знакового отрицания INT32_MIN нет
+    // результата в типе: неопределённое поведение, и компилятор вправе выкинуть проверку знака.
+    {
+        struct { int32_t v; const char* want; } cases[] = {
+            { 0,           "0.000000" },
+            { 55751244,    "55.751244" },
+            { -37617890,   "-37.617890" },
+            { 1,           "0.000001" },
+            { -1,          "-0.000001" },
+            { 2147483647,  "2147.483647" },
+            { -2147483647, "-2147.483647" },
+            { -2147483648, "-2147.483648" },   // INT32_MIN
+        };
+        for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char b[24];
+            memset(b, 'X', sizeof(b));
+            fmtUdeg(cases[i].v, b, sizeof(b));
+            if (strnlen(b, sizeof(b)) >= sizeof(b)) {
+                printf("fmtUdeg: строка не завершена при %ld\n", (long)cases[i].v);
+                fails++;
+            } else if (strcmp(b, cases[i].want) != 0) {
+                printf("fmtUdeg: %ld -> %s, ждали %s\n", (long)cases[i].v, b, cases[i].want);
+                fails++;
+            }
+        }
+        // Тесный буфер: обрезаем, но ноль остаётся
+        for (size_t n = 1; n < 14; n++) {
+            char small[14];
+            memset(small, 'X', sizeof(small));
+            fmtUdeg(-2147483648, small, n);
+            if (strnlen(small, n) >= n) {
+                printf("fmtUdeg: нет нуля при n=%u\n", (unsigned)n);
+                fails++;
+            }
+        }
+    }
+
     // Сюда прошивка дописывает свои чистые функции: у meshcore-fork это
     // fwVersionCmp и mqttSlug. Подставляется параметром extra_main.
     %%EXTRA_MAIN%%
@@ -192,6 +231,7 @@ def pure_functions_test(ctx, extra_funcs=(), extra_main="", extra_prelude="",
             + ctx.grab(ctx.core / "src/crypto.cpp", "char* fmtFix(") + "\n"
             + ctx.grab(ctx.core / "src/crypto.cpp", "float parseFixed(") + "\n"
             + ctx.grab(ctx.core / "src/crypto.cpp", "uint16_t crc16buf(") + "\n"
+            + ctx.grab(ctx.core / "src/crypto.cpp", "char* fmtUdeg(") + "\n"
             + "".join(ctx.grab(h, sig) + "\n" for h, sig in extra_funcs)
             + PURE_MAIN.replace("%%EXTRA_MAIN%%", extra_main))
     ok, out = ctx.host_run(code, "p.cpp", label)
@@ -1026,6 +1066,138 @@ def meshcore_copies_test(ctx):
               "а кода кнопки в прошивке нет")
     ctx.note("     сводка: копий lib/meshcore две, совпадают %d файлов, расходятся %d, "
              "только у форка %d" % (len(same), len(diff), len(only_fork)))
+
+
+PEER_PRELUDE = r"""
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#define PEER_CACHE_MAX 8
+struct PeerEntry { bool used; uint8_t hash; uint8_t pub[32]; uint32_t last_seen; };
+static PeerEntry peerCache[PEER_CACHE_MAX];
+static uint32_t clockMs = 1000;
+static unsigned long millis() { return clockMs; }
+"""
+
+PEER_MAIN = r"""
+int main() {
+    int fails = 0;
+    // Ключ, начинающийся с 0x00. Раньше слот считали занятым по pub[0] != 0, и такой узел
+    // был «неизвестен»: ответ в личку не уходил, dmNoPubkey рос без причины.
+    uint8_t zero[32];
+    memset(zero, 0xAB, 32);
+    zero[0] = 0x00;
+    rememberPeerPub(0x5C, zero);
+    uint8_t* got = findPeerPub(0x5C);
+    if (got == NULL) { printf("ключ с нулевым первым байтом не найден\n"); fails++; }
+    else if (memcmp(got, zero, 32) != 0) { printf("найден не тот ключ\n"); fails++; }
+
+    // Неизвестный хэш по-прежнему не находится — иначе «нашлось всё» тоже сошло бы за успех
+    if (findPeerPub(0x5D) != NULL) { printf("неизвестный хэш нашёлся\n"); fails++; }
+
+    // Хэш 0x00 в пустом кэше: у свободного слота поле hash тоже нулевое, и без признака
+    // занятости он выглядел бы как запись про узел 0x00 с нулевым ключом.
+    memset(peerCache, 0, sizeof(peerCache));
+    if (findPeerPub(0x00) != NULL) { printf("пустой слот сошёл за узел 0x00\n"); fails++; }
+    uint8_t k2[32];
+    memset(k2, 0x77, 32);
+    rememberPeerPub(0x00, k2);
+    uint8_t* g2 = findPeerPub(0x00);
+    if (g2 == NULL || memcmp(g2, k2, 32) != 0) { printf("узел 0x00 не запомнился\n"); fails++; }
+
+    // Кэш заполняется без вытеснения, пока есть свободные слоты
+    memset(peerCache, 0, sizeof(peerCache));
+    for (int i = 0; i < PEER_CACHE_MAX; i++) {
+        uint8_t k[32];
+        memset(k, (uint8_t)(0x10 + i), 32);
+        k[0] = 0x00;                      // все ключи с нулевым первым байтом — худший случай
+        clockMs += 10;
+        rememberPeerPub((uint8_t)(0x20 + i), k);
+    }
+    for (int i = 0; i < PEER_CACHE_MAX; i++) {
+        if (findPeerPub((uint8_t)(0x20 + i)) == NULL) {
+            printf("узел %d вытеснен, хотя место было\n", i);
+            fails++;
+        }
+    }
+    // Повторный адверт того же узла обновляет запись, а не занимает второй слот
+    uint8_t k3[32];
+    memset(k3, 0x99, 32);
+    clockMs += 10;
+    rememberPeerPub(0x20, k3);
+    uint8_t* g3 = findPeerPub(0x20);
+    if (g3 == NULL || memcmp(g3, k3, 32) != 0) { printf("повторный адверт не обновил ключ\n"); fails++; }
+    int busy = 0;
+    for (int i = 0; i < PEER_CACHE_MAX; i++) if (peerCache[i].used) busy++;
+    if (busy != PEER_CACHE_MAX) { printf("занято слотов %d\n", busy); fails++; }
+
+    if (fails) { printf("не сошлось: %d\n", fails); return 1; }
+    printf("ok\n");
+    return 0;
+}
+"""
+
+
+def peer_cache_test(ctx):
+    """Кэш публичных ключей не теряет узел, чей ключ начинается с нуля.
+
+    Слот считали занятым по `pub[0] != 0`, а первый байт публичного ключа бывает нулём —
+    один узел из 256. Для такого узла `findPeerPub` возвращал NULL: ответ в личку не уходил,
+    а `dmNoPubkey` рос и показывал «advert не дошёл», хотя адверт дошёл и ключ лежал в кэше.
+    Диагностика врала ровно там, где по ней и стали бы разбираться."""
+    if not shutil.which("g++"):
+        print("SKIP g++ не найден — кэш ключей не проверен")
+        return
+    code = (PEER_PRELUDE
+            + ctx.grab(ctx.core / "src/mesh.cpp", "uint8_t* findPeerPub(") + "\n"
+            + ctx.grab(ctx.core / "src/mesh.cpp", "void rememberPeerPub(") + "\n"
+            + PEER_MAIN)
+    exe, build = ctx.host_build(code, "peer.cpp")
+    if exe is None:
+        ctx.check("сборка теста кэша ключей", False, build[:500])
+        return
+    run = subprocess.run([str(exe)], capture_output=True, text=True)
+    ctx.check("кэш ключей: нулевой первый байт, узел 0x00, заполнение без вытеснения",
+              run.returncode == 0, (run.stdout + run.stderr).strip()[:600])
+
+    # Признак занятости обязан быть в самой структуре: без него проверка выше собралась бы
+    # со своим объявлением PeerEntry и молчала о том, что в ядре поля нет.
+    cfg = (ctx.core / "include" / "config.h").read_text(encoding="utf-8")
+    ctx.check("PeerEntry несёт признак занятости",
+              re.search(r"struct\s+PeerEntry\s*\{[^}]*\bbool\s+used\s*;", cfg, re.S) is not None,
+              "в PeerEntry нет поля used — занятость слота снова определяется по ключу")
+
+
+def group_text_bound_test(ctx):
+    """Расшифровка группового текста сама ограничивает длину, а не верит вызывающему.
+
+    `decryptGroupText` пишет в буфер фиксированного размера ровно `len` байт, а `len` приходит
+    параметром. Сегодня единственный вызывающий — разбор кадра, и больше 240 там не бывает: кадр
+    в эфире короче. Но это свойство вызывающего, а не функции; появится второй (по сети, из
+    приложения, из тестов) — и переполнение стека станет тихим.
+
+    На хосте функцию не прогнать: она тянет mbedtls. Проверяется устройство — предел есть, он
+    назван константой, тем же именем объявлен буфер, и стоит он ДО расшифровки."""
+    src = (ctx.core / "src" / "crypto.cpp").read_text(encoding="utf-8")
+    fn = ctx.grab(ctx.core / "src/crypto.cpp", "String decryptGroupText(")
+
+    m = re.search(r"uint8_t\s+plaintext\[([A-Za-z_][A-Za-z_0-9]*)\]", fn)
+    ctx.check("буфер расшифровки объявлен через именованный предел", m is not None,
+              "plaintext объявлен числом: предел и буфер разъедутся при первой же правке")
+    if not m:
+        return
+    name = m.group(1)
+    ctx.check("предел задан макросом в том же файле",
+              re.search(r"#\s*define\s+%s\s+\d+" % re.escape(name), src) is not None,
+              "%s нигде не определён числом" % name)
+
+    guard = re.search(r"if\s*\(\s*len\s*>\s*%s\s*\)\s*return" % re.escape(name), fn)
+    ctx.check("длина сверяется с этим же пределом", guard is not None,
+              "в decryptGroupText нет отказа по len > %s — предел держится на вызывающем" % name)
+    if guard:
+        loop = fn.find("mbedtls_aes_crypt_ecb")
+        ctx.check("предел проверяется ДО расшифровки", guard.start() < loop,
+                  "отказ по длине стоит после цикла расшифровки — переполнение уже случилось")
 
 
 def relay_queue_test(ctx):
