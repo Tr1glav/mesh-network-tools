@@ -62,6 +62,7 @@ cd ../tdeck         && python3 scripts/selftest.py
 | `mcselftest/suite_core.py` | проверки ядра — идут для **любой** цели |
 | `mcselftest/suite_fork.py` | своё у meshcore-fork: страница, кнопки в MQTT, приложение |
 | `mcselftest/suite_tdeck.py` | своё у T-Deck: пакет `.tapp`, шапка ELF |
+| `mcselftest/suite_font.py` | шрифты T-Deck: кириллица в пропорциональных шрифтах |
 | `mcselftest/suite_meta.py` | проверки самого набора проверок (см. ниже) |
 
 Проверки ядра идут для любой цели намеренно. Раньше они лежали в `scripts/selftest.py`

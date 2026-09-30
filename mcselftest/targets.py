@@ -8,7 +8,7 @@ suite_<имя>.py рядом. Больше нигде трогать ничег�
 """
 import pathlib
 
-from . import suite_core, suite_fork, suite_tdeck
+from . import suite_core, suite_fork, suite_font, suite_tdeck
 
 
 def _core_checks(ctx, host_extra=None, pure_extra=None):
@@ -59,13 +59,14 @@ def run_fork(ctx):
 
 
 def run_tdeck(ctx):
-    """tdeck: ядро плюс своё — пакет приложения и шапка ELF."""
+    """tdeck: ядро плюс своё — пакет приложения, шапка ELF и кириллица в шрифтах."""
     _core_checks(ctx,
                  host_extra=dict(extra_funcs=suite_tdeck.HOST_EXTRA_FUNCS,
                                  extra_main=suite_tdeck.HOST_EXTRA_MAIN,
                                  extra_label=suite_tdeck.HOST_EXTRA_LABEL))
     suite_tdeck.tapp_test(ctx)
     suite_tdeck.elf_headers_test(ctx)
+    suite_font.cyrillic_font_test(ctx)
 
 
 # Имя цели -> (каталог прошивки относительно рабочего дерева, что запускать, пояснение).
