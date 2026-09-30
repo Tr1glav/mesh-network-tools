@@ -923,3 +923,82 @@ def timing_budgets_test(ctx):
           % (airtime, vals["CAD_WAIT_BUDGET_MS"], tx_worst))
     print("             худший ответ %d мс, таймаут с запасом >%d мс, цикл проверки ~%d мс"
           % (response, response, tx_worst + response))
+
+
+def ota_slow_test(ctx):
+    """Медленная прошивка: объявленный размер, порядок проверки и номер чанка.
+
+    Все три проверки закрывают ошибки, из-за которых медленный режим не мог завершиться ни
+    при каких условиях. Проверяется устройство кода, а не поведение: сессия идёт часами,
+    трогает флеш и радио, и прогнать её на хосте нельзя — но каждая из трёх ошибок видна в
+    исходнике однозначно.
+    """
+    src_path = ctx.core / "src/ota_slow.cpp"
+    if not src_path.is_file():
+        ctx.check("ota_slow.cpp найден", False, str(src_path))
+        return
+
+    # --- 1. Узлу объявляется размер РАСПАКОВАННОГО образа ---
+    # Здесь стоял otaFwSize — длина СЖАТОГО потока плюс хвост нулей. Приёмник открывал
+    # раздел под него, обрезал по нему распакованный поток, длина сходилась ровно, а CRC32
+    # считается по полному образу и не совпадал никогда.
+    start = ctx.grab(src_path, "bool otaSlowStart(")
+    m = re.search(r"otaSlowTotal\s*=\s*(\w+)\s*;", start)
+    ctx.check("медленный режим объявляет размер образа", m is not None,
+              "в otaSlowStart нет присваивания otaSlowTotal")
+    if m:
+        ctx.check("объявляется размер РАСПАКОВАННОГО образа, а не сжатого потока",
+                  m.group(1) == "otaImgSize",
+                  "otaSlowTotal = %s; сжатый размер узлу не годится — он им открывает "
+                  "раздел и проверяет CRC" % m.group(1))
+
+    # ...и это объявление должно быть видно самому ядру: раньше otaImgSize объявлялся только
+    # в заголовке прошивки, и файл ядра его не видел — отсюда и подстановка otaFwSize.
+    ota_h = (ctx.core / "include/ota.h").read_text(encoding="utf-8")
+    ctx.check("otaImgSize объявлен в заголовке ядра",
+              re.search(r"extern\s+uint32_t\s+otaImgSize\s*;", ota_h) is not None,
+              "в include/ota.h ядра нет extern uint32_t otaImgSize")
+
+    # Числа не равны и не близки — значит путаница фатальна, а не косметична. Считаем на
+    # данных, похожих на прошивку (много повторов), а не на случайных: случайные не жмутся.
+    img = (b"\x00" * 64 + b"MBFW:h3:0.0.0" + bytes(range(256))) * 400
+    stream = zlib.compress(img, 9)
+    cfg = (ctx.core / "include/config.h").read_text(encoding="utf-8")
+    pad = re.search(r"#define\s+OTA_Z_TAIL_PAD\s+(\d+)", cfg)
+    announced_wrong = len(stream) + (int(pad.group(1)) if pad else 0)
+    ctx.check("сжатый и распакованный размеры расходятся в разы",
+              announced_wrong * 2 < len(img),
+              "образ %d Б, поток %d Б — на таких данных подмена была бы незаметна"
+              % (len(img), announced_wrong))
+
+    # --- 2. Приёмник проверяет образ раньше, чем подтвердит его ---
+    rx = ctx.grab(src_path, "void otaSlowRxData(")
+    end_at = rx.find("otaSlowStreamEnd(true)")
+    ack_at = rx.find("slowRxAckNow(")
+    off_at = rx.find("slowRxOn = false")
+    ctx.check("приёмник вообще проверяет образ перед применением", end_at >= 0,
+              "в otaSlowRxData нет otaSlowStreamEnd(true)")
+    if end_at >= 0 and ack_at >= 0:
+        ctx.check("подтверждение уходит ПОСЛЕ проверки образа", end_at < ack_at,
+                  "«принял всё» уходит в эфир раньше проверки — ведущий заканчивает сессию "
+                  "довольным на несошедшемся образе")
+    # otaSlowRxAbort выходит по `if (!slowRxOn) return;`, поэтому гасить флаг до отказа —
+    # значит проглотить отказ целиком: ни ota:sfail в эфир, ни строки на экран.
+    abort_src = ctx.grab(src_path, "void otaSlowRxAbort(")
+    ctx.check("отказ приёмника защищён флагом сессии",
+              re.search(r"if\s*\(\s*!\s*slowRxOn\s*\)\s*return\s*;", abort_src) is not None,
+              "в otaSlowRxAbort нет проверки slowRxOn — проверка ниже потеряла смысл")
+    if end_at >= 0 and off_at >= 0:
+        ctx.check("флаг сессии гаснет ПОСЛЕ проверки образа", end_at < off_at,
+                  "slowRxOn снят раньше проверки — otaSlowRxAbort выйдет на первой строке, "
+                  "и отказ не дойдёт ни до ведущего, ни до экрана")
+
+    # --- 3. Номер отправленного чанка не переживает сессию ---
+    tick = ctx.grab(src_path, "void otaSlowTick(")
+    ctx.check("номер чанка не статический внутри otaSlowTick",
+              re.search(r"\bstatic\b", tick) is None,
+              "статическая переменная переживает сессию: вторая сессия за включение начнёт "
+              "окно не с нулевого чанка, и узел её не догонит")
+    ctx.check("номер чанка сбрасывается на старте сессии",
+              re.search(r"otaSlowSent\s*=\s*0\s*;", start) is not None,
+              "в otaSlowStart нет сброса otaSlowSent")
