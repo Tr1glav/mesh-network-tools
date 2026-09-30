@@ -936,6 +936,98 @@ def loss_counters_live_test(ctx):
                       "живой счётчик тоже пропал из ответа")
 
 
+# Копии lib/meshcore, которым РАЗРЕШЕНО расходиться, и почему. Список ведётся руками
+# намеренно: расхождение само по себе не ошибка (файлы платформенные), ошибка — расхождение,
+# которого никто не заметил. Поэтому новое расхождение обязано попасть сюда осознанно, а
+# исчезнувшее — уйти отсюда.
+MESHCORE_DIVERGENT = {
+    "src/app_main.cpp":       "роли плат и порядок инициализации: у T-Deck экран, SD, клавиатура",
+    "src/display.cpp":        "OLED у Heltec против ST7789 у T-Deck",
+    "src/sensor_tasks.cpp":   "у T-Deck нет кнопки, состав задач другой",
+    "include/app_main.h":     "разный состав хуков платформы",
+    "include/board_config.h": "пины и параметры разных плат",
+    "include/build_info.h":   "ГЕНЕРИРУЕТСЯ сборкой: версия и хэш исходников",
+    "include/cyrillic_glyphs.h": "у T-Deck свои таблицы шрифтов под ST7789",
+    "include/display.h":      "разные экраны — разный интерфейс вывода",
+    "include/features.h":     "наборы признаков разных плат",
+    "include/oled.h":         "OLED против ST7789",
+}
+# Файлы, которых у T-Deck нет и не должно быть.
+MESHCORE_FORK_ONLY = {
+    "src/button.cpp":    "у T-Deck нет кнопки сенсорного типа: ввод — клавиатура и трекбол",
+    "include/button.h":  "то же",
+}
+
+
+def meshcore_copies_test(ctx):
+    """Расхождения двух копий lib/meshcore перечислены явно.
+
+    `lib/meshcore` — это не общий слой, а две независимые копии в двух прошивках; в ядро эти
+    файлы не поднимаются, потому что платформенные (экран, ввод, роли плат). Расхождение
+    поэтому штатно. Не штатно другое: расхождение, про которое никто не знает. Правка в одной
+    копии молча не доезжает во вторую, и узнать об этом можно только по поведению платы.
+
+    Поэтому список разрешённых расхождений ведётся руками, а проверка требует, чтобы он
+    совпадал с действительностью В ОБЕ СТОРОНЫ: новый разошедшийся файл — провал (расхождение
+    не осознано), и файл, записанный как разошедшийся, но ставший одинаковым, — тоже провал
+    (список врёт, и следующий читатель поверит ему, а не файлам)."""
+    fork = ctx.tree / "meshcore-fork" / "lib" / "meshcore"
+    tdeck = ctx.tree / "tdeck" / "lib" / "meshcore"
+    if not (fork.is_dir() and tdeck.is_dir()):
+        ctx.note("SKIP meshcore_copies_test: рядом нет обеих прошивок")
+        return
+
+    same, diff, only_fork, only_tdeck = [], [], [], []
+    names = set()
+    for sub in ("src", "include"):
+        for d in (fork / sub, tdeck / sub):
+            if d.is_dir():
+                names |= {sub + "/" + f.name for f in d.iterdir() if f.is_file()}
+    for rel in sorted(names):
+        a, b = fork / rel, tdeck / rel
+        if a.is_file() and b.is_file():
+            (same if a.read_bytes() == b.read_bytes() else diff).append(rel)
+        elif a.is_file():
+            only_fork.append(rel)
+        else:
+            only_tdeck.append(rel)
+
+    unexpected = [r for r in diff if r not in MESHCORE_DIVERGENT]
+    ctx.check("новых расхождений копий lib/meshcore нет", not unexpected,
+              "расходятся, но в списке не записаны: " + ", ".join(unexpected) +
+              " — внесите с причиной в MESHCORE_DIVERGENT или сведите файлы")
+    stale = [r for r in MESHCORE_DIVERGENT if r in same]
+    ctx.check("список расхождений не содержит лишнего", not stale,
+              "записаны как разошедшиеся, а совпадают: " + ", ".join(stale))
+
+    # Файл только у форка — тоже решение, а не случайность.
+    extra = [r for r in only_fork if r not in MESHCORE_FORK_ONLY
+             and not r.startswith(("src/companion", "src/mqtt", "src/web", "src/net",
+                                   "src/support", "src/coordinator", "src/fwupdate",
+                                   "include/companion", "include/mqtt", "include/web",
+                                   "include/net", "include/support", "include/coordinator",
+                                   "include/fwupdate", "include/ca_bundle", "include/ota_internal"))]
+    ctx.check("файлы, которых нет у T-Deck, перечислены", not extra,
+              "есть только у форка и нигде не объяснены: " + ", ".join(extra))
+
+    # Кнопки у T-Deck нет — это решение владельца, и мёртвой копии там быть не должно.
+    ctx.check("у T-Deck нет копии кода кнопки",
+              not (tdeck / "src" / "button.cpp").exists()
+              and not (tdeck / "include" / "button.h").exists(),
+              "вернулась мёртвая копия button.cpp: она не компилируется (FEATURE_BUTTON=0) "
+              "и разойдётся с форком молча")
+    feat = (tdeck / "include" / "features.h").read_text(encoding="utf-8")
+    # Именно `#if FEATURE_BUTTON` + `#error` подряд. Искать просто «#error» и слово «кнопка»
+    # где-нибудь в файле нельзя: других #error в features.h хватает, и проверка проходила бы
+    # после удаления нужного — откат это и показал.
+    ctx.check("включить кнопку у T-Deck нельзя молча",
+              re.search(r"#if\s+FEATURE_BUTTON\s*\n\s*#\s*error", feat) is not None,
+              "features.h T-Deck не отказывает на FEATURE_BUTTON=1 — признак включился бы, "
+              "а кода кнопки в прошивке нет")
+    ctx.note("     сводка: копий lib/meshcore две, совпадают %d файлов, расходятся %d, "
+             "только у форка %d" % (len(same), len(diff), len(only_fork)))
+
+
 def relay_queue_test(ctx):
     """Решения ретранслятора по кадру.
 

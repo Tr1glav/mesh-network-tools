@@ -32,6 +32,7 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.relay_default_off_test(ctx)
     suite_core.features_defined_test(ctx)
     suite_core.loss_counters_live_test(ctx)
+    suite_core.meshcore_copies_test(ctx)
     suite_core.relay_queue_test(ctx)
     suite_core.fast_rx_isolation_test(ctx)
     suite_core.handshake_budget_test(ctx)
