@@ -567,6 +567,60 @@ int main() {
     meshRelayTick();
     want("после освобождения очереди кадр проходит", maybeQueueRelay(over, nover), RELAY_QUEUED);
 
+    // ===== Чужая разметка пути =====
+    // Размер хэша хопа кадр объявляет сам. Свой путь мы строим константой PATH_HASH_SIZE, и
+    // при несовпадении переиздание портит кадр: шаг по чужому пути один, а запись своя.
+    // Однобайтовый хэш — это оригинальный MeshCore, встретить его в общем канале штатно.
+    clockMs += 100000;
+    meshRelayTick();
+    for (int hs = 1; hs <= 4; hs++) {
+        if (hs == PATH_HASH_SIZE) continue;
+        uint8_t alien[256];
+        int at = 0;
+        alien[at++] = (uint8_t)((0x01 << 2) | 0x01);
+        alien[at++] = (uint8_t)(((hs - 1) << 6) | 1);      // один хоп чужого размера
+        memset(alien + at, 0x5A + hs, hs);
+        at += hs;
+        memset(alien + at, 0x5A + hs, 20);
+        char what[64];
+        snprintf(what, sizeof(what), "хэш хопа %d Б не переиздаём", hs);
+        want(what, maybeQueueRelay(alien, at + 20), RELAY_SKIPPED);
+    }
+    // ...и кадр со своим размером по-прежнему проходит: отказ адресный, а не «всё подряд»
+    uint8_t mine[256];
+    int nm = mkFrame(mine, 1, 0x6B);
+    want("кадр со своим размером хэша проходит", maybeQueueRelay(mine, nm), RELAY_QUEUED);
+
+    // ===== Один кадр за тик =====
+    // txFrame ждёт канал до CAD_WAIT_BUDGET_MS (1.5 с) и держит кадр в эфире ещё около
+    // полусекунды. Раньше тик отдавал всю очередь одним проходом — полная очередь
+    // останавливала главный цикл почти на 16 секунд, и это штатный случай: паузы берутся из
+    // одного диапазона, поэтому принятые подряд кадры просрочиваются вместе.
+    clockMs += 100000;
+    for (int i = 0; i < RELAY_QUEUE_MAX + 2; i++) meshRelayTick();   // очередь начисто
+    int queued = 0;
+    for (int i = 0; i < RELAY_QUEUE_MAX; i++) {
+        uint8_t q[256];
+        int nq = mkFrame(q, 0, (uint8_t)(0xC0 + i));
+        if (maybeQueueRelay(q, nq) == RELAY_QUEUED) queued++;
+    }
+    want("очередь набрана целиком", queued, RELAY_QUEUE_MAX);
+    clockMs += 100000;                        // просрочены ВСЕ слоты сразу
+    uint32_t sentBefore = relayForwardedCount;
+    meshRelayTick();
+    want("за один тик уходит ровно один кадр",
+         (int)(relayForwardedCount - sentBefore), 1);
+    meshRelayTick();
+    want("следующий тик отдаёт следующий кадр",
+         (int)(relayForwardedCount - sentBefore), 2);
+    // Очередь обязана разгрузиться целиком — по одному за тик, но без потерь
+    for (int i = 0; i < RELAY_QUEUE_MAX; i++) meshRelayTick();
+    want("вся очередь разгружается тиками",
+         (int)(relayForwardedCount - sentBefore), RELAY_QUEUE_MAX);
+    // И пустая очередь ничего не отправляет
+    meshRelayTick();
+    want("пустая очередь молчит", (int)(relayForwardedCount - sentBefore), RELAY_QUEUE_MAX);
+
     if (fails) { printf("не сошлось: %d\n", fails); return 1; }
     printf("ok\n");
     return 0;
