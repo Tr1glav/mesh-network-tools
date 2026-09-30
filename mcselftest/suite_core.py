@@ -859,6 +859,83 @@ def features_defined_test(ctx):
         ctx.note("SKIP features_defined_test: прошивок рядом нет")
 
 
+def loss_counters_live_test(ctx):
+    """Каждый счётчик потерь, который показывает страница, может сработать в этой сборке.
+
+    Было так: на странице T-Deck пять счётчиков, из них живой один. `relayQueueDrops` растёт
+    только в очереди переизданий (она за FEATURE_RELAY, а он выключен у всех), а
+    `replyDropped`, `replyDeferred` и `dmNoPubkey` — только в очереди отложенных ответов,
+    которая целиком лежит за `#ifndef SENSOR_NODE`; T-Deck собирается с `SENSOR_NODE=1`.
+
+    Мёртвый счётчик не виден — страницы показывают только ненулевые. Беда в другом: пустая
+    строка потерь читается как «потерь нет», то есть страница обещает диагностику, которой у
+    неё нет.
+
+    Механизм ответов в сенсоры НЕ переносили: рядом в mesh_rx.cpp стоит обратное решение —
+    «сенсорный узел пассивный, пинг и личку не обслуживает». Поэтому вердикт «может ли
+    счётчик сработать» задан в ядре (MESH_HAS_* в globals.h), а обе страницы его спрашивают."""
+    g = (ctx.core / "include" / "globals.h").read_text(encoding="utf-8")
+
+    # Вердикт живёт в ядре и выведен из того, от чего зависит на самом деле, а не задан числом.
+    ctx.check("ядро объявляет MESH_HAS_REPLY_QUEUE", "MESH_HAS_REPLY_QUEUE" in g,
+              "вердикта про очередь ответов нет — страницы снова будут решать сами")
+    ctx.check("вердикт про ответы выведен из SENSOR_NODE",
+              re.search(r"#ifdef\s+SENSOR_NODE\s*\n\s*#\s*define\s+MESH_HAS_REPLY_QUEUE\s+0", g)
+              is not None,
+              "MESH_HAS_REPLY_QUEUE не выведен из SENSOR_NODE")
+    ctx.check("вердикт про ретрансляцию выведен из FEATURE_RELAY",
+              re.search(r"#\s*define\s+MESH_HAS_RELAY_QUEUE\s+FEATURE_RELAY", g) is not None,
+              "MESH_HAS_RELAY_QUEUE задан не через FEATURE_RELAY — разъедется с признаком")
+
+    # Счётчик и его вердикт: где растёт и чем закрыт на странице.
+    guarded = {"relayQueueDrops": "MESH_HAS_RELAY_QUEUE",
+               "replyDropped": "MESH_HAS_REPLY_QUEUE",
+               "replyDeferred": "MESH_HAS_REPLY_QUEUE",
+               "dmNoPubkey": "MESH_HAS_REPLY_QUEUE"}
+
+    # Инкремент каждого счётчика обязан существовать — иначе счётчик мёртв везде, и вердикт
+    # ему не поможет.
+    src = "\n".join((ctx.core / "src" / f).read_text(encoding="utf-8")
+                    for f in ("mesh_rx.cpp", "mesh_relay.cpp", "radio.cpp"))
+    for name in list(guarded) + ["cadGiveUps"]:
+        ctx.check("счётчик %s где-то растёт" % name, name + "++" in src,
+                  "в ядре нет ни одного инкремента %s — счётчик мёртв при любых признаках"
+                  % name)
+
+    # Страница T-Deck: каждый счётчик из списка закрыт своим вердиктом.
+    page = ctx.tree / "tdeck" / "src" / "tdeck_web.cpp"
+    if page.is_file():
+        txt = page.read_text(encoding="utf-8")
+        block = txt[txt.index("struct { uint32_t v; const char* t; } los[]"):]
+        block = block[:block.index("};")]
+        for name, macro in guarded.items():
+            listed = name in block
+            ctx.check("страница T-Deck закрывает %s вердиктом" % name,
+                      (not listed) or macro in block,
+                      "%s показывается без #if %s — на этой плате он не может сработать"
+                      % (name, macro))
+    # Страница форка: /info отдаёт мёртвые поля только под вердиктом. Скрипт страницы
+    # фильтрует по значению, поэтому отсутствующего поля он просто не покажет.
+    web = ctx.tree / "meshcore-fork" / "lib" / "meshcore" / "src" / "web.cpp"
+    if web.is_file():
+        txt = web.read_text(encoding="utf-8")
+        i = txt.find("char loss[")
+        ctx.check("/info собирает счётчики потерь отдельным фрагментом", i >= 0,
+                  "в web.cpp нет сборки фрагмента потерь — значит все поля уходят всегда, "
+                  "включая мёртвые")
+        if i >= 0:
+            frag = txt[i:txt.index("char json[", i)]
+            for field, macro in (("rlq", "MESH_HAS_RELAY_QUEUE"),
+                                 ("rdr", "MESH_HAS_REPLY_QUEUE"),
+                                 ("rdf", "MESH_HAS_REPLY_QUEUE"),
+                                 ("dmn", "MESH_HAS_REPLY_QUEUE")):
+                ctx.check("/info отдаёт %s только под вердиктом" % field,
+                          field in frag and macro in frag,
+                          "поле %s уходит без #if %s" % (field, macro))
+            ctx.check("/info всегда отдаёт cadg", "cadg" in frag,
+                      "живой счётчик тоже пропал из ответа")
+
+
 def relay_queue_test(ctx):
     """Решения ретранслятора по кадру.
 
