@@ -33,6 +33,7 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.fast_rx_isolation_test(ctx)
     suite_core.handshake_budget_test(ctx)
     suite_core.timing_budgets_test(ctx)
+    suite_core.build_commits_test(ctx)
 
 
 def run_core(ctx):

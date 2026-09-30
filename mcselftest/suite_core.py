@@ -636,6 +636,75 @@ def relay_default_off_test(ctx):
               "%s не разгружает очередь переизданий" % path)
 
 
+def build_commits_test(ctx):
+    """Каждая сборка коммитит и отправляет, а релиз остаётся за явной просьбой (правило 6).
+
+    Проверяется решение, а не поведение: запускать здесь настоящую сборку с push нельзя, а
+    ошибка в этих воротах видна только постфактум — либо код перестал уезжать в репозиторий
+    молча, либо, наоборот, CI начал коммитить сам и зациклил себя.
+
+    Пять утверждений на каждую прошивку плюс страховка CI. Ворота живут в
+    scripts/copy_firmware.py, в пост-действии сборки: коммитить то, что не собралось, смысла
+    нет, поэтому шаг обязан стоять именно там, а не в pre-скрипте."""
+    seen = 0
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        cf = ctx.tree / sub / "scripts" / "copy_firmware.py"
+        if not cf.is_file():
+            continue
+        seen += 1
+        txt = cf.read_text(encoding="utf-8")
+
+        # Условие, под которым зовётся release.py: ближайший if выше вызова.
+        lines = txt.splitlines()
+        call = next((i for i, l in enumerate(lines) if "subprocess.run(cmd" in l), None)
+        ctx.check("%s: сборка зовёт release.py" % name, call is not None,
+                  "в %s нет вызова release.py" % cf)
+        if call is None:
+            continue
+        # Ворота — это внешний if тела функции (отступ 4), а не ближайший сверху: между ним
+        # и вызовом стоит `if os.environ.get("RELEASE") == "1"`, и поиск «ближайшего if»
+        # находил именно его, объявляя верный код неверным.
+        gate = next((lines[i] for i in range(call, -1, -1)
+                     if lines[i].startswith("    if ")), "")
+        flat = re.sub(r"[\s'\"]", "", gate)
+
+        # Главное: отправка больше НЕ ждёт GIT=1. Правило 6 разрешает коммит без спроса, и
+        # ворота, требующие переменную, возвращают прежний запрет чёрным ходом.
+        ctx.check("%s: отправка не требует GIT=1" % name,
+                  "GIT)==1" not in flat.replace("NOGIT", "_"),
+                  "ворота %s снова ждут GIT=1" % cf.name)
+        # Но выключить её должно быть можно, и обоими способами: NOGIT=1 нужен CI (иначе push
+        # перезапустит workflow), GIT=0 — человеку с незаконченной правкой в дереве.
+        ctx.check("%s: NOGIT=1 выключает отправку" % name, "NOGIT)!=1" in flat,
+                  "в воротах нет NOGIT")
+        ctx.check("%s: GIT=0 выключает отправку" % name,
+                  re.search(r"(?<!NO)GIT\)!=0", flat) is not None,
+                  "в воротах нет GIT=0")
+
+        # Релиз этими воротами не делается: релизная ветка только при RELEASE=1.
+        rel = re.search(r'RELEASE"\)\s*==\s*"1"', txt)
+        ctx.check("%s: релизная ветка только при RELEASE=1" % name, rel is not None,
+                  "--release добавляется не по RELEASE=1")
+        if rel:
+            tail = txt[rel.end():rel.end() + 200]
+            ctx.check("%s: под RELEASE=1 добавляется именно --release" % name,
+                      "--release" in tail, "после проверки RELEASE не добавляется --release")
+
+        # Пост-действие, а не pre: коммитим только то, что собралось.
+        ctx.check("%s: ворота стоят в пост-действии сборки" % name,
+                  "AddPostAction" in txt, "в %s нет AddPostAction" % cf.name)
+
+        # CI обязан глушить отправку явно. Раньше это была страховка (без GIT=1 и так ничего
+        # не уходило), теперь — единственное, что отделяет Actions от бесконечной пересборки.
+        wf = ctx.tree / sub / ".github" / "workflows" / "build.yml"
+        if wf.is_file():
+            ctx.check("%s: CI ставит NOGIT=1 на шаге сборки" % name,
+                      re.search(r"NOGIT:\s*'?1'?", wf.read_text(encoding="utf-8")) is not None,
+                      "%s не глушит отправку — push из Actions запустит workflow заново" % wf)
+    if not seen:
+        ctx.note("SKIP build_commits_test: прошивок рядом нет")
+
+
 def relay_queue_test(ctx):
     """Решения ретранслятора по кадру.
 
