@@ -1418,6 +1418,48 @@ def flood_gap_name_test(ctx):
               % (floor, "; ".join(bad)))
 
 
+def tools_ref_branch_test(ctx):
+    """`tools.ref` держит имя ветки, а не пин, — и это решение владельца.
+
+    В `core.ref` лежит тег (пин на версию ядра), а в `tools.ref` — имя ветки. Разница не
+    случайная: владельцу предлагали три варианта (оставить ветку, пинить на коммит, пинить на
+    тег), и он выбрал ветку. Цена известна и принята — правка проверок меняет результат сборки
+    прошивки, которую никто не трогал; выгода — свежие проверки действуют на обе прошивки
+    сразу, без шага «поднять пин» в двух репозиториях.
+
+    Проверка нужна ровно затем, чтобы пин не появился здесь незаметно: sha или тег в
+    `tools.ref` поменяли бы порядок работы молча, и узнать об этом можно было бы только по
+    тому, что новая проверка нигде не запускается."""
+    seen = 0
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        f = ctx.tree / sub / "tools.ref"
+        if not f.is_file():
+            continue
+        seen += 1
+        ref = f.read_text(encoding="utf-8").strip().splitlines()[0].strip() if f.read_text(
+            encoding="utf-8").strip() else ""
+        ctx.check("tools.ref %s не пуст" % name, bool(ref), "файл пуст — CI не найдёт проверки")
+        if not ref:
+            continue
+        ctx.check("tools.ref %s — не sha коммита" % name,
+                  re.fullmatch(r"[0-9a-f]{7,40}", ref) is None,
+                  "в tools.ref лежит %s: похоже на пин, а решено держать ветку" % ref)
+        ctx.check("tools.ref %s — не тег версии" % name,
+                  re.fullmatch(r"v\d+\.\d+\.\d+", ref) is None,
+                  "в tools.ref лежит тег %s: решено держать ветку" % ref)
+    # core.ref, наоборот, обязан быть пином: иначе прошивка собирается с «чем-то из main».
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        f = ctx.tree / sub / "core.ref"
+        if not f.is_file():
+            continue
+        ref = f.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+        ctx.check("core.ref %s — тег версии ядра" % name,
+                  re.fullmatch(r"v\d+\.\d+\.\d+", ref) is not None,
+                  "в core.ref лежит %s, а не тег: прошивка собралась бы «чем-то из main»" % ref)
+    if not seen:
+        ctx.note("SKIP tools_ref_branch_test: прошивок рядом нет")
+
+
 def relay_queue_test(ctx):
     """Решения ретранслятора по кадру.
 
