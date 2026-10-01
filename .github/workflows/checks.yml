@@ -1,0 +1,45 @@
+name: checks
+
+# Проверки — это код, и он ломается так же, как любой другой. До этого workflow сломанный
+# набор обнаруживался только на следующей сборке прошивки: её CI берёт проверки по tools.ref,
+# то есть правка здесь меняет результат чужой сборки, которую никто не трогал.
+#
+# Прошивок рядом в этом job нет намеренно: цель core прогоняет весь набор проверок ядра, а
+# кросс-репозиторные проверки обязаны молчать про отсутствующую прошивку, а не падать.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: mesh-network-tools
+
+      # Ядро берём по его рабочей ветке: правку проверок надо гонять против актуального ядра.
+      - uses: actions/checkout@v4
+        with:
+          repository: Tr1glav/mesh-network-core
+          ref: main
+          path: mesh-network-core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Проверки ядра без прошивок рядом
+        run: python3 selftest.py --target core
+        working-directory: mesh-network-tools
+
+      # Отдельно — проверки самого набора: каждая написанная функция *_test обязана кем-то
+      # вызываться. Без этого новая проверка может молча никогда не запуститься.
+      - name: Связность набора проверок
+        working-directory: mesh-network-tools
+        run: python3 -c "import sys; sys.path.insert(0,'.'); from mcselftest import harness, suite_meta; import pathlib; c=harness.Ctx(pathlib.Path('../mesh-network-core'), pathlib.Path('../mesh-network-core'),'core', tree=pathlib.Path('..')); suite_meta.wiring_test(c); sys.exit(1 if c.failures else 0)"

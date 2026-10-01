@@ -14,6 +14,7 @@ import ast
 import contextlib
 import io
 import pathlib
+import re
 import tempfile
 
 from . import harness, suite_core
@@ -38,6 +39,41 @@ def _called_names(path):
             elif isinstance(f, ast.Attribute):
                 out.add(f.attr)
     return out
+
+
+def ci_present_test(ctx, tree):
+    """У каждого репозитория есть свой CI.
+
+    У ядра и у этого репозитория своего CI не было вовсе — при том что в ядре протокол, крипто
+    и разбор кадров, а здесь сами проверки. Правка в любом из двух всплывала только на
+    следующей сборке прошивки: её workflow берёт проверки по `tools.ref`, то есть правка здесь
+    меняет результат чужой сборки, которую никто не трогал.
+
+    Проверка намеренно смотрит на все четыре репозитория: заводить CI по одному легко, а
+    забыть про четвёртый — ещё легче."""
+    want = {
+        "mesh-network-core":  "проверки ядра: суть репозитория — протокол, крипто, кадры",
+        "mesh-network-tools": "проверки самих проверок: сломанный набор роняет чужие сборки",
+        "meshcore-fork":      "сборка прошивок Heltec и релиз",
+        "tdeck":              "сборка прошивки T-Deck и релиз",
+    }
+    seen = 0
+    for sub, why in want.items():
+        repo = pathlib.Path(tree) / sub
+        if not repo.is_dir():
+            continue
+        seen += 1
+        wf = repo / ".github" / "workflows"
+        files = sorted(wf.glob("*.yml")) + sorted(wf.glob("*.yaml")) if wf.is_dir() else []
+        ctx.check("у %s есть workflow" % sub, bool(files),
+                  "нет ни одного файла в .github/workflows — %s" % why)
+        for f in files:
+            txt = f.read_text(encoding="utf-8")
+            ctx.check("%s/%s запускается на push" % (sub, f.name),
+                      re.search(r"^\s*push\s*:", txt, re.M) is not None,
+                      "workflow есть, но на push не запускается — значит не запускается никогда")
+    if not seen:
+        ctx.note("SKIP ci_present_test: репозиториев рядом нет")
 
 
 def wiring_test(ctx, pkg=None):
