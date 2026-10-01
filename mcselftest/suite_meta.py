@@ -76,6 +76,61 @@ def ci_present_test(ctx, tree):
         ctx.note("SKIP ci_present_test: репозиториев рядом нет")
 
 
+def no_secrets_test(ctx, tree):
+    """Ни один репозиторий не держит у себя токен или приватный ключ.
+
+    Токен GitHub лежит в `.env` в корне рабочего дерева, а корень под git НЕ находится — туда
+    он и положен затем, чтобы физически не попасть ни в один коммит. Внутри репозитория такой
+    файл попал бы, и цена ошибки — секрет в истории публичного репозитория, откуда его уже не
+    убрать переписыванием.
+
+    Проверка ищет не конкретное значение (хранить его здесь означало бы ровно то, от чего
+    защищаемся), а признаки формата: префиксы токенов GitHub и шапку приватного ключа. Смотрит
+    только отслеживаемые git'ом файлы: `.env` рядом с репозиторием, но вне его, — это норма."""
+    import subprocess
+    # Маркеры собираются из частей намеренно: написанные целиком, они сделали бы ЭТОТ файл
+    # «похожим на секрет», и проверка падала бы на себе самой — так и случилось при первом
+    # прогоне. Склейка решает это без списка исключений, который пришлось бы поддерживать.
+    marks = tuple("github_" + "pat_" for _ in (0,)) + ("gh" + "p_", "gh" + "o_", "gh" + "s_",
+                  "BEGIN OPENSSH PRIVATE " + "KEY", "BEGIN RSA PRIVATE " + "KEY")
+    seen = 0
+    for sub in ("mesh-network-core", "mesh-network-tools", "meshcore-fork", "tdeck"):
+        repo = pathlib.Path(tree) / sub
+        if not (repo / ".git").exists():
+            continue
+        seen += 1
+        r = subprocess.run(["git", "ls-files", "-z"], cwd=str(repo),
+                           capture_output=True, text=True)
+        files = [f for f in r.stdout.split("\0") if f]
+        bad = []
+        for rel in files:
+            f = repo / rel
+            if not f.is_file() or f.stat().st_size > 2_000_000:
+                continue
+            try:
+                txt = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for m in marks:
+                if m in txt:
+                    bad.append("%s (%s)" % (rel, m))
+                    break
+        ctx.check("%s не держит секретов в отслеживаемых файлах" % sub, not bad,
+                  "похоже на секрет: " + "; ".join(bad))
+        # Нужна именно СТРОКА-правило, а не упоминание: слово «.env» стоит и в комментарии
+        # рядом с ним, и проверка «есть ли .env в тексте» проходила после удаления правила —
+        # откат это показал.
+        gi = (repo / ".gitignore")
+        lines = [ln.strip() for ln in gi.read_text(encoding="utf-8").splitlines()] \
+            if gi.is_file() else []
+        ctx.check("%s игнорирует .env" % sub,
+                  any(ln in (".env", "/.env", ".env*", "*.env") for ln in lines),
+                  "в .gitignore нет правила на .env: случайная копия файла с токеном уедет "
+                  "в коммит")
+    if not seen:
+        ctx.note("SKIP no_secrets_test: репозиториев рядом нет")
+
+
 def wiring_test(ctx, pkg=None):
     """Ни одна написанная проверка не потерялась по дороге к запуску."""
     pkg = pathlib.Path(pkg) if pkg else pathlib.Path(__file__).resolve().parent
