@@ -1265,6 +1265,159 @@ def cfg_reply_queue_test(ctx):
         ctx.note("SKIP часть cfg_reply_queue_test: прошивок рядом нет")
 
 
+def secrets_example_test(ctx):
+    """Пример настроек развёртывания подходит СВОЕЙ прошивке.
+
+    Оба примера были побайтовой копией друг друга: в `tdeck/secrets.example.json` лежали MQTT,
+    `coord_ip` и четыре устройства Heltec — и ни одной записи для самого T-Deck. Человек,
+    копирующий пример в `secrets.json`, получал файл, которым нельзя настроить плату: скрипт
+    просит роль из своего списка, а в примере таких ролей нет.
+
+    Проверяется связь примера со скриптом, который его читает: каждая роль из примера известна
+    `provision.py`, каждое поле этой роли есть в примере, и в примере нет полей, которые ни
+    одна его роль не использует."""
+    import json
+    seen = 0
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        ex = ctx.tree / sub / "secrets.example.json"
+        pv = ctx.tree / sub / "scripts" / "provision.py"
+        if not (ex.is_file() and pv.is_file()):
+            continue
+        seen += 1
+        try:
+            data = json.loads(ex.read_text(encoding="utf-8"))
+        except Exception as e:
+            ctx.check("пример %s — годный JSON" % name, False, str(e))
+            continue
+        ctx.check("пример %s — годный JSON" % name, True)
+
+        src = pv.read_text(encoding="utf-8")
+        radio = re.search(r"RADIO_FIELDS\s*=\s*\[(.*?)\]", src, re.S)
+        roles_src = re.search(r"ROLE_FIELDS\s*=\s*\{(.*?)\n\}", src, re.S)
+        if not (radio and roles_src):
+            ctx.check("в provision.py %s нашлись роли" % name, False,
+                      "не разобрать RADIO_FIELDS/ROLE_FIELDS")
+            continue
+        radio_f = set(re.findall(r'"([^"]+)"', radio.group(1)))
+        roles = {}
+        for m in re.finditer(r'"([a-z]+)":\s*\[(.*?)\]([^,]*)', roles_src.group(1), re.S):
+            fields = set(re.findall(r'"([^"]+)"', m.group(2)))
+            if "RADIO_FIELDS" in m.group(3):
+                fields |= radio_f
+            roles[m.group(1)] = fields
+
+        devices = data.get("devices", {})
+        ctx.check("в примере %s есть хотя бы одно устройство" % name, bool(devices),
+                  "раздел devices пуст — настроить по такому примеру нечего")
+        used = set()
+        for dev, body in devices.items():
+            role = body.get("role")
+            ctx.check("роль %s в примере %s известна provision.py" % (role, name),
+                      role in roles,
+                      "provision.py знает роли: " + ", ".join(sorted(roles)))
+            if role in roles:
+                used |= roles[role]
+
+        # Каждое устройство примера обязано быть окружением ЭТОГО проекта. Без этого
+        # утверждения проверка пропускала главное: пример, целиком скопированный из соседней
+        # прошивки, проходил её — роли-то знакомы обоим provision.py, а вот плат из примера в
+        # этом проекте нет, и настроить по нему нечего. Именно так и было у T-Deck.
+        ini = (ctx.tree / sub / "platformio.ini")
+        envs = set(re.findall(r"^\[env:([^\]]+)\]", ini.read_text(encoding="utf-8"), re.M)) \
+            if ini.is_file() else set()
+        alien = sorted(b.get("env", "?") for b in devices.values()
+                       if b.get("env") not in envs)
+        ctx.check("устройства примера %s собираются в этом проекте" % name, not alien,
+                  "окружений нет в platformio.ini: " + ", ".join(alien) +
+                  " — пример из другой прошивки")
+
+        have = set(data.get("common", {}))
+        for body in devices.values():
+            have |= {k for k in body if k not in ("role", "env", "port")}
+        missing = sorted(f for f in used if f not in have and f != "name")
+        ctx.check("пример %s содержит все поля своих ролей" % name, not missing,
+                  "нет в примере: " + ", ".join(missing))
+        extra = sorted(f for f in have if f not in used)
+        ctx.check("в примере %s нет чужих полей" % name, not extra,
+                  "лишние, ни одной роли примера не нужны: " + ", ".join(extra))
+    if not seen:
+        ctx.note("SKIP secrets_example_test: прошивок рядом нет")
+
+
+def flood_gap_name_test(ctx):
+    """Параметр паузы флуда назван базой, и никто не просит паузы короче диапазона.
+
+    Смысл параметра изменился тихо: раньше это была сама пауза, а с тех пор как паузу стали
+    брать из всего диапазона FLOOD_RETRY_MIN_MS…MAX_MS, переданное значение — лишь БАЗА,
+    которую в этот диапазон зажимают. Имя `gapMs` обещало другое: вызывающий, попросивший
+    20 мс, молча получал не меньше 1000. Отсюда два утверждения — имя говорит, что это база,
+    и ни один вызывающий не просит значения, которое всё равно будет поднято."""
+    hdr = (ctx.core / "include" / "mesh.h").read_text(encoding="utf-8")
+    for fn in ("floodSend", "sensorSendMsg"):
+        m = re.search(r"void\s+%s\s*\(([^;]*?)\)\s*;" % fn, hdr, re.S)
+        ctx.check("%s объявлена в заголовке ядра" % fn, m is not None)
+        if not m:
+            continue
+        args = m.group(1)
+        ctx.check("%s: параметр паузы назван базой" % fn,
+                  "gapBaseMs" in args and not re.search(r"\bgapMs\b", args),
+                  "параметр снова зовётся gapMs — это не пауза, а база, зажатая в диапазон "
+                  "флуда: просьба о 20 мс даст не меньше FLOOD_RETRY_MIN_MS")
+
+    # Нижняя граница диапазона: ниже неё просить бессмысленно, значение всё равно поднимут.
+    mn = re.search(r"#\s*define\s+FLOOD_RETRY_MIN_MS\s+(\d+)",
+                   (ctx.core / "include" / "config.h").read_text(encoding="utf-8"))
+    ctx.check("нижняя граница паузы флуда задана числом", mn is not None)
+    if not mn:
+        return
+    floor = int(mn.group(1))
+
+    def top_args(text, at):
+        """Аргументы вызова, начинающегося на позиции at (на '('), по верхнему уровню скобок."""
+        depth, cur, out = 0, "", []
+        for ch in text[at:]:
+            if ch in "([":
+                depth += 1
+                if depth == 1:
+                    continue
+            elif ch in ")]":
+                depth -= 1
+                if depth == 0:
+                    out.append(cur)
+                    return out
+            if depth == 1 and ch == ",":
+                out.append(cur)
+                cur = ""
+                continue
+            cur += ch
+        return out
+
+    bad = []
+    roots = [ctx.core] + [ctx.tree / s for s in ("meshcore-fork", "tdeck")]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for f in sorted(root.rglob("*.cpp")):
+            if ".pio" in f.parts:
+                continue
+            txt = f.read_text(encoding="utf-8", errors="replace")
+            for fn in ("floodSend", "sensorSendMsg"):
+                for m in re.finditer(r"\b%s\s*\(" % fn, txt):
+                    if txt[:m.start()].rstrip().endswith(("void", "unsigned", "int")):
+                        continue            # это определение, а не вызов
+                    a = top_args(txt, m.end() - 1)
+                    idx = 3 if fn == "floodSend" else 1
+                    if len(a) <= idx:
+                        continue
+                    v = a[idx].strip()
+                    if re.fullmatch(r"\d+", v) and 0 < int(v) < floor:
+                        bad.append("%s:%d %s(..., %s, ...)"
+                                   % (f.name, txt[:m.start()].count("\n") + 1, fn, v))
+    ctx.check("никто не просит паузу короче диапазона флуда", not bad,
+              "просят меньше FLOOD_RETRY_MIN_MS=%d и молча получат больше: %s"
+              % (floor, "; ".join(bad)))
+
+
 def relay_queue_test(ctx):
     """Решения ретранслятора по кадру.
 
