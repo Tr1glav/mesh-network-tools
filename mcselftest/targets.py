@@ -35,6 +35,7 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.meshcore_copies_test(ctx)
     suite_core.peer_cache_test(ctx)
     suite_core.group_text_bound_test(ctx)
+    suite_core.cfg_reply_queue_test(ctx)
     suite_core.relay_queue_test(ctx)
     suite_core.fast_rx_isolation_test(ctx)
     suite_core.handshake_budget_test(ctx)

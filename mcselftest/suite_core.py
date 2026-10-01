@@ -1200,6 +1200,71 @@ def group_text_bound_test(ctx):
                   "отказ по длине стоит после цикла расшифровки — переполнение уже случилось")
 
 
+def cfg_reply_queue_test(ctx):
+    """Ответ узла на «cfg get» уходит очередью, а не блокирующими паузами.
+
+    Было: между частями ответа стоял `delay(1500)` прямо в разборе команды. Частей бывает три,
+    то есть узел на три секунды перестаёт обслуживать радио, сторожа сессий прошивки и свои
+    задачи — и делает это по чужой команде из эфира. Вторая ошибка в том же месте: предел длины
+    части проверялся ДО добавления поля, поэтому одно длинное поле всё равно уезжало частью
+    длиннее предела.
+
+    Проверяется устройство: сессия и эфир на хосте недоступны, но каждое из утверждений видно
+    в исходнике однозначно."""
+    src = (ctx.core / "src" / "appconfig.cpp").read_text(encoding="utf-8")
+    hdr = (ctx.core / "include" / "appconfig.h").read_text(encoding="utf-8")
+    cfg = (ctx.core / "include" / "config.h").read_text(encoding="utf-8")
+    get = src[src.index('if (rest == "get")'):]
+    get = get[:get.index("\n    }")]
+    # Комментарии выкидываем: в этой ветке стоит объяснение «раньше здесь был delay(1500)», и
+    # поиск по тексту находил именно его — проверка объявляла верный код неверным.
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")]) for ln in get.splitlines())
+
+    # 1. Никаких блокирующих пауз в разборе команды.
+    ctx.check("в ответе на «cfg get» нет delay()", "delay(" not in code,
+              "в ветке ответа снова стоит delay — узел глохнет на время ответа")
+    ctx.check("части ответа кладутся в очередь", "cfgReplyPush(" in code,
+              "части не уходят в очередь — значит отправляются прямо из разбора команды")
+    ctx.check("разбор команды сам ничего не отправляет", "sensorSendMsg(" not in code,
+              "ветка ответа отправляет сама: очередь есть, но её обходят")
+
+    # 2. Предел и очередь заданы в ядре числами, а не прошивкой и не на месте.
+    for name in ("CFG_GET_PART_MAX", "CFG_REPLY_QUEUE_MAX", "CFG_REPLY_GAP_MS"):
+        ctx.check("%s задан в config.h ядра" % name,
+                  re.search(r"#\s*define\s+%s\s+\d+" % name, cfg) is not None,
+                  "%s не найден числом в config.h: правило поведения сети одно на все платы"
+                  % name)
+    ctx.check("предел части взят из константы", "CFG_GET_PART_MAX" in code,
+              "в ветке ответа предел задан числом на месте")
+
+    # 3. Предел проверяется ПОСЛЕ добавления поля, и одно длинное поле обрезается.
+    ctx.check("длинное поле обрезается до размера части",
+              "piece.substring(" in code,
+              "одно поле длиннее части уйдёт как есть — часть вылезет за предел")
+    ctx.check("пустая часть в очередь не кладётся", "out.length() > strlen(" in code,
+              "последняя часть отправляется без проверки, что в ней есть поля")
+
+    # 4. Тик обязан быть объявлен и вызван в ЗАДАЧАХ УЗЛА каждой прошивки. Очередь без вызова —
+    # это ответ, который никогда не уйдёт; ровно так было с meshRelayTick в tdeck.
+    ctx.check("cfgReplyTick объявлен в заголовке ядра", "void cfgReplyTick();" in hdr,
+              "без объявления прошивка не сможет его позвать")
+    ctx.check("cfgReplyTick ждёт тишины в эфире", "otaAnySessionActive()" in
+              src[src.index("void cfgReplyTick()"):src.index("void cfgReplyTick()") + 700],
+              "очередь ответа выходит в эфир во время прошивки по радио")
+    seen = 0
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        path = ctx.tree / sub / "lib" / "meshcore" / "src" / "sensor_tasks.cpp"
+        if not path.is_file():
+            continue
+        seen += 1
+        ctx.check("задачи узла %s зовут cfgReplyTick" % name,
+                  re.search(r"^\s*cfgReplyTick\s*\(\s*\)\s*;", path.read_text(encoding="utf-8"),
+                            re.M) is not None,
+                  "%s не разгружает очередь ответа — ответ на «cfg get» не уйдёт никогда" % path)
+    if not seen:
+        ctx.note("SKIP часть cfg_reply_queue_test: прошивок рядом нет")
+
+
 def relay_queue_test(ctx):
     """Решения ретранслятора по кадру.
 
