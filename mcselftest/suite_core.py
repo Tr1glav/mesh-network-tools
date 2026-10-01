@@ -983,7 +983,6 @@ def loss_counters_live_test(ctx):
 MESHCORE_DIVERGENT = {
     "src/app_main.cpp":       "роли плат и порядок инициализации: у T-Deck экран, SD, клавиатура",
     "src/display.cpp":        "OLED у Heltec против ST7789 у T-Deck",
-    "src/sensor_tasks.cpp":   "у T-Deck нет кнопки, состав задач другой",
     "include/app_main.h":     "разный состав хуков платформы",
     "include/board_config.h": "пины и параметры разных плат",
     "include/build_info.h":   "ГЕНЕРИРУЕТСЯ сборкой: версия и хэш исходников",
@@ -1039,6 +1038,12 @@ def meshcore_copies_test(ctx):
     stale = [r for r in MESHCORE_DIVERGENT if r in same]
     ctx.check("список расхождений не содержит лишнего", not stale,
               "записаны как разошедшиеся, а совпадают: " + ", ".join(stale))
+    # Файл, которого нет НИ В ОДНОЙ копии, в списке расхождений тоже лишний: так список начал
+    # врать после переезда sensor_tasks.cpp в ядро — расхождения нет, а запись о нём осталась.
+    gone = [r for r in MESHCORE_DIVERGENT if r not in same and r not in diff
+            and r not in only_fork and r not in only_tdeck]
+    ctx.check("в списке расхождений нет исчезнувших файлов", not gone,
+              "записаны как разошедшиеся, а файлов нет ни у одной прошивки: " + ", ".join(gone))
 
     # Файл только у форка — тоже решение, а не случайность.
     extra = [r for r in only_fork if r not in MESHCORE_FORK_ONLY
@@ -1458,6 +1463,61 @@ def tools_ref_branch_test(ctx):
                   "в core.ref лежит %s, а не тег: прошивка собралась бы «чем-то из main»" % ref)
     if not seen:
         ctx.note("SKIP tools_ref_branch_test: прошивок рядом нет")
+
+
+def sensor_tasks_in_core_test(ctx):
+    """Расписание задач узла живёт в ядре, а платформенное из него — за хуками.
+
+    `sensor_tasks.cpp` лежал двумя копиями в `lib/meshcore` каждой прошивки и успел
+    разойтись — при том что из 68 строк платформенными были ровно три вызова: экран, кнопка и
+    телефонное приложение. Остальное (расписание heartbeat, сторожа сессий, переключение
+    частоты процессора, откат несохранённых настроек) к плате отношения не имеет.
+
+    Поэтому файл переехал в ядро, а три вызова стали хуками. Проверка следит за обеими
+    половинами решения: копий в прошивках нет, и ядро не зовёт платформенное напрямую."""
+    core_src = ctx.core / "src" / "sensor_tasks.cpp"
+    ctx.check("расписание задач узла лежит в ядре", core_src.is_file(),
+              "нет mesh-network-core/src/sensor_tasks.cpp")
+    ctx.check("ядро объявляет sensorTasksTick", (ctx.core / "include" / "sensor_tasks.h").is_file(),
+              "нет mesh-network-core/include/sensor_tasks.h — прошивке нечего включать")
+    if not core_src.is_file():
+        return
+    txt = core_src.read_text(encoding="utf-8")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                     for ln in txt.splitlines())
+
+    # Ядро не имеет права знать про экран, кнопку и приложение иначе как через хуки.
+    for direct, hook in (("screenTick", "mcUiTick"),
+                         ("buttonTick", "mcButtonTick"),
+                         ("companionTick", "mcCompanionTick")):
+        ctx.check("ядро зовёт %s, а не %s напрямую" % (hook, direct),
+                  hook in code and not re.search(r"(?<!mc)\b%s\s*\(" % direct, code),
+                  "в ядре остался прямой вызов %s: это код прошивки, и ядру его не собрать"
+                  % direct)
+    for bad in ("display.h", "button.h", "companion.h"):
+        ctx.check("ядро не включает %s" % bad, bad not in txt,
+                  "ядро включает заголовок прошивки — он до него не доедет")
+
+    # Копий в прошивках быть не должно: вернувшаяся копия снова разойдётся, и собираться
+    # будет именно она (lib/ прошивки перекрывает библиотеку).
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        d = ctx.tree / sub / "lib" / "meshcore"
+        if not d.is_dir():
+            continue
+        for rel in ("src/sensor_tasks.cpp", "include/sensor_tasks.h"):
+            ctx.check("у %s нет своей копии %s" % (name, rel), not (d / rel).exists(),
+                      "копия вернулась: она перекроет ядро и снова разойдётся с ним")
+
+    # Хук экрана обязаны закрыть обе прошивки: заглушка здесь — экран, который не гаснет.
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        root = ctx.tree / sub
+        if not root.is_dir():
+            continue
+        own = "\n".join(f.read_text(encoding="utf-8")
+                        for f in sorted((root / "src").glob("*.cpp")) if f.is_file())
+        ctx.check("%s переопределяет mcUiTick" % name,
+                  re.search(r"^\s*void\s+mcUiTick\s*\(\s*\)\s*\{", own, re.M) is not None,
+                  "без переопределения экран %s не будет гаснуть: сработает заглушка ядра" % name)
 
 
 def relay_queue_test(ctx):
