@@ -74,6 +74,7 @@ def run_tdeck(ctx):
                                  extra_label=suite_tdeck.HOST_EXTRA_LABEL))
     suite_tdeck.tapp_test(ctx)
     suite_tdeck.elf_headers_test(ctx)
+    suite_tdeck.elf_sections_test(ctx)
     suite_font.cyrillic_font_test(ctx)
 
 

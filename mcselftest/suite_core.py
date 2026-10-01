@@ -2197,9 +2197,17 @@ def weak_hooks_test(ctx):
         # Вызов без переопределения: прошивка сама позвала хук и забыла его закрыть.
         called = set()
         for p in files:
-            if p.name == "mc_platform.cpp":
-                continue
             txt = p.read_text(encoding="utf-8")
+            if p.name == "mc_platform.cpp":
+                # Раньше этот файл пропускался целиком — и напрасно: в нём не только
+                # ОПРЕДЕЛЕНИЯ хуков, но и вызовы (хук интерфейса может спрашивать другой хук).
+                # Такой вызов был у T-Deck: mcUiSensorRx спрашивал mcWifiConnected, которого
+                # T-Deck не переопределяет, и получал заглушку ядра — всегда false. Пропуск
+                # файла это скрывал. Теперь выбрасываются только строки-заголовки определений.
+                txt = "\n".join(
+                    ln for ln in txt.splitlines()
+                    if not re.match(r"\s*(?:void|bool|int|float|String|uint32_t|size_t)\s+"
+                                    r"(?:mc[A-Z]\w*|screenWake)\s*\(", ln))
             called |= {h for h in hooks_in_hdr if re.search(r"\b%s\s*\(" % h, txt)}
         ctx.check("%s: у вызываемых хуков есть переопределение" % sub,
                   called <= strong,

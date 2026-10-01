@@ -89,6 +89,49 @@ int main(int argc, char** argv) {
 """
 
 
+def elf_sections_test(ctx):
+    """Разбор секций ELF: имя секции не читается за границей, REL не разбирается как RELA.
+
+    Файл приложения приходит с карты памяти, то есть целиком извне. Две дыры в разборе:
+
+    1. Имя секции брали как `shNames + s.sh_name`, проверив только, что смещение внутри
+       .shstrtab. Нуля в конце строки это не гарантирует: если таблица обрывается без нуля,
+       `strcmp` уходит за её границу. Для имён СИМВОЛОВ такая проверка была с самого начала
+       (`strAt`), для имён секций — нет.
+    2. `.rel.dyn` попадал в тот же разбор, что `.rela.dyn`, и читался структурой `ElfRela` в
+       12 байт, тогда как запись REL — 8 байт. Каждая запись брала полтора размера своей, и
+       файл разбирался в мусор.
+
+    Проверяется устройство: разбор живёт в большой функции загрузки, которую на хосте не
+    собрать (она тянет флеш, PSRAM и таблицу символов прошивки). Но оба утверждения видны в
+    исходнике однозначно."""
+    src = (ctx.root / "src" / "tdeck_elf.cpp").read_text(encoding="utf-8")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                     for ln in src.splitlines())
+
+    ctx.check("имя секции берётся через strAt",
+              re.search(r"strAt\s*\(\s*shNames\s*,", code) is not None,
+              "имя секции читается как shNames + sh_name: без нуля внутри .shstrtab strcmp "
+              "уйдёт за границу секции")
+    ctx.check("сломанное имя секции — отказ",
+              re.search(r"if\s*\(\s*!\s*nm\s*\)\s*return\s+setError", code) is not None,
+              "результат strAt для имени секции не проверяется на 0")
+    ctx.check("strAt проверяет нуль внутри секции",
+              "memchr" in ctx.grab("src/tdeck_elf.cpp", "static const char* strAt("),
+              "strAt больше не ищет завершающий нуль — проверка выше стала бессмысленной")
+
+    ctx.check(".rel.dyn отвергается явно",
+              re.search(r'strcmp\s*\(\s*nm\s*,\s*"\.rel\.dyn"\s*\)[^;]*?\n?[^;]*?'
+                        r'sh_size\s*\)\s*return\s+setError', code) is not None,
+              ".rel.dyn не отвергается: он разберётся структурой RELA в 12 байт вместо 8")
+    ctx.check("таблица релокаций одна (.rela.dyn)",
+              re.search(r"int16_t\s+rela\s*=\s*-1", code) is not None,
+              "rela снова массив из двух: значит .rel.dyn опять идёт в разбор RELA")
+    ctx.check("размер таблицы релокаций делится на размер записи",
+              re.search(r"sh_size\s*%\s*sizeof\s*\(\s*ElfRela\s*\)", code) is not None,
+              "хвост таблицы читается за границей секции, а записей считается на одну больше")
+
+
 def elf_headers_test(ctx):
     if not shutil.which("g++"):
         print("SKIP g++ не найден — шапка ELF не проверена")
