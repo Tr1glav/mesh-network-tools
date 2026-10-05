@@ -1375,6 +1375,124 @@ def provision_console_budget_test(ctx):
         ctx.note("SKIP provision_console_budget_test: прошивок рядом нет")
 
 
+
+def lora_airtime_ms(length, sf, bw_khz, cr, preamble, crc=True, ldro=False):
+    """Сколько миллисекунд кадр такой длины занимает эфир. Та же формула, что в радио.
+
+    Считается по разделу 6.1.4 даташита SX1268 — ровно так, как это делает
+    SX126x::calculateTimeOnAir() в RadioLib, целочисленно и теми же коэффициентами. Это важно:
+    проверка сверяет константу прошивки с тем, что получится на плате, и своя «похожая»
+    формула сверяла бы её с чем-то третьим.
+
+    cr — знаменатель кодирования в записи RadioLib (5..8 означает 4/5..4/8).
+    """
+    symbol_us = ((1000 * 10) << sf) // int(bw_khz * 10)
+    sf_coeff1_x4, sf_coeff2 = (25, 0) if sf in (5, 6) else (17, 8)
+    sf_divisor = 4 * (sf - 2) if ldro else 4 * sf
+    bits = 8 * length + (16 if crc else 0) - 4 * sf + sf_coeff2 + 20
+    if bits < 0:
+        bits = 0
+    n_pre_coded = (bits + sf_divisor - 1) // sf_divisor
+    n_symbol_x4 = (preamble + 8) * 4 + sf_coeff1_x4 + n_pre_coded * cr * 4
+    return (symbol_us * n_symbol_x4) // 4 // 1000
+
+
+def radio_profile(ctx, sub):
+    """Профиль радио по умолчанию из board_config.h прошивки: (sf, bw, cr, преамбула).
+
+    Профиль живёт в прошивке, а не в ядре: частота и полоса — свойство платы и региона. Для
+    бюджетов ядра берётся именно он, потому что на этапе сборки другого знания нет; что
+    настройки могут разойтись с профилем в NVS, ловит уже прошивка при старте радио.
+    """
+    bc = ctx.tree / sub / "lib" / "meshcore" / "include" / "board_config.h"
+    if not bc.is_file():
+        return None
+    txt = bc.read_text(encoding="utf-8")
+
+    def val(name, cast):
+        m = re.search(r"(?m)^\s*#\s*define\s+%s\s+([0-9.]+)" % name, txt)
+        return cast(m.group(1)) if m else None
+
+    sf, bw, cr, pre = (val("LORA_SF", int), val("LORA_BW", float),
+                       val("LORA_CR", int), val("LORA_PREAMBLE", int))
+    if None in (sf, bw, cr, pre):
+        return None
+    return sf, bw, cr, pre
+
+
+def airtime_budget_test(ctx):
+    """FRAME_AIRTIME_MS — это настоящее время самого большого кадра в эфире, а не круглое число.
+
+    Здесь была одна из самых дорогих ошибок в дереве: константа называлась «грубой верхней
+    оценкой для SF8/BW62.5» и равнялась 500 мс, но её никто не считал. По формуле даташита на
+    этом профиле кадр 255 Б висит в эфире 1979 мс — вчетверо больше. А из этой константы
+    выведены ВСЕ бюджеты ожидания: TX_WORST_MS, RELAY_WORST_MS, PING_TIMEOUT_MS,
+    PING_MODE_CYCLE_MS, OTA_SLOW_RESP_MS, OTA_SLOW_AIR_BUSY_MS. То есть ответ, пришедший
+    вовремя по меркам эфира, засчитывался потерей — и тем вернее, чем длиннее сообщение.
+
+    Проверка считает время кадра сама, по профилю радио из board_config.h прошивки, и требует
+    двустороннего совпадения: константа обязана покрывать самый большой кадр (иначе бюджеты
+    коротки) и не должна быть завышена вдвое (иначе это не граница, а запас на всякий случай,
+    и сеть ждёт впустую)."""
+    cfg = (ctx.core / "include" / "config.h").read_text(encoding="utf-8")
+
+    def const(name):
+        m = re.search(r"(?m)^#define\s+%s\s+(\d+)\b" % name, cfg)
+        return int(m.group(1)) if m else None
+
+    budget = const("FRAME_AIRTIME_MS")
+    ctx.check("FRAME_AIRTIME_MS задан числом", budget is not None,
+              "константа не найдена — бюджеты не на чём проверять")
+    if budget is None:
+        return
+
+    seen = 0
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        prof = radio_profile(ctx, sub)
+        if prof is None:
+            continue
+        seen += 1
+        sf, bw, cr, pre = prof
+        worst = lora_airtime_ms(255, sf, bw, cr, pre)
+        ctx.check("бюджет кадра покрывает профиль %s (SF%d/%g кГц/4-%d)" % (name, sf, bw, cr),
+                  budget >= worst,
+                  "кадр 255 Б висит в эфире %d мс, а FRAME_AIRTIME_MS = %d: все выведенные "
+                  "отсюда таймауты короче нужного" % (worst, budget))
+        ctx.check("бюджет кадра не завышен у %s" % name, budget <= worst * 2,
+                  "FRAME_AIRTIME_MS = %d при настоящих %d мс: это не граница, а запас, и "
+                  "сеть ждёт вдвое дольше нужного" % (budget, worst))
+        # Пауза между копиями берётся из времени ЭТОГО кадра (floodSend), но зажимается в
+        # [FLOOD_RETRY_MIN_MS, FLOOD_RETRY_MAX_MS]. Потолок обязан быть не ниже времени
+        # самого большого кадра, иначе зажим опустит его паузу ниже его же эфира — и
+        # следующая копия ляжет на предыдущую.
+        gap_max = const("FLOOD_RETRY_MAX_MS")
+        ctx.check("потолок паузы флуда не режет самый большой кадр (%s)" % name,
+                  gap_max is not None and gap_max >= worst,
+                  "FLOOD_RETRY_MAX_MS = %s, а кадр 255 Б висит %d мс" % (gap_max, worst))
+        ctx.note("     %s: кадр 16 Б — %d мс, 64 Б — %d мс, 240 Б — %d мс, 255 Б — %d мс"
+                 % (name, lora_airtime_ms(16, sf, bw, cr, pre),
+                    lora_airtime_ms(64, sf, bw, cr, pre),
+                    lora_airtime_ms(240, sf, bw, cr, pre), worst))
+
+    # База паузы обязана браться из кадра, а не из константы: иначе короткие сообщения
+    # (heartbeat, пинги, команды — почти весь обмен) ждут столько же, сколько самое большое.
+    tx = (ctx.core / "src" / "mesh_tx.cpp").read_text(encoding="utf-8")
+    ctx.check("пауза флуда выводится из времени этого кадра",
+              re.search(r"gapBaseMs\s*=\s*radioAirtimeMs\s*\(\s*f\s*\)", tx) is not None,
+              "floodSend не спрашивает radioAirtimeMs(f): пауза снова одна на все размеры")
+    rad = (ctx.core / "src" / "radio.cpp").read_text(encoding="utf-8")
+    ctx.check("время кадра берётся у радио, а не вычисляется заново",
+              "getTimeOnAir" in rad,
+              "radioAirtimeMs не спрашивает радио: своя копия формулы разойдётся с модулем")
+    # И отклонение настроек от профиля обязано быть ЗАМЕТНО: настройки лежат в NVS.
+    ctx.check("прошивка ругается, если настройки вышли за бюджет",
+              "FRAME_AIRTIME_MS" in rad and "ВНИМАНИЕ" in rad,
+              "initLoRa не сверяет настоящее время кадра с бюджетом: узел на SF11 молча "
+              "получит короткие пороги")
+    if not seen:
+        ctx.note("SKIP airtime_budget_test: профиля радио рядом нет")
+
+
 def secrets_example_test(ctx):
     """Пример настроек развёртывания подходит СВОЕЙ прошивке.
 
@@ -1833,8 +1951,19 @@ def handshake_budget_test(ctx):
           "sensorSendMsg(OTA_ACKSTART, ...) берёт FLOOD_RETRY_MIN_MS между копиями, "
           "а бюджет первого чанка %d мс" % first_chunk)
 
-    # и укладываться в окно сторожа с запасом на эфир
-    ack_span = ack_copies * airtime + (ack_copies - 1) * ack_gap
+    # и укладываться в окно сторожа с запасом на эфир.
+    #
+    # Время в эфире берётся по НАСТОЯЩЕЙ длине кадра ackstart, а не по FRAME_AIRTIME_MS: тот
+    # описывает самый большой кадр (1979 мс), а ackstart — короткое сообщение, 832 мс. Считая
+    # по максимуму, проверка объявляла рукопожатие невыполнимым там, где оно работает, —
+    # ровно это и случилось, когда FRAME_AIRTIME_MS исправили с 500 до 2000.
+    ack_bytes = const("OTA_ACKSTART_FRAME_MAX")
+    prof = radio_profile(ctx, "meshcore-fork") or radio_profile(ctx, "tdeck")
+    if ack_bytes and prof:
+        ack_air = lora_airtime_ms(ack_bytes, *prof)
+    else:
+        ack_air = airtime      # профиля рядом нет — считаем по верхней границе
+    ack_span = ack_copies * ack_air + (ack_copies - 1) * ack_gap
     ctx.check("ackstart укладывается в окно первого чанка",
           ack_gap < flood_min and ack_span < first_chunk,
           "копий %d по %d мс + эфир ≈ %d мс, окно %d мс (пауза флуда %d мс)"
@@ -1842,8 +1971,9 @@ def handshake_budget_test(ctx):
 
     # и бот обязан ждать не меньше, чем сенсор тратит на уход в быстрый канал
     ctx.check("бот ждёт переключения сенсора не меньше, чем сенсор шлёт ackstart",
-          settle >= ack_span - airtime,
-          "OTA_FAST_SETTLE_MS %d, отправка ackstart ≈ %d мс" % (settle, ack_span))
+          settle >= ack_span - ack_air,
+          "OTA_FAST_SETTLE_MS %d, отправка ackstart ≈ %d мс (кадр %s Б, эфир %d мс)"
+          % (settle, ack_span, ack_bytes, ack_air))
 
     # Обычные сообщения: пачка копий по 1000+ мс не должна выглядеть как «несколько копий»
     src_files = list((ctx.core / "src").glob("*.cpp")) + \
@@ -1995,7 +2125,8 @@ def timing_budgets_test(ctx):
 
     # Величины, которые обязаны быть числами — иначе расчёт снизу не проверить
     names = ["FRAME_AIRTIME_MS", "CAD_WAIT_BUDGET_MS", "RELAY_DELAY_MAX_MS",
-             "PING_REPLY_DELAY_MAX_MS", "FLOOD_REPEATS", "FLOOD_RETRY_MIN_MS"]
+             "PING_REPLY_DELAY_MAX_MS", "FLOOD_REPEATS", "FLOOD_RETRY_MIN_MS",
+             "FLOOD_RETRY_MAX_MS"]
     vals = {}
     for n in names:
         raw = macro(n)
@@ -2018,14 +2149,34 @@ def timing_budgets_test(ctx):
         return
     ctx.check("таймаут ответа выведен из худшего случая, а не задан числом", True)
 
-    # 2. Пауза между копиями обязана быть заметно больше времени в эфире, иначе чужая
-    #    передача накрывает все копии сразу и повторы не спасают (было 60 мс при ~500 мс).
-    if vals["FLOOD_RETRY_MIN_MS"] < airtime:
-        ctx.check("пауза между копиями больше времени в эфире", False,
-              "пауза %d мс, кадр в эфире %d мс" % (vals["FLOOD_RETRY_MIN_MS"], airtime))
+    # 2. Пауза между копиями обязана быть больше времени в эфире ЭТОГО кадра, иначе
+    #    следующая копия ложится на предыдущую и повторы не спасают (было 60 мс при ~500 мс).
+    #
+    #    Раньше здесь сравнивались два числа: FLOOD_RETRY_MIN_MS против FRAME_AIRTIME_MS. Это
+    #    было верно, пока пауза была одна на все размеры кадра. Теперь база паузы берётся из
+    #    времени этого кадра в эфире (floodSend), и сравнивать с бюджетом самого большого
+    #    кадра стало неправильно: нижняя граница 1000 мс меньше 1979 мс, но паузу большого
+    #    кадра она и не задаёт — её задаёт сам кадр.
+    #
+    #    Правило после правки двустороннее, и обе половины проверяются:
+    #      * нижняя граница закрывает КОРОТКИЕ кадры: самый маленький висит в эфире 259 мс, и
+    #        пауза обязана быть больше, иначе копии мелких сообщений идут залпом;
+    #      * потолок FLOOD_RETRY_MAX_MS закрывает БОЛЬШИЕ (airtime_budget_test): зажим не
+    #        должен опускать базу ниже времени кадра.
+    prof = radio_profile(ctx, "meshcore-fork") or radio_profile(ctx, "tdeck")
+    small_air = lora_airtime_ms(16, *prof) if prof else 0
+    if vals["FLOOD_RETRY_MIN_MS"] <= small_air:
+        ctx.check("пауза между копиями больше времени короткого кадра в эфире", False,
+              "нижняя граница паузы %d мс, а кадр 16 Б висит %d мс"
+              % (vals["FLOOD_RETRY_MIN_MS"], small_air))
         return
-    ctx.check("пауза между копиями (%d мс) больше времени в эфире (%d мс)"
-          % (vals["FLOOD_RETRY_MIN_MS"], airtime), True)
+    if vals["FLOOD_RETRY_MAX_MS"] < airtime:
+        ctx.check("потолок паузы не режет самый большой кадр", False,
+              "FLOOD_RETRY_MAX_MS %d мс, бюджет кадра %d мс: зажим опустит паузу большого "
+              "кадра ниже его эфира" % (vals["FLOOD_RETRY_MAX_MS"], airtime))
+        return
+    ctx.check("пауза между копиями: %d…%d мс против эфира %d…%d мс"
+          % (vals["FLOOD_RETRY_MIN_MS"], vals["FLOOD_RETRY_MAX_MS"], small_air, airtime), True)
 
     # 3. Повторов должно быть больше одного — с одной копией любая помеха равна потере.
     if vals["FLOOD_REPEATS"] < 2:
