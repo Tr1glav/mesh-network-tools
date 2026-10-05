@@ -459,8 +459,24 @@ RELAY_PRELUDE = r"""
 #define FEATURE_RELAY 1
 #define RELAY_QUEUE_MAX 8
 #define RELAY_DELAY_MIN_MS 1400
-#define RELAY_DELAY_MAX_MS 2500
-#define MAX_RELAY_HOPS 32
+#define RELAY_DELAY_MAX_MS 6400
+#define RELAY_FLOOD_MAX 32
+#define RELAY_FLOOD_MAX_ADVERT 8
+#define RELAY_LOOP_OFF      0
+#define RELAY_LOOP_MINIMAL  1
+#define RELAY_LOOP_MODERATE 2
+#define RELAY_LOOP_STRICT   3
+#ifndef RELAY_LOOP_DETECT
+#define RELAY_LOOP_DETECT RELAY_LOOP_STRICT
+#endif
+#define RELAY_TX_DELAY_PCT 50
+#define RELAY_DELAY_SPREAD 5
+#define PAYLOAD_TYPE_REQ      0x00
+#define PAYLOAD_TYPE_TXT_MSG  0x02
+#define PAYLOAD_TYPE_ACK      0x03
+#define PAYLOAD_TYPE_ADVERT   0x04
+#define PAYLOAD_TYPE_GRP_TXT  0x05
+#define ROUTE_TYPE_FLOOD      0x01
 #define RELAY_SEEN_COUNT 24
 #define SEEN_HASH_SIZE 8
 #define PATH_HASH_SIZE 2
@@ -493,6 +509,23 @@ long random(long howsmall, long howbig) {
     return howsmall + (long)random((unsigned int)(howbig - howsmall));
 }
 static void txFrame(const uint8_t*, int) {}
+// Время кадра в эфире: на хосте радио нет, поэтому считаем ту же формулу, что отдаёт
+// RadioLib на плате, для профиля сети (SF8, 62.5 кГц, кодирование 4/7, преамбула 16).
+// Заглушка-константа здесь не годится: проверка ниже требует, чтобы задержка переиздания
+// РОСЛА вместе с кадром, а с константой она была бы одинаковой для всех размеров.
+static uint32_t radioAirtimeMs(int len) {
+    if (len <= 0) len = 1;
+    if (len > 255) len = 255;
+    const int sf = 8, cr = 7, pre = 16;
+    const uint32_t symbol_us = ((1000u * 10u) << sf) / 625u;   // BW 62.5 кГц
+    int bits = 8 * len + 16 - 4 * sf + 8 + 20;
+    if (bits < 0) bits = 0;
+    const int sf_divisor = 4 * sf;
+    const int n_pre = (bits + sf_divisor - 1) / sf_divisor;
+    const uint32_t n_symbol_x4 = (uint32_t)((pre + 8) * 4 + 17 + n_pre * cr * 4);
+    const uint32_t us = (symbol_us * n_symbol_x4) / 4;
+    return (us + 999) / 1000;
+}
 static bool meshFrameHashOf(const uint8_t* data, int len, uint8_t out[32]);
 // Хэш кадра: mbedtls на хосте нет, а проверять надо решение, а не криптографию.
 // Считаем что-то, что зависит ровно от переданных байт, — этого достаточно, чтобы
@@ -555,13 +588,44 @@ int main() {
     want("свой хэш в пути не ретранслируем", maybeQueueRelay(loop, nl), RELAY_SKIPPED);
     memcpy(bot_pub, "\xEE\xFF", 2);
 
-    // Транспортные коды (0x00) и direct (route 0x02) не переносятся
+    // Маршруты с транспортными кодами и direct не переносятся: решает ТИП МАРШРУТА
     uint8_t tr[256];
     int nt = mkFrame(tr, 0, 0x33);
-    tr[0] = (uint8_t)((0x00 << 2) | 0x00);
-    want("служебный обмен не ретранслируем", maybeQueueRelay(tr, nt), RELAY_SKIPPED);
-    tr[0] = (uint8_t)((0x01 << 2) | 0x02);
+    tr[0] = (uint8_t)((PAYLOAD_TYPE_REQ << 2) | 0x00);   // route = TRANSPORT_FLOOD
+    want("флуд с транспортными кодами не ретранслируем", maybeQueueRelay(tr, nt), RELAY_SKIPPED);
+    tr[0] = (uint8_t)((PAYLOAD_TYPE_GRP_TXT << 2) | 0x02);   // route = DIRECT
     want("direct-кадр не ретранслируем", maybeQueueRelay(tr, nt), RELAY_SKIPPED);
+
+    // А вот ТИП НАГРУЗКИ переиздание не ограничивает: раньше здесь стояло условие на
+    // payload 0x00/0x03 с подписью «транспортные коды», и оно отбрасывало REQ и ACK —
+    // то есть подтверждения доставки через нас не проходили. Репитер переносит, а не
+    // выбирает: у оригинала allowPacketForward по типу нагрузки не фильтрует вовсе.
+    uint8_t ack[256];
+    int na = mkFrame(ack, 0, 0x44);
+    ack[0] = (uint8_t)((PAYLOAD_TYPE_ACK << 2) | ROUTE_TYPE_FLOOD);
+    want("подтверждение доставки переиздаётся", maybeQueueRelay(ack, na), RELAY_QUEUED);
+    uint8_t req[256];
+    int nq = mkFrame(req, 0, 0x45);
+    req[0] = (uint8_t)((PAYLOAD_TYPE_REQ << 2) | ROUTE_TYPE_FLOOD);
+    want("запрос переиздаётся", maybeQueueRelay(req, nq), RELAY_QUEUED);
+
+    // Объявления отсечены раньше остальных: advert расходится по всей сети, и каждый
+    // лишний хоп множит копии. Предел свой, RELAY_FLOOD_MAX_ADVERT, и он СТРОГО меньше
+    // общего — иначе смысла в отдельном числе нет.
+    uint8_t adv[256];
+    int nadv = mkFrame(adv, RELAY_FLOOD_MAX_ADVERT, 0x55);
+    adv[0] = (uint8_t)((PAYLOAD_TYPE_ADVERT << 2) | ROUTE_TYPE_FLOOD);
+    want("объявление с исчерпанным пределом пропущено", maybeQueueRelay(adv, nadv),
+         RELAY_SKIPPED);
+    uint8_t adv2[256];
+    int nadv2 = mkFrame(adv2, RELAY_FLOOD_MAX_ADVERT - 1, 0x56);
+    adv2[0] = (uint8_t)((PAYLOAD_TYPE_ADVERT << 2) | ROUTE_TYPE_FLOOD);
+    want("объявление в пределах лимита переиздаётся", maybeQueueRelay(adv2, nadv2),
+         RELAY_QUEUED);
+    // Тот же путь, но НЕ объявление — общий предел больше, значит кадр проходит.
+    uint8_t txt[256];
+    int ntxt = mkFrame(txt, RELAY_FLOOD_MAX_ADVERT, 0x57);
+    want("сообщение с тем же путём переиздаётся", maybeQueueRelay(txt, ntxt), RELAY_QUEUED);
 
     // Битые кадры: путь объявлен длиннее, чем данных в кадре
     uint8_t bad[256];
@@ -570,18 +634,57 @@ int main() {
     bad[1] = (uint8_t)(((PATH_HASH_SIZE - 1) << 6) | 5);   // 5 хопов, а данных нет
     want("обрезанный кадр пропущен", maybeQueueRelay(bad, 4), RELAY_SKIPPED);
     want("кадр короче заголовка пропущен", maybeQueueRelay(bad, 1), RELAY_SKIPPED);
-    // Путь упёрся в потолок хопов
-    bad[1] = (uint8_t)(((PATH_HASH_SIZE - 1) << 6) | 63);
-    memset(bad + 2, 0x77, 63 * PATH_HASH_SIZE);
-    want("путь длиннее потолка пропущен", maybeQueueRelay(bad, 2 + 63 * PATH_HASH_SIZE + 4),
-         RELAY_SKIPPED);
+    // Путь упёрся в общий потолок хопов (RELAY_FLOOD_MAX). Берём ровно потолок: он и есть
+    // граница отказа, и шестибитный счётчик хопов до 63 её достигает.
+    bad[1] = (uint8_t)(((PATH_HASH_SIZE - 1) << 6) | RELAY_FLOOD_MAX);
+    memset(bad + 2, 0x77, RELAY_FLOOD_MAX * PATH_HASH_SIZE);
+    want("путь длиннее потолка пропущен",
+         maybeQueueRelay(bad, 2 + RELAY_FLOOD_MAX * PATH_HASH_SIZE + 4), RELAY_SKIPPED);
+    // На один хоп меньше — проходит: иначе проверка выше ловила бы не потолок, а что угодно.
+    uint8_t edge[256];
+    memset(edge, 0, sizeof(edge));
+    edge[0] = (uint8_t)((PAYLOAD_TYPE_GRP_TXT << 2) | ROUTE_TYPE_FLOOD);
+    edge[1] = (uint8_t)(((PATH_HASH_SIZE - 1) << 6) | (RELAY_FLOOD_MAX - 1));
+    memset(edge + 2, 0x78, (RELAY_FLOOD_MAX - 1) * PATH_HASH_SIZE);
+    memset(edge + 2 + (RELAY_FLOOD_MAX - 1) * PATH_HASH_SIZE, 0x79, 8);
+    want("путь на хоп короче потолка проходит",
+         maybeQueueRelay(edge, 2 + (RELAY_FLOOD_MAX - 1) * PATH_HASH_SIZE + 8), RELAY_QUEUED);
+
+    // Задержка переиздания обязана РАСТИ вместе с кадром: она выводится из времени кадра в
+    // эфире, а не задана одним числом на все размеры. Проверяем не конкретные миллисекунды
+    // (там случайность), а то, что верхняя граница у большого кадра выше, чем у малого.
+    unsigned long dSmall = 0, dBig = 0;
+    for (int i = 0; i < 200; i++) {
+        unsigned long a = relayDelayMs(24);
+        unsigned long b = relayDelayMs(250);
+        if (a > dSmall) dSmall = a;
+        if (b > dBig) dBig = b;
+    }
+    if (!(dBig > dSmall)) {
+        printf("задержка переиздания не зависит от размера кадра: %lu против %lu\n",
+               dBig, dSmall);
+        return 1;
+    }
+    if (dSmall < RELAY_DELAY_MIN_MS) {
+        printf("задержка переиздания ниже нижней границы: %lu\n", dSmall);
+        return 1;
+    }
+    if (dBig > RELAY_DELAY_MAX_MS) {
+        printf("задержка переиздания выше объявленного бюджета: %lu > %d\n",
+               dBig, RELAY_DELAY_MAX_MS);
+        return 1;
+    }
 
     // Главное, что чинили: забитая очередь обязана отпустить следующую копию.
     // Очередь на 8 слотов уже занята кадрами выше? Нет — занимаем её явно.
     // Очередь уже занята кадрами из предыдущих проверок — освобождаем её целиком, иначе
     // «переполнение» наступит раньше, чем мы его устроим.
     clockMs += 100000;
-    meshRelayTick();
+    // Тик отдаёт ОДИН кадр, а не всю очередь (это и починено в meshRelayTick), поэтому
+    // освобождать её надо столько раз, сколько в ней слотов. Раньше здесь стоял один вызов:
+    // хватало, пока выше в очередь попадал один кадр, и сломалось, как только проверок
+    // политики стало больше. Проверка теста на самом тесте — тоже проверка.
+    for (int i = 0; i < RELAY_QUEUE_MAX + 2; i++) meshRelayTick();
     uint32_t dropsBefore = relayQueueDrops;
     uint8_t full[9][256];
     int fullLen[9];
@@ -1872,6 +1975,121 @@ def button_in_core_test(ctx):
                   "ссылка на функцию, которой в сборке нет")
 
 
+def relay_policy_test(ctx):
+    """Правила переиздания — перенос из оригинального MeshCore, и перенос честный.
+
+    Политика взята из meshcore-dev/MeshCore (лицензия MIT): `isFloodHopLimitExceeded` из
+    src/helpers/RoutingPolicy.h, `isLooped`, таблицы `max_loop_*` и `getRetransmitDelay` из
+    examples/simple_repeater/MyMesh.cpp. Решения проверяются на хосте (relay_queue_test);
+    здесь проверяется то, что из поведения не видно: согласованность чисел между собой,
+    отсутствие фильтра по типу нагрузки и уведомление об авторстве.
+
+    Числа скопированы НЕ все, и это тоже проверяется. Общий предел хопов у оригинала 64, а
+    счётчик хопов занимает шесть бит — больше 63 не бывает ни у них, ни у нас, то есть их
+    число не срабатывает никогда. Скопировать его значило бы тихо выключить работающую
+    проверку, поэтому общий предел остался нашим."""
+    cfg = (ctx.core / "include" / "config.h").read_text(encoding="utf-8")
+    rel = (ctx.core / "src" / "mesh_relay.cpp").read_text(encoding="utf-8")
+
+    def const(name):
+        m = re.search(r"(?m)^#define\s+%s\s+(\d+)\b" % name, cfg)
+        return int(m.group(1)) if m else None
+
+    names = ("RELAY_DELAY_MIN_MS", "RELAY_DELAY_MAX_MS", "RELAY_TX_DELAY_PCT",
+             "RELAY_DELAY_SPREAD", "RELAY_FLOOD_MAX", "RELAY_FLOOD_MAX_ADVERT",
+             "FRAME_AIRTIME_MS")
+    vals = {n: const(n) for n in names}
+    missing = [n for n, v in vals.items() if v is None]
+    ctx.check("числа политики переиздания заданы", not missing,
+              "не найдено в config.h: " + ", ".join(missing))
+    if missing:
+        return
+
+    # 1. Объявленный бюджет задержки обязан совпадать с формулой, по которой она считается.
+    #    Литералом он оставлен затем, что его читают проверки и чужие таймауты; но литерал,
+    #    разошедшийся с формулой, — это обещание, которого код не держит.
+    t = (vals["FRAME_AIRTIME_MS"] * vals["RELAY_TX_DELAY_PCT"]) // 100
+    want = vals["RELAY_DELAY_MIN_MS"] + vals["RELAY_DELAY_SPREAD"] * t
+    ctx.check("бюджет задержки переиздания совпадает с формулой (%d мс)" % want,
+              vals["RELAY_DELAY_MAX_MS"] == want,
+              "RELAY_DELAY_MAX_MS = %d, а формула даёт %d + %d * (%d * %d / 100) = %d"
+              % (vals["RELAY_DELAY_MAX_MS"], vals["RELAY_DELAY_MIN_MS"],
+                 vals["RELAY_DELAY_SPREAD"], vals["FRAME_AIRTIME_MS"],
+                 vals["RELAY_TX_DELAY_PCT"], want))
+
+    # 2. Предел объявлений обязан быть СТРОГО меньше общего: равный ничего не добавляет.
+    ctx.check("у объявлений свой предел хопов, и он строже общего",
+              vals["RELAY_FLOOD_MAX_ADVERT"] < vals["RELAY_FLOOD_MAX"],
+              "advert %d против общего %d: отдельное число не отсекает ничего"
+              % (vals["RELAY_FLOOD_MAX_ADVERT"], vals["RELAY_FLOOD_MAX"]))
+
+    # 3. Общий предел обязан быть достижим: счётчик хопов шестибитный, выше 63 не бывает.
+    ctx.check("общий предел хопов достижим (<= 63)", vals["RELAY_FLOOD_MAX"] <= 63,
+              "RELAY_FLOOD_MAX = %d, а в path_len под число хопов шесть бит — предел не "
+              "сработает никогда, и ограничителем останется только размер кадра"
+              % vals["RELAY_FLOOD_MAX"])
+
+    # 4. Задержка выводится из времени ЭТОГО кадра, а не из константы.
+    delay = ctx.grab(ctx.core / "src/mesh_relay.cpp", "unsigned long relayDelayMs(")
+    ctx.check("задержка переиздания выводится из времени кадра",
+              "radioAirtimeMs(" in delay,
+              "relayDelayMs не спрашивает время кадра: задержка снова одна на все размеры")
+    ctx.check("задержка переиздания не выходит за объявленный бюджет",
+              "RELAY_DELAY_MAX_MS" in delay,
+              "relayDelayMs не ограничен RELAY_DELAY_MAX_MS, а из него выведены чужие "
+              "таймауты ожидания")
+
+    # 5. Таблицы допусков петли: строгая — все единицы, и с ростом хэша допуск не растёт.
+    tables = {}
+    for name in ("relayLoopMinimal", "relayLoopModerate", "relayLoopStrict"):
+        m = re.search(r"%s\[\]\s*=\s*\{([^}]*)\}" % name, rel)
+        if not m:
+            tables[name] = None
+            continue
+        # Комментарии внутри таблицы выкидываем: в них стоят номера размеров хэша
+        # (/* 1 Б */, /* 2 Б */), и без этого в список допусков попадали они.
+        body = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+        tables[name] = [int(x) for x in re.findall(r"(?<![\w.])(\d+)(?![\w.])", body)]
+    ctx.check("таблицы допусков петли на месте", all(tables.values()),
+              "не разобрались: " + ", ".join(n for n, v in tables.items() if not v))
+    if all(tables.values()):
+        ctx.check("строгий уровень не допускает повторов",
+                  tables["relayLoopStrict"][1:] == [1] * len(tables["relayLoopStrict"][1:]),
+                  "строгий уровень разрешает больше одного вхождения: %s"
+                  % tables["relayLoopStrict"])
+        for name in ("relayLoopMinimal", "relayLoopModerate"):
+            row = tables[name][1:]
+            ctx.check("допуск %s не растёт с размером хэша" % name,
+                      all(a >= b for a, b in zip(row, row[1:])),
+                      "%s = %s: чем длиннее хэш, тем МЕНЬШЕ случайных совпадений, значит "
+                      "допуск обязан сужаться" % (name, tables[name]))
+    ctx.check("уровень определения петли объявлен",
+              const("RELAY_LOOP_DETECT") is not None
+              or re.search(r"(?m)^#define\s+RELAY_LOOP_DETECT\s+RELAY_LOOP_\w+", cfg)
+              is not None,
+              "RELAY_LOOP_DETECT не задан — уровень строгости выбирать нечем")
+
+    # 6. По типу нагрузки переиздание не фильтруется. Раньше фильтр был, с подписью
+    #    «транспортные коды», и отбрасывал REQ и ACK: подтверждения доставки через нас не
+    #    проходили. Разрешено ровно два упоминания типа: предел объявлений и личка себе.
+    decide = ctx.grab(ctx.core / "src/mesh_relay.cpp", "int maybeQueueRelay(")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                      for ln in decide.splitlines())
+    bad = [m for m in re.findall(r"payload_type\s*(?:==|!=)\s*(\w+)", code)
+           if m not in ("PAYLOAD_TYPE_TXT_MSG",)]
+    ctx.check("по типу нагрузки переиздание не фильтруется", not bad,
+              "в решении сравнение типа нагрузки с %s: репитер переносит, а не выбирает, и "
+              "так уже терялись ACK" % ", ".join(bad))
+
+    # 7. Уведомление об авторстве обязано ехать с кодом: он скопирован под MIT.
+    for path, txt in ((ctx.core / "src/mesh_relay.cpp", rel),
+                      (ctx.core / "include/config.h", cfg)):
+        ctx.check("в %s есть ссылка на источник правил" % path.name,
+                  "MIT" in txt and "MeshCore" in txt,
+                  "код правил переиздания скопирован из оригинального MeshCore под MIT — "
+                  "уведомление об авторстве обязано остаться в файле")
+
+
 def relay_queue_test(ctx):
     """Решения ретранслятора по кадру.
 
@@ -1886,6 +2104,13 @@ def relay_queue_test(ctx):
             + ctx.span(ctx.core / "src/mesh_relay.cpp",
                    "static struct {", "static int relaySeenNext = 0;")
             + "\n" + ctx.grab(ctx.core / "src/mesh_relay.cpp", "static bool relayWasQueued(") + "\n"
+            + ctx.span(ctx.core / "src/mesh_relay.cpp",
+                       "static const uint8_t relayLoopMinimal[]",
+                       "relayLoopStrict[]   = { 0, /* 1 \u0411 */ 1, /* 2 \u0411 */ 1, "
+                       "/* 3 \u0411 */ 1 };") + "\n"
+            + ctx.grab(ctx.core / "src/mesh_relay.cpp", "bool relayFloodHopLimitExceeded(") + "\n"
+            + ctx.grab(ctx.core / "src/mesh_relay.cpp", "bool relayIsLooped(") + "\n"
+            + ctx.grab(ctx.core / "src/mesh_relay.cpp", "unsigned long relayDelayMs(") + "\n"
             + ctx.grab(ctx.core / "src/mesh_relay.cpp", "static void relayMarkQueued(") + "\n"
             + ctx.grab(ctx.core / "src/mesh.cpp", "static bool meshFrameHash(") + "\n"
             + ctx.grab(ctx.core / "src/mesh.cpp", "bool meshFrameHashOf(") + "\n"
