@@ -69,6 +69,7 @@ def run_fork(ctx):
                                  extra_prelude=suite_fork.PURE_EXTRA_PRELUDE,
                                  label=suite_fork.PURE_LABEL))
     suite_fork.button_compat_test(ctx)
+    suite_fork.advert_path_prefix_test(ctx)
     suite_fork.companion_bounds_test(ctx)
     # Страница проверяется цепочкой: page_js_test читает web/app.js и передаёт его дальше —
     # разбор разметки, маршруты и поля /info нужны все от одного и того же текста.
