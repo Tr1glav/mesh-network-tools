@@ -1992,16 +1992,24 @@ def flood_tx_queue_test(ctx):
     сообщение станет одноразовым, и выглядеть это будет как потеря в эфире."""
     tx = (ctx.core / "src" / "mesh_tx.cpp").read_text(encoding="utf-8")
 
-    send = ctx.grab(ctx.core / "src/mesh_tx.cpp", "void floodSend(")
+    # Логика живёт в floodSendImpl: floodSend и floodSendQueued — две тонкие обёртки над ней,
+    # и отличаются ровно тем, уходит ли первая копия в эфир из вызывающего кода.
+    send = ctx.grab(ctx.core / "src/mesh_tx.cpp", "static void floodSendImpl(")
     code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
                       for ln in send.splitlines())
-    ctx.check("floodSend кладёт копии в очередь", "floodQueueCopy(" in code,
+    ctx.check("отправка кладёт копии в очередь", "floodQueueCopy(" in code,
               "копии снова уходят подряд: главный цикл встанет на время всей отправки")
-    # Первая копия обязана уйти СРАЗУ: иначе нажатие ждёт тика, и задержка возвращается.
+    # У обычной отправки первая копия обязана уйти СРАЗУ: иначе нажатие ждёт тика.
     first = code[:code.find("for (int i = 1")] if "for (int i = 1" in code else code
-    ctx.check("первая копия уходит без очереди",
-              "sendFrame(" in first or "txFrame(" in first,
-              "первая копия тоже через очередь — сообщение ждёт тика вместо эфира")
+    ctx.check("первая копия обычной отправки уходит без очереди",
+              re.search(r"if\s*\(\s*inlineFirst\s*\)", first) is not None
+              and ("sendFrame(" in first or "txFrame(" in first),
+              "ветки «первая копия сразу» не осталось — сообщение ждёт тика вместо эфира")
+    wrap = ctx.grab(ctx.core / "src/mesh_tx.cpp", "void floodSend(")
+    ctx.check("floodSend остаётся отправкой с немедленной первой копией",
+              "true" in wrap,
+              "floodSend перестал быть немедленной отправкой: тогда кнопка и ответы узла "
+              "снова будут ждать тика")
 
     tick = ctx.grab(ctx.core / "src/mesh_tx.cpp", "void meshTxTick(")
     tcode = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
