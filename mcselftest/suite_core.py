@@ -1959,21 +1959,30 @@ def handshake_budget_test(ctx):
     # ровно это и случилось, когда FRAME_AIRTIME_MS исправили с 500 до 2000.
     ack_bytes = const("OTA_ACKSTART_FRAME_MAX")
     prof = radio_profile(ctx, "meshcore-fork") or radio_profile(ctx, "tdeck")
-    if ack_bytes and prof:
-        ack_air = lora_airtime_ms(ack_bytes, *prof)
+    # Без профиля радио время кадра ackstart посчитать нечем, а подставлять вместо него
+    # бюджет самого большого кадра НЕЛЬЗЯ: 96 Б висят в эфире 832 мс против 1979 мс, и
+    # проверка объявляла бы рукопожатие невыполнимым. Так и вышло в CI ядра и набора
+    # проверок, где прошивок рядом нет вовсе: локально зелено, там красно. Молчание честнее
+    # посчитанного не из того.
+    if not (ack_bytes and prof):
+        ctx.note("     SKIP бюджет рукопожатия: профиля радио рядом нет (нужен "
+                 "board_config.h прошивки)")
+        ack_air = None
     else:
-        ack_air = airtime      # профиля рядом нет — считаем по верхней границе
-    ack_span = ack_copies * ack_air + (ack_copies - 1) * ack_gap
-    ctx.check("ackstart укладывается в окно первого чанка",
-          ack_gap < flood_min and ack_span < first_chunk,
-          "копий %d по %d мс + эфир ≈ %d мс, окно %d мс (пауза флуда %d мс)"
-          % (ack_copies, ack_gap, ack_span, first_chunk, flood_min))
+        ack_air = lora_airtime_ms(ack_bytes, *prof)
+        ack_span = ack_copies * ack_air + (ack_copies - 1) * ack_gap
+    if ack_air is not None:
+        ctx.check("ackstart укладывается в окно первого чанка",
+              ack_gap < flood_min and ack_span < first_chunk,
+              "копий %d по %d мс + эфир ≈ %d мс, окно %d мс (пауза флуда %d мс)"
+              % (ack_copies, ack_gap, ack_span, first_chunk, flood_min))
 
     # и бот обязан ждать не меньше, чем сенсор тратит на уход в быстрый канал
-    ctx.check("бот ждёт переключения сенсора не меньше, чем сенсор шлёт ackstart",
-          settle >= ack_span - ack_air,
-          "OTA_FAST_SETTLE_MS %d, отправка ackstart ≈ %d мс (кадр %s Б, эфир %d мс)"
-          % (settle, ack_span, ack_bytes, ack_air))
+    if ack_air is not None:
+        ctx.check("бот ждёт переключения сенсора не меньше, чем сенсор шлёт ackstart",
+              settle >= ack_span - ack_air,
+              "OTA_FAST_SETTLE_MS %d, отправка ackstart ≈ %d мс (кадр %s Б, эфир %d мс)"
+              % (settle, ack_span, ack_bytes, ack_air))
 
     # Обычные сообщения: пачка копий по 1000+ мс не должна выглядеть как «несколько копий»
     src_files = list((ctx.core / "src").glob("*.cpp")) + \
