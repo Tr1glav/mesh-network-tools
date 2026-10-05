@@ -34,6 +34,7 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.loss_counters_live_test(ctx)
     suite_core.meshcore_copies_test(ctx)
     suite_core.sensor_tasks_in_core_test(ctx)
+    suite_core.button_in_core_test(ctx)
     suite_core.peer_cache_test(ctx)
     suite_core.group_text_bound_test(ctx)
     suite_core.cfg_reply_queue_test(ctx)

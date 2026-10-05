@@ -991,11 +991,12 @@ MESHCORE_DIVERGENT = {
     "include/features.h":     "наборы признаков разных плат",
     "include/oled.h":         "OLED против ST7789",
 }
-# Файлы, которых у T-Deck нет и не должно быть.
-MESHCORE_FORK_ONLY = {
-    "src/button.cpp":    "у T-Deck нет кнопки сенсорного типа: ввод — клавиатура и трекбол",
-    "include/button.h":  "то же",
-}
+# Файлы, которых у T-Deck нет и не должно быть. Список намеренно пуст: обе записи, что в нём
+# были (`src/button.cpp` и `include/button.h`), уехали в ядро 5 октября 2026 — логика кнопки
+# одинакова на любой плате с кнопкой, а пин и прерывание ушли за хуки. Пустой список не значит
+# «проверять нечего»: прочие файлы форка закрыты списком приставок в самой проверке, а запись,
+# которой больше нет на диске, ловится проверкой «список файлов форка не врёт».
+MESHCORE_FORK_ONLY = {}
 
 
 def meshcore_copies_test(ctx):
@@ -1054,13 +1055,20 @@ def meshcore_copies_test(ctx):
                                    "include/fwupdate", "include/ca_bundle", "include/ota_internal"))]
     ctx.check("файлы, которых нет у T-Deck, перечислены", not extra,
               "есть только у форка и нигде не объяснены: " + ", ".join(extra))
+    # И в обратную сторону, как у списка расхождений: запись про файл, которого у форка больше
+    # нет, — это ложь, и следующий читатель поверит ей, а не диску. Так список начал врать,
+    # когда button.cpp уехал в ядро: записи остались, файлов не стало.
+    lying = [r for r in MESHCORE_FORK_ONLY if r not in only_fork]
+    ctx.check("список файлов форка не врёт", not lying,
+              "записаны как «только у форка», а у форка их нет: " + ", ".join(lying))
 
-    # Кнопки у T-Deck нет — это решение владельца, и мёртвой копии там быть не должно.
+    # Кнопки у T-Deck нет — это решение владельца, и копии кода там быть не должно. Теперь
+    # цена копии выше, чем была: lib/ прошивки перекрывает библиотеку, то есть вернувшийся
+    # button.cpp собирался бы ВМЕСТО ядерного и разошёлся бы с ним молча.
     ctx.check("у T-Deck нет копии кода кнопки",
               not (tdeck / "src" / "button.cpp").exists()
               and not (tdeck / "include" / "button.h").exists(),
-              "вернулась мёртвая копия button.cpp: она не компилируется (FEATURE_BUTTON=0) "
-              "и разойдётся с форком молча")
+              "вернулась копия button.cpp: она перекроет ядро и разойдётся с ним молча")
     feat = (tdeck / "include" / "features.h").read_text(encoding="utf-8")
     # Именно `#if FEATURE_BUTTON` + `#error` подряд. Искать просто «#error» и слово «кнопка»
     # где-нибудь в файле нельзя: других #error в features.h хватает, и проверка проходила бы
@@ -1068,7 +1076,8 @@ def meshcore_copies_test(ctx):
     ctx.check("включить кнопку у T-Deck нельзя молча",
               re.search(r"#if\s+FEATURE_BUTTON\s*\n\s*#\s*error", feat) is not None,
               "features.h T-Deck не отказывает на FEATURE_BUTTON=1 — признак включился бы, "
-              "а кода кнопки в прошивке нет")
+              "и ядро стало бы разбирать кнопку, которой у платы нет: хуки mcButtonAttach/"
+              "mcButtonDown здесь закрывать нечем")
     ctx.note("     сводка: копий lib/meshcore две, совпадают %d файлов, расходятся %d, "
              "только у форка %d" % (len(same), len(diff), len(only_fork)))
 
@@ -1485,15 +1494,18 @@ def sensor_tasks_in_core_test(ctx):
     code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
                      for ln in txt.splitlines())
 
-    # Ядро не имеет права знать про экран, кнопку и приложение иначе как через хуки.
+    # Ядро не имеет права знать про экран и приложение иначе как через хуки. Кнопка из этого
+    # списка ушла: её логика переехала в ядро следом за расписанием (button_in_core_test), и
+    # расписание зовёт buttonTick() напрямую — хук mcButtonTick стал бы пустой пересылкой.
     for direct, hook in (("screenTick", "mcUiTick"),
-                         ("buttonTick", "mcButtonTick"),
                          ("companionTick", "mcCompanionTick")):
         ctx.check("ядро зовёт %s, а не %s напрямую" % (hook, direct),
                   hook in code and not re.search(r"(?<!mc)\b%s\s*\(" % direct, code),
                   "в ядре остался прямой вызов %s: это код прошивки, и ядру его не собрать"
                   % direct)
-    for bad in ("display.h", "button.h", "companion.h"):
+    # button.h из этого списка ушёл: он теперь заголовок ЯДРА, и включать его расписание
+    # обязано. Остались заголовки, которые живут только в прошивке.
+    for bad in ("display.h", "companion.h"):
         ctx.check("ядро не включает %s" % bad, bad not in txt,
                   "ядро включает заголовок прошивки — он до него не доедет")
 
@@ -1517,6 +1529,123 @@ def sensor_tasks_in_core_test(ctx):
         ctx.check("%s переопределяет mcUiTick" % name,
                   re.search(r"^\s*void\s+mcUiTick\s*\(\s*\)\s*\{", own, re.M) is not None,
                   "без переопределения экран %s не будет гаснуть: сработает заглушка ядра" % name)
+
+
+def button_in_core_test(ctx):
+    """Логика кнопки живёт в ядре, а пин, уровень и экран — за хуками.
+
+    `button.cpp` лежал копией в `lib/meshcore` форка, и из его 130 строк платформенными были
+    ровно три вызова: настроить пин с прерыванием, прочитать уровень, переключить экран. Всё
+    остальное — смысл нажатия: окно дребезга, кольцо фронтов, счёт серии коротких, порог
+    долгого удержания, намеренно пустой промежуток между ними и правило «пока идёт проверка
+    доступности, её гасит ЛЮБОЕ короткое нажатие». К плате это отношения не имеет, и держать
+    это копией значило повторить историю `sensor_tasks.cpp`.
+
+    Проверка следит за тремя вещами сразу, потому что поломаться может любая:
+
+    1. ядро держит логику и не знает про пин;
+    2. прошивка закрывает три хука и отдаёт фронт из обработчика прерывания в ядро;
+    3. от переезда не осталось пустой пересылки — хук `mcButtonTick` удалён, расписание зовёт
+       `buttonTick()` напрямую под признаком `FEATURE_BUTTON`.
+    """
+    src = ctx.core / "src" / "button.cpp"
+    hdr = ctx.core / "include" / "button.h"
+    ctx.check("логика кнопки лежит в ядре", src.is_file(),
+              "нет mesh-network-core/src/button.cpp")
+    ctx.check("ядро объявляет кнопку", hdr.is_file(),
+              "нет mesh-network-core/include/button.h — прошивке нечего включать")
+    if not (src.is_file() and hdr.is_file()):
+        return
+    txt = src.read_text(encoding="utf-8")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                      for ln in txt.splitlines())
+
+    # --- 1. ядро знает про кнопку только через хуки ---
+    for hook, why in (("mcButtonAttach", "настроить пин и повесить прерывание"),
+                      ("mcButtonDown", "прочитать уровень для пересинхронизации"),
+                      ("mcScreenToggle", "переключить экран на долгом удержании")):
+        ctx.check("ядро спрашивает хук %s" % hook,
+                  re.search(r"\b%s\s*\(" % hook, code) is not None,
+                  "ядро не зовёт %s (%s) — значит делает это само, а пин у плат разный"
+                  % (hook, why))
+    for bad in ("BUTTON_PIN", "pinMode", "digitalRead", "attachInterrupt", "gpio_get_level",
+                "screenToggle"):
+        ctx.check("ядро не трогает %s" % bad,
+                  re.search(r"\b%s\b" % bad, code) is None,
+                  "в ядре осталось платформенное обращение %s: на плате без этого пина ядро "
+                  "не собрать, а на другой плате он другой" % bad)
+
+    # --- отказ платы уважается ---
+    # Не формальность: признак включали на плате без кнопки, и digitalRead на пине -1 отдавал
+    # LOW, то есть «кнопка нажата навсегда». Теперь плата отвечает отказом, и ядро обязано
+    # замолчать, а не разбирать пустое кольцо.
+    begin = ctx.grab(src, "void buttonBegin(")
+    # Именно ПРИСВАИВАНИЕ, а не вызов: проверка «mcButtonAttach() упоминается в buttonBegin»
+    # проходила и после отката, в котором ответ хука выбрасывался, — то есть не проверяла
+    # ничего. Откат это и показал.
+    ctx.check("buttonBegin запоминает ответ платы",
+              re.search(r"btnAttached\s*=\s*mcButtonAttach\s*\(", begin) is not None,
+              "buttonBegin зовёт хук и выбрасывает ответ — отказ платы ни на что не влияет")
+    tick = ctx.grab(src, "void buttonTick(")
+    ctx.check("buttonTick молчит, когда платы нет",
+              re.search(r"if\s*\(\s*!\s*btnAttached\s*\)\s*return\s*;", tick) is not None,
+              "buttonTick не выходит при отказе платы: кнопки нет, а фронты разбираются")
+
+    # --- обработчик прерывания держит только защёлку ---
+    isr = ctx.grab(src, "void IRAM_ATTR buttonEdgeCaptured(")
+    ctx.check("защёлка фронта лежит в IRAM", "IRAM_ATTR" in txt,
+              "buttonEdgeCaptured без IRAM_ATTR: обработчик может сработать во время операции "
+              "с флешем, и код должен быть в IRAM")
+    for bad in ("millis", "Serial", "mcButtonDown", "buttonEdge("):
+        ctx.check("защёлка не зовёт %s" % bad, bad not in isr,
+                  "в защёлке фронта вызов %s: из прерывания так делать нельзя" % bad)
+
+    # --- 2. прошивка закрывает хуки и отдаёт фронт ядру ---
+    fork = ctx.tree / "meshcore-fork"
+    if not fork.is_dir():
+        ctx.note("     meshcore-fork рядом нет — железная половина кнопки не проверяется")
+    else:
+        own = fork / "src" / "mc_platform.cpp"
+        ctx.check("железная половина кнопки у форка на месте", own.is_file(),
+                  "нет meshcore-fork/src/mc_platform.cpp")
+        if own.is_file():
+            o = own.read_text(encoding="utf-8")
+            for hook in ("mcButtonAttach", "mcButtonDown", "mcScreenToggle"):
+                ctx.check("форк переопределяет %s" % hook,
+                          re.search(r"(?m)^(?:void|bool)\s+%s\s*\(" % hook, o) is not None,
+                          "без переопределения сработает заглушка ядра: кнопки у платы как "
+                          "будто нет (%s)" % hook)
+            # Обработчик обязан отдавать фронт в ядро, иначе кольцо пустое навсегда.
+            ctx.check("обработчик прерывания форка отдаёт фронт ядру",
+                      "buttonEdgeCaptured(" in o,
+                      "прошивка защёлкивает фронты у себя: ядро их не увидит")
+            ctx.check("обработчик прерывания форка лежит в IRAM",
+                      re.search(r"IRAM_ATTR\s+\w*[Ii]sr\s*\(", o) is not None,
+                      "обработчик без IRAM_ATTR — он может сработать во время операции с флешем")
+        # Копия в прошивке перекрыла бы ядро: lib/ прошивки сильнее библиотеки.
+        for rel in ("src/button.cpp", "include/button.h"):
+            ctx.check("у форка нет своей копии %s" % rel,
+                      not (fork / "lib" / "meshcore" / rel).exists(),
+                      "копия вернулась: она перекроет ядро и снова разойдётся с ним")
+
+    # --- 3. пустой пересылки не осталось ---
+    plat = (ctx.core / "include" / "mc_platform.h").read_text(encoding="utf-8")
+    ctx.check("хука mcButtonTick в контракте нет",
+              re.search(r"(?m)^\s*void\s+mcButtonTick\s*\(\s*\)\s*;", plat) is None,
+              "mcButtonTick вернулся в контракт: он пересылал вызов в прошивку, а логика "
+              "кнопки теперь в ядре — пересылать некуда")
+    tasks = ctx.core / "src" / "sensor_tasks.cpp"
+    if tasks.is_file():
+        t = tasks.read_text(encoding="utf-8")
+        ctx.check("расписание зовёт кнопку напрямую",
+                  re.search(r"(?m)^\s*buttonTick\s*\(\s*\)\s*;", t) is not None,
+                  "расписание не зовёт buttonTick(): нажатия не разбираются вовсе")
+        # Под признаком, а не безусловно: на плате без кнопки файла кнопки в сборке нет.
+        ctx.check("вызов кнопки стоит под FEATURE_BUTTON",
+                  re.search(r"#if\s+FEATURE_BUTTON\s*\n\s*buttonTick\s*\(\s*\)\s*;", t)
+                  is not None,
+                  "buttonTick() зовётся без #if FEATURE_BUTTON: на плате без кнопки это "
+                  "ссылка на функцию, которой в сборке нет")
 
 
 def relay_queue_test(ctx):
