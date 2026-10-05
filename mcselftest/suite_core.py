@@ -1278,6 +1278,103 @@ def cfg_reply_queue_test(ctx):
               "%s не разгружает очередь ответа — ответ на «cfg get» не уйдёт никогда" % path)
 
 
+def provision_console_budget_test(ctx):
+    """Скрипт настройки ждёт ответ платы дольше, чем плата может молчать.
+
+    Главный цикл прошивки на время передачи стоит ЦЕЛИКОМ: `radio.transmit()` блокирующий, а
+    `floodSend` между копиями берёт `delay()`. Пока цикл стоит, `cfgConsoleTick()` не читает
+    порт, и ответа на `set` не будет — не потому что плата отказала, а потому что команду ещё
+    не прочитали.
+
+    В `provision.py` стоял таймаут 4 с при худшем случае около 10.6 с, и запись падала ровно
+    тогда, когда узел что-то передавал: в ответе на `set wifi_ssid` приходило `[TX] OK`.
+    Выглядело это как отказ устройства.
+
+    Проверка считает худший случай САМА, из `config.h` ядра, и требует, чтобы число в скрипте
+    его покрывало. Сверять с константой нельзя: вырастет число копий флуда или пауза между
+    ними — и прежний таймаут снова окажется коротким, а проверка этого не заметит."""
+    def val(txt, name):
+        m = re.search(r"(?m)^#define\s+%s\s+(\d+)" % name, txt)
+        return int(m.group(1)) if m else None
+
+    cfg = (ctx.core / "include" / "config.h").read_text(encoding="utf-8")
+    nums = {n: val(cfg, n) for n in ("FLOOD_REPEATS", "CAD_WAIT_BUDGET_MS", "FRAME_AIRTIME_MS",
+                                     "FLOOD_RETRY_MAX_MS", "FLOOD_JITTER_MS")}
+    missing = [n for n, v in nums.items() if v is None]
+    ctx.check("бюджеты флуда заданы числами в config.h", not missing,
+              "не нашлось в config.h: " + ", ".join(missing) +
+              " — худший случай занятости цикла не вычислить")
+    if missing:
+        return
+    worst_ms = (nums["FLOOD_REPEATS"] * (nums["CAD_WAIT_BUDGET_MS"] + nums["FRAME_AIRTIME_MS"])
+                + (nums["FLOOD_REPEATS"] - 1) * (nums["FLOOD_RETRY_MAX_MS"]
+                                                 + nums["FLOOD_JITTER_MS"]))
+    seen = 0
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        pv = ctx.tree / sub / "scripts" / "provision.py"
+        if not pv.is_file():
+            continue
+        seen += 1
+        txt = pv.read_text(encoding="utf-8")
+
+        # Таймаут по умолчанию не задан числом: иначе он не поедет за бюджетами ядра.
+        ctx.check("talk() %s берёт таймаут не числом" % name,
+                  re.search(r"def talk\([^)]*timeout=None", txt) is not None,
+                  "в подписи talk() стоит число: оно не поднимется вместе с бюджетами флуда")
+        ctx.check("таймаут %s выводится из config.h ядра" % name,
+                  "def console_reply_timeout" in txt
+                  and all(n in txt for n in ("FLOOD_REPEATS", "CAD_WAIT_BUDGET_MS",
+                                             "FRAME_AIRTIME_MS", "FLOOD_RETRY_MAX_MS",
+                                             "FLOOD_JITTER_MS")),
+                  "скрипт не считает худший случай по бюджетам ядра")
+
+        # Главное: ЗАПУСКАЕМ функцию скрипта и сверяем её число с худшим случаем. Разбирать
+        # текст формулы бессмысленно — проверять надо результат.
+        fn = re.search(r"(?ms)^def console_reply_timeout\(.*?(?=^\S)", txt)
+        ctx.check("функция таймаута %s вырезается целиком" % name, fn is not None,
+                  "не нашлась def console_reply_timeout — проверить результат нечем")
+        if fn:
+            ns = {"re": re, "pathlib": pathlib, "ROOT": ctx.tree / sub}
+            try:
+                exec(fn.group(0), ns)
+                got = ns["console_reply_timeout"](core_dir=ctx.core)
+            except Exception as e:                       # noqa: BLE001 — любая поломка важна
+                got = None
+                ctx.note("     таймаут %s не посчитался: %s" % (name, e))
+            ctx.check("таймаут %s покрывает худший случай (%.1f с)" % (name, worst_ms / 1000.0),
+                      got is not None and got * 1000.0 >= worst_ms,
+                      "скрипт ждёт %s с, а цикл может молчать %.1f с — занятость платы "
+                      "станет «устройство не подтвердило»"
+                      % (got, worst_ms / 1000.0))
+            # И без ядра рядом он обязан остаться разумным: скрипт запускают из релиза.
+            try:
+                bare = ns["console_reply_timeout"](core_dir="/nonexistent")
+            except Exception:                            # noqa: BLE001
+                bare = None
+            ctx.check("без ядра рядом таймаут %s не обнуляется" % name,
+                      bare is not None and bare >= 10.0,
+                      "резервное значение %s с: скрипт из распакованного релиза снова "
+                      "упрётся в занятость платы" % bare)
+
+        # Повтор команды: один флуд — не предел, передачи идут подряд.
+        ctx.check("у %s команда повторяется после молчания" % name,
+                  re.search(r"if not ok and not refused\(buf\)", txt) is not None,
+                  "молчание платы сразу считается отказом, хотя set/clear идемпотентны")
+        # На ЯВНЫЙ отказ повтора быть не должно: ответ не изменится, а ошибка спрячется.
+        ctx.check("у %s явный отказ не повторяется" % name,
+                  "def refused(" in txt and "REFUSALS" in txt,
+                  "нет разделения «молчит» и «отказала»: повтор спрячет неверное значение")
+        # Молчание не значит «не дошло»: плата могла ответить позже таймаута, и тогда поле
+        # применено в ОЗУ, а в NVS не записано. Узел остаётся с половиной новых настроек, и
+        # заметить это нельзя — "show" покажет ОЗУ. Сброс возвращает сохранённое состояние.
+        tail = txt[txt.find("ОШИБКА — устройство не подтвердило"):][:1200]
+        ctx.check("%s сбрасывает плату после неподтверждённой записи" % name,
+                  'b"reboot' in tail,
+                  "скрипт уходит, оставив плату с применённым в ОЗУ и несохранённым в NVS")
+    if not seen:
+        ctx.note("SKIP provision_console_budget_test: прошивок рядом нет")
+
+
 def secrets_example_test(ctx):
     """Пример настроек развёртывания подходит СВОЕЙ прошивке.
 
