@@ -1256,18 +1256,17 @@ def cfg_reply_queue_test(ctx):
     ctx.check("cfgReplyTick ждёт тишины в эфире", "otaAnySessionActive()" in
               src[src.index("void cfgReplyTick()"):src.index("void cfgReplyTick()") + 700],
               "очередь ответа выходит в эфир во время прошивки по радио")
-    seen = 0
-    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
-        path = ctx.tree / sub / "lib" / "meshcore" / "src" / "sensor_tasks.cpp"
-        if not path.is_file():
-            continue
-        seen += 1
-        ctx.check("задачи узла %s зовут cfgReplyTick" % name,
-                  re.search(r"^\s*cfgReplyTick\s*\(\s*\)\s*;", path.read_text(encoding="utf-8"),
-                            re.M) is not None,
-                  "%s не разгружает очередь ответа — ответ на «cfg get» не уйдёт никогда" % path)
-    if not seen:
-        ctx.note("SKIP часть cfg_reply_queue_test: прошивок рядом нет")
+    # Расписание задач узла с 1 октября 2026 живёт в ядре (sensor_tasks_in_core_test), и
+    # разгружать очередь обязано оно. Раньше здесь перебирались копии
+    # `<прошивка>/lib/meshcore/src/sensor_tasks.cpp`: после переезда их не стало, обе ветви
+    # цикла уходили в `continue`, и проверка молча печатала «прошивок рядом нет» — при том
+    # что прошивки лежали рядом. Это ровно тот тихий пропуск, ради которого заведён
+    # wiring_test, только внутри одной проверки.
+    path = ctx.core / "src" / "sensor_tasks.cpp"
+    ctx.check("задачи узла зовут cfgReplyTick",
+              path.is_file() and re.search(r"^\s*cfgReplyTick\s*\(\s*\)\s*;",
+                                           path.read_text(encoding="utf-8"), re.M) is not None,
+              "%s не разгружает очередь ответа — ответ на «cfg get» не уйдёт никогда" % path)
 
 
 def secrets_example_test(ctx):
