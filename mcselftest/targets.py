@@ -38,6 +38,9 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.peer_cache_test(ctx)
     suite_core.dm_decrypt_test(ctx)
     suite_core.dm_ack_test(ctx)
+    suite_core.path_return_test(ctx)
+    suite_core.dm_to_app_test(ctx)
+    suite_core.raw_rx_log_test(ctx)
     suite_core.group_text_bound_test(ctx)
     suite_core.cfg_reply_queue_test(ctx)
     suite_core.airtime_budget_test(ctx)
@@ -75,6 +78,9 @@ def run_fork(ctx):
     suite_fork.ble_responsiveness_test(ctx)
     suite_fork.ack_confirm_test(ctx)
     suite_fork.companion_send_latency_test(ctx)
+    suite_fork.dm_contact_frame_test(ctx)
+    suite_fork.raw_rx_push_test(ctx)
+    suite_fork.contacts_rotation_test(ctx)
     suite_fork.companion_bounds_test(ctx)
     # Страница проверяется цепочкой: page_js_test читает web/app.js и передаёт его дальше —
     # разбор разметки, маршруты и поля /info нужны все от одного и того же текста.

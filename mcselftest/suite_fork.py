@@ -362,6 +362,29 @@ def advert_path_prefix_test(ctx):
               "соседних мест дважды за день и приводило к поломке")
 
 
+def _handler_body(text, handler):
+    """Тело обработчика handler целиком, от его открывающей скобки до парной закрывающей.
+
+    Нужно там, где проверок по телу несколько: искать каждую через _in_handler значит
+    заново разбирать скобки на каждый вопрос. Пусто — обработчика нет.
+    """
+    i = text.find(handler)
+    if i < 0:
+        return ""
+    j = text.find("{", i)
+    if j < 0:
+        return ""
+    depth = 0
+    for k in range(j, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[j:k]
+    return ""
+
+
 def _in_handler(text, handler, needle):
     """Встречается ли needle внутри тела обработчика handler.
 
@@ -562,6 +585,123 @@ def companion_send_latency_test(ctx):
     ctx.check("ядро умеет отправку без выхода в эфир",
               "void floodSendQueued(" in core_tx,
               "в ядре нет floodSendQueued — очереди для первой копии не существует")
+
+
+def dm_contact_frame_test(ctx):
+    """Кадр лички для приложения собран как в оригинале.
+
+    Ядро отдаёт личку хуком, а кадр для приложения собирает прошивка — и именно его
+    приложение разбирает, чтобы положить сообщение в переписку с конкретным узлом и показать
+    маршрут. Раскладка оригинала (`MyMesh::queueMessage`): код кадра, для версии 3 ещё
+    качество связи, затем ШЕСТЬ байт начала ключа собеседника (у группового здесь номер
+    канала), байт длины пути, тип текста, время отправителя и текст."""
+    comp = ctx.root / "lib" / "meshcore" / "src" / "companion.cpp"
+    proto = ctx.root / "lib" / "meshcore" / "src" / "companion_proto.cpp"
+    hdr = ctx.root / "lib" / "meshcore" / "include" / "companion_internal.h"
+    if not (comp.is_file() and proto.is_file() and hdr.is_file()):
+        ctx.note("     SKIP dm_contact_frame_test: кода компаньона рядом нет")
+        return
+    ctxt, ptxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, proto, hdr))
+    pcode = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                       for ln in ptxt.splitlines())
+
+    ctx.check("прошивка закрывает хук лички",
+              re.search(r"(?m)^void\s+companionOnDirectText\s*\(", ctxt) is not None,
+              "companionOnDirectText не реализован: ядро зовёт его на каждое личное "
+              "сообщение, и прошивка не соберётся")
+    ctx.check("у кадра лички свой код",
+              "RESP_CODE_CONTACT_MSG_RECV" in htxt
+              and "RESP_CODE_CONTACT_MSG_RECV" in pcode,
+              "личка отдаётся кодом группового сообщения: приложение положит её в общий "
+              "канал, а не в переписку, и маршрут показывать будет не для кого")
+    ctx.check("старое приложение получает свой код кадра",
+              "RESP_CODE_CONTACT_MSG_RECV_V3" in pcode
+              and re.search(r"RESP_CODE_CONTACT_MSG_RECV\b(?!_V3)", pcode) is not None,
+              "для приложений до версии 3 кода лички нет: они не понимают полей качества "
+              "связи и разберут кадр со сдвигом")
+    ctx.check("в кадре лички шесть байт ключа собеседника",
+              re.search(r"memcpy\(&out\[i\],\s*m\.pub6,\s*6\)", pcode) is not None,
+              "в кадре нет начала ключа: приложение не поймёт, от кого сообщение")
+    ctx.check("номер канала в личку не попадает",
+              re.search(r"if\s*\(dm\)[^;]*pub6[^}]*\}\s*else", pcode) is not None,
+              "номер канала и ключ пишутся в кадр одинаково: у лички и группового здесь "
+              "разные поля, и приложение разберёт кадр со сдвигом")
+    ctx.check("тип текста уходит из сообщения, а не нулём",
+              re.search(r"out\[i\+\+\]\s*=\s*m\.txtType", pcode) is not None,
+              "тип текста прибит нулём: ответ командной строки приедет в приложение обычным "
+              "сообщением")
+    ctx.check("вид сообщения хранится в очереди",
+              "MSG_KIND_CONTACT" in htxt and "MSG_KIND_CONTACT" in ctxt,
+              "очередь не помнит, личка это или канал: обе команды синхронизации отдадут "
+              "один и тот же кадр")
+
+
+def raw_rx_push_test(ctx):
+    """Сырые кадры доходят до приложения и не ломают его границы.
+
+    Вторая половина отметки «принято ретранслятором»: ядро отдаёт кадр хуком, прошивка шлёт
+    его приложению кодом 0x88 с качеством связи впереди. Границы здесь не формальность —
+    эфирный кадр длиннее кадра приложения, и оригинал такие молча пропускает."""
+    comp = ctx.root / "lib" / "meshcore" / "src" / "companion.cpp"
+    hdr = ctx.root / "lib" / "meshcore" / "include" / "companion_internal.h"
+    if not (comp.is_file() and hdr.is_file()):
+        ctx.note("     SKIP raw_rx_push_test: кода компаньона рядом нет")
+        return
+    ctxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, hdr))
+    ctx.check("прошивка закрывает хук сырого приёма",
+              re.search(r"(?m)^void\s+mcOnRawRx\s*\(", ctxt) is not None,
+              "mcOnRawRx не переопределён: сработает заглушка ядра, и приложение не узнает "
+              "о переизданных ретранслятором пакетах")
+    ctx.check("у сырого журнала код оригинала",
+              "PUSH_CODE_LOG_RX_DATA" in htxt and "PUSH_CODE_LOG_RX_DATA" in ctxt,
+              "кадр журнала уходит чужим кодом — приложение его не разберёт")
+    body = _handler_body(ctxt, "void mcOnRawRx(")
+    ctx.check("длинный кадр в приложение не лезет",
+              re.search(r"len\s*\+\s*3\s*>\s*MAX_FRAME_SIZE", body) is not None,
+              "длина не проверяется: эфирный кадр длиннее кадра приложения, и копия вылезет "
+              "за буфер")
+    ctx.check("без подключения журнал молчит",
+              "bleConnected" in body,
+              "журнал собирается и шлётся без подключённого приложения: это работа на "
+              "каждый принятый кадр впустую")
+
+
+def contacts_rotation_test(ctx):
+    """Контакты ротируются: давние вытесняются, избранные остаются.
+
+    Владелец: «авторотацию ещё давай сделаем контактов — самые старые удаляются, новые
+    запоминаются». Вытеснение самого давнего уже было, но молча и без разбора: приложение
+    продолжало показывать контакт, которого на узле уже нет, а под раздачу мог попасть
+    отмеченный владельцем узел.
+
+    Оригинал (`BaseChatMesh::allocateContactSlot`) пропускает избранные (младший бит флагов),
+    сообщает приложению о вытесненном кодом 0x8F и отдельно говорит кодом 0x90, когда
+    вытеснять нечего."""
+    comp = ctx.root / "lib" / "meshcore" / "src" / "companion.cpp"
+    hdr = ctx.root / "lib" / "meshcore" / "include" / "companion_internal.h"
+    if not (comp.is_file() and hdr.is_file()):
+        ctx.note("     SKIP contacts_rotation_test: кода компаньона рядом нет")
+        return
+    ctxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, hdr))
+    body = _handler_body(ctxt, "void companionOnAdvert(")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                      for ln in body.splitlines())
+    ctx.check("место под новый контакт освобождается самым давним",
+              re.search(r"lastmod\s*<\s*oldest", code) is not None,
+              "при полной памяти новый узел не запоминается вовсе: сеть растёт, а узел "
+              "перестаёт видеть новых соседей")
+    ctx.check("избранные не вытесняются",
+              re.search(r"flags\s*&\s*0x01", code) is not None,
+              "под ротацию попадает отмеченный владельцем контакт: случайный прохожий "
+              "вытеснит из памяти нужный узел")
+    ctx.check("приложению говорят о вытесненном контакте",
+              "PUSH_CODE_CONTACT_DELETED" in code and "PUSH_CODE_CONTACT_DELETED" in htxt,
+              "вытеснение молчит: приложение продолжит показывать контакт, которого на узле "
+              "уже нет, и писать ему в пустоту")
+    ctx.check("приложению говорят о переполнении",
+              "PUSH_CODE_CONTACTS_FULL" in code and "PUSH_CODE_CONTACTS_FULL" in htxt,
+              "когда все контакты избранные, новые перестают запоминаться беззвучно — "
+              "владелец узнает об этом только по пропавшим узлам")
 
 
 def companion_bounds_test(ctx):
