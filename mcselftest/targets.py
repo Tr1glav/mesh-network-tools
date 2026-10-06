@@ -46,6 +46,7 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.repeater_req_test(ctx)
     suite_core.airtime_counters_test(ctx)
     suite_core.version_rollover_test(ctx)
+    suite_core.cyrillic_decoder_flat_test(ctx)
     suite_core.group_text_bound_test(ctx)
     suite_core.cfg_reply_queue_test(ctx)
     suite_core.airtime_budget_test(ctx)
@@ -106,6 +107,13 @@ def run_tdeck(ctx):
     suite_tdeck.tapp_test(ctx)
     suite_tdeck.elf_headers_test(ctx)
     suite_tdeck.elf_sections_test(ctx)
+    suite_tdeck.app_frame_ms_test(ctx)
+    suite_tdeck.snake_rules_test(ctx)
+    suite_tdeck.board_power_guard_test(ctx)
+    suite_tdeck.panel_orientation_test(ctx)
+    suite_tdeck.battery_pin_test(ctx)
+    suite_tdeck.keyboard_probe_read_only_test(ctx)
+    suite_tdeck.status_clock_contrast_test(ctx)
     suite_font.cyrillic_font_test(ctx)
 
 

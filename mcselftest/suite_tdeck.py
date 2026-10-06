@@ -267,3 +267,358 @@ HOST_EXTRA_MAIN = r"""
 """
 
 HOST_EXTRA_LABEL = ("fmtUdeg", "nmeaCoord")
+
+
+# ===== Приложение, которое движется само =====
+def app_frame_ms_test(ctx):
+    """Приложение может просить частый кадр, а оболочка его даёт — но не быстрее предела.
+
+    До этого кадр просили раз в полсекунды, и ни одно приложение не могло двигаться само:
+    игра шла бы двумя кадрами в секунду. Просит теперь само приложение — пятой, НЕ
+    ОБЯЗАТЕЛЬНОЙ точкой входа appFrameMs: знать, что внутри движется, может только оно.
+    Необязательность важна не меньше самой возможности: календарь и заметки собраны без
+    неё, и требовать её от всех значило бы сломать уже собранные приложения.
+
+    Нижний предел ставит оболочка: вывод кадра занимает шину SPI, общую с радио, и просить
+    кадры чаще, чем панель успевает их принимать, значит отнимать эфир у приёма."""
+    api = ctx.root / "include" / "tdeck_api.h"
+    apps_h = ctx.root / "include" / "tdeck_apps.h"
+    elf = ctx.root / "src" / "tdeck_elf.cpp"
+    ui = ctx.root / "src" / "tdeck_ui.cpp"
+    if not (api.is_file() and apps_h.is_file() and elf.is_file() and ui.is_file()):
+        ctx.note("     SKIP app_frame_ms_test: исходников T-Deck рядом нет")
+        return
+    api_t, apps_t, elf_t, ui_t = (f.read_text(encoding="utf-8")
+                                  for f in (api, apps_h, elf, ui))
+
+    ctx.check("точка входа шага кадра объявлена в АБИ",
+              re.search(r"(?m)^uint16_t\s+appFrameMs\s*\(\s*\)\s*;", api_t) is not None,
+              "appFrameMs нет в tdeck_api.h — приложению нечем попросить кадр, и ни одна "
+              "анимация в приложении невозможна")
+    ctx.check("реестр хранит шаг кадра приложения",
+              "frameMs" in apps_t,
+              "в структурах реестра нет поля шага кадра: оболочке неоткуда его взять")
+    ctx.check("загрузчик считает шаг кадра необязательным",
+              re.search(r'\{\s*"appFrameMs"[^}]*true\s*\}', elf_t) is not None
+              and re.search(r"optional", elf_t) is not None,
+              "appFrameMs требуется наравне с остальными: уже собранные приложения "
+              "(календарь, заметки) перестанут грузиться")
+    ctx.check("обязательные точки входа остались обязательными",
+              re.search(r'\{\s*"appDraw"[^}]*false\s*\}', elf_t) is not None,
+              "appDraw помечен необязательным — приложение без рисования загрузится и "
+              "упадёт при первом кадре")
+    ctx.check("оболочка спрашивает шаг у ОТКРЫТОГО приложения",
+              re.search(r"tdeckAppFrameMs\(\s*curApp\s*\)", ui_t) is not None,
+              "шаг кадра берётся не у открытого приложения: частый кадр нужен тому, что "
+              "сейчас на экране, а шина у платы одна")
+    ctx.check("шаг кадра ограничен снизу",
+              re.search(r"want\s*<\s*\(uint16_t\)TDECK_ANIM_FRAME_MS", ui_t) is not None,
+              "предела нет: приложение сможет попросить кадр каждую миллисекунду и займёт "
+              "шину SPI, общую с радио")
+    sym = (ctx.root / "src" / "tdeck_symtab.cpp").read_text(encoding="utf-8")
+    ctx.check("приложению доступны часы",
+              re.search(r'S\("millis"', sym) is not None,
+              "millis не экспортирован: движение приложению придётся считать по кадрам, а "
+              "кадр может задержаться или прийти дважды")
+
+
+# ===== Правила самой игры =====
+# Ход змейки — это не рисование, а правила, и проверяются они счётом, а не картинкой:
+# код хода вырезается из приложения и прогоняется на хосте под санитайзерами.
+SNAKE_MAIN = r"""
+static int fails = 0;
+static void expect(bool ok, const char* what) {
+    if (!ok) { printf("не сошлось: %s\n", what); fails++; }
+}
+
+static void put(int len, const int* xs, const int* ys) {
+    bodyLen = len;
+    for (int i = 0; i < len; i++) body[i] = cellOf(xs[i], ys[i]);
+}
+
+int main() {
+    // Обычный ход: голова сдвинулась, длина не изменилась. Именно здесь была ошибка,
+    // которую показал предпросмотр: змейка укорачивалась на звено за ход и исчезала.
+    {
+        const int xs[4] = {5, 4, 3, 2}, ys[4] = {5, 5, 5, 5};
+        put(4, xs, ys);
+        dirX = 1; dirY = 0; wantX = 1; wantY = 0;
+        food = cellOf(20, 20);
+        expect(stepOnce(), "обычный ход проходит");
+        expect(bodyLen == 4, "длина при обычном ходе не меняется");
+        expect(body[0] == cellOf(6, 5), "голова сдвинулась по направлению");
+        // Хвост подтянулся: последнее звено встало туда, где было предпоследнее, а самая
+        // дальняя клетка (2,5) освободилась — именно так змейка и движется.
+        expect(body[3] == cellOf(3, 5), "хвост подтянулся");
+    }
+    // Яблоко: длина растёт ровно на звено, счёт на единицу.
+    {
+        const int xs[3] = {5, 4, 3}, ys[3] = {5, 5, 5};
+        put(3, xs, ys);
+        dirX = 1; dirY = 0; wantX = 1; wantY = 0;
+        food = cellOf(6, 5);
+        score = 0;
+        expect(stepOnce(), "ход на яблоко проходит");
+        expect(bodyLen == 4, "съев яблоко, змейка выросла на звено");
+        expect(score == 1, "счёт вырос");
+    }
+    // Стена: ход в край поля — конец партии, с любой стороны.
+    {
+        const int xs[2] = {0, 1}, ys[2] = {3, 3};
+        put(2, xs, ys);
+        dirX = -1; dirY = 0; wantX = -1; wantY = 0;
+        expect(!stepOnce(), "ход в левую стену — проигрыш");
+        const int xs2[2] = {COLS - 1, COLS - 2}, ys2[2] = {3, 3};
+        put(2, xs2, ys2);
+        dirX = 1; dirY = 0; wantX = 1; wantY = 0;
+        expect(!stepOnce(), "ход в правую стену — проигрыш");
+        const int xs3[2] = {4, 4}, ys3[2] = {0, 1};
+        put(2, xs3, ys3);
+        dirX = 0; dirY = -1; wantX = 0; wantY = -1;
+        expect(!stepOnce(), "ход в верхнюю стену — проигрыш");
+        const int xs4[2] = {4, 4}, ys4[2] = {ROWS - 1, ROWS - 2};
+        put(2, xs4, ys4);
+        dirX = 0; dirY = 1; wantX = 0; wantY = 1;
+        expect(!stepOnce(), "ход в нижнюю стену — проигрыш");
+    }
+    // В себя: ход в собственное тело — проигрыш, а в клетку уходящего хвоста — нет.
+    {
+        const int xs[5] = {5, 5, 4, 4, 3}, ys[5] = {5, 4, 4, 5, 5};
+        put(5, xs, ys);
+        dirX = 0; dirY = 1; wantX = -1; wantY = 0;   // поворот влево, в своё же тело
+        food = cellOf(20, 20);
+        expect(!stepOnce(), "ход в собственное тело — проигрыш");
+    }
+    {
+        // Голова входит в клетку ПОСЛЕДНЕГО звена: оно уйдёт этим же ходом, и это не
+        // проигрыш — так устроены все змейки.
+        const int xs[4] = {5, 5, 4, 4}, ys[4] = {5, 4, 4, 5};
+        put(4, xs, ys);
+        dirX = -1; dirY = 0; wantX = 0; wantY = 1;   // вниз, в клетку хвоста
+        food = cellOf(20, 20);
+        expect(stepOnce(), "ход в клетку уходящего хвоста — не проигрыш");
+    }
+    // Разворот на себя запрещён: заявка «назад» игнорируется, змейка идёт прежним курсом.
+    {
+        const int xs[3] = {5, 4, 3}, ys[3] = {5, 5, 5};
+        put(3, xs, ys);
+        dirX = 1; dirY = 0; wantX = -1; wantY = 0;   // попытка развернуться
+        food = cellOf(20, 20);
+        expect(stepOnce(), "разворот не убивает змейку");
+        expect(body[0] == cellOf(6, 5), "разворот на себя не применяется");
+    }
+    // Ускорение с каждым яблоком, но не быстрее предела.
+    {
+        const int xs[2] = {5, 4}, ys[2] = {5, 5};
+        stepMs = STEP_MS_MIN + 1;
+        put(2, xs, ys);
+        dirX = 1; dirY = 0; wantX = 1; wantY = 0;
+        food = cellOf(6, 5);
+        stepOnce();
+        expect(stepMs == STEP_MS_MIN, "скорость упирается в предел, а не уходит за него");
+    }
+    if (fails == 0) printf("змейка: правила сошлись\n");
+    return fails == 0 ? 0 : 1;
+}
+"""
+
+
+def snake_rules_test(ctx):
+    """Правила змейки проверяются счётом, а не картинкой.
+
+    Игра — первое приложение T-Deck с собственными правилами: стена, своё тело, рост от
+    яблока, запрет разворота на себя. Всё это считается, а не рисуется, поэтому и
+    проверяется на хосте: код хода вырезается из приложения как есть и прогоняется под
+    санитайзерами.
+
+    Повод не теоретический. Первая версия хода укорачивала змейку на звено за ход (хвост
+    снимался отдельно от сдвига тела), и через четыре хода от неё не оставалось ничего —
+    на предпросмотре было видно пустое поле с одним яблоком."""
+    app = ctx.root / "apps" / "snake" / "snake.cpp"
+    if not app.is_file():
+        ctx.note("     SKIP snake_rules_test: приложения apps/snake рядом нет")
+        return
+    src = app.read_text(encoding="utf-8")
+
+    # Состояние приложения объявлено файловыми статиками — повторяем объявления, а код
+    # хода берём из приложения как есть: проверять нужно его, а не копию.
+    prelude = """#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#define CELL 10
+"""
+    for name in ("COLS", "ROWS", "BODY_MAX", "STEP_MS_START", "STEP_MS_MIN", "STEP_MS_DEC"):
+        m = re.search(r"(?m)^#define\s+%s\s+(\d+)" % name, src)
+        ctx.check("в приложении задано %s" % name, m is not None,
+                  "константа %s не найдена — проверять правила не на чем" % name)
+        if m is None:
+            return
+        prelude += "#define %s %s\n" % (name, m.group(1))
+    prelude += """
+static uint16_t body[BODY_MAX];
+static int bodyLen = 0;
+static int8_t dirX = 1, dirY = 0, wantX = 1, wantY = 0;
+static uint16_t food = 0;
+static int score = 0;
+static uint32_t stepMs = STEP_MS_START;
+static uint32_t steps = 0;
+static void foodPlace() { food = (uint16_t)((food + 7u) % (COLS * ROWS)); }
+"""
+    for sig in ("static inline uint16_t cellOf(", "static inline int cellX(",
+                "static inline int cellY(", "static bool stepOnce("):
+        code = ctx.grab(app, sig)
+        ctx.check("вырезан %s" % sig.split()[-1].rstrip("("), bool(code),
+                  "не нашлась функция %s — правила проверить нечем" % sig)
+        prelude += code + "\n"
+
+    ok, out = ctx.host_run(prelude + SNAKE_MAIN, "snake.cpp", "правила змейки")
+    if ok is None:
+        return
+    ctx.check("правила змейки сошлись", ok, out.strip()[:400])
+
+
+
+
+def board_power_guard_test(ctx):
+    """Настройка питания периферии не может погасить плату, где этот пин питает всё.
+
+    Случай из жизни: плата приехала 6 октября 2026, в secrets.json у неё стояло
+    `vext_on: 0` (значение досталось от Heltec, где активный уровень шины датчиков LOW), и
+    первая же настройка погасила экран. У T-Deck этим пином (GPIO10 BOARD_POWERON)
+    питается ВСЯ плата — панель, радио, клавиатура и карта, — так что ноль превращает узел
+    в кирпич с одной консолью по USB, из которой уже не видно, что случилось.
+
+    Защита живёт в ядре и в ОДНОМ месте: и старт прошивки, и команда «cfg vext» ходят
+    через vextApply. Два места разошлись бы на первой же правке, и защита работала бы в
+    одном из них."""
+    pio = ctx.root / "platformio.ini"
+    appmain = ctx.root / "lib" / "meshcore" / "src" / "app_main.cpp"
+    cfg = ctx.core / "src" / "appconfig.cpp"
+    if not (pio.is_file() and appmain.is_file() and cfg.is_file()):
+        ctx.note("     SKIP board_power_guard_test: исходников рядом нет")
+        return
+    pio_t, main_t, cfg_t = (f.read_text(encoding="utf-8") for f in (pio, appmain, cfg))
+
+    ctx.check("плата объявлена питающейся через этот пин",
+              re.search(r"-DVEXT_IS_BOARD_POWER=1", pio_t) is not None,
+              "признак не выставлен: настройка vext=0 снова погасит плату целиком")
+    ctx.check("питание применяется одним входом на старте",
+              re.search(r"vextApply\(cfg\.vextOn\)", main_t) is not None,
+              "старт прошивки дёргает пин сам, мимо защиты — настройка vext=0 погасит узел "
+              "при первой же перезагрузке")
+    ctx.check("команда настройки идёт тем же входом",
+              re.search(r"vextApply\(cfg\.vextOn\)", cfg_t) is not None,
+              "«cfg vext» дёргает пин сам: защита останется только на старте")
+    guard = cfg_t[cfg_t.find("void vextApply("):]
+    guard = guard[:guard.find("\n}\n") + 3] if "\n}\n" in guard else guard
+    ctx.check("у платы с таким пином настройка не применяется",
+              re.search(r"#if\s+VEXT_IS_BOARD_POWER", guard) is not None
+              and re.search(r"digitalWrite\(VEXT_PIN,\s*VEXT_EN_ACTIVE\)", guard) is not None,
+              "защиты нет: ноль в настройке снимет питание со всей платы")
+    ctx.check("отказ применить настройку не молчит",
+              re.search(r"if\s*\(!vextOn\)", guard) is not None
+              and "Serial.printf" in guard,
+              "настройка молча игнорируется: «я же выключил, а оно горит» потом не "
+              "объяснить")
+
+
+def panel_orientation_test(ctx):
+    """Разворот панели — тот, что подтверждён живой платой, и его можно перевернуть флагом.
+
+    Ландшафт у ST7789 получается сменой осей (MV) плюс отражением одной из них: MY даёт
+    один поворот, MX — тот же вид вверх ногами. Пока платы не было, выбор был гаданием, и
+    выбран был MY; приехавшая плата показала изображение перевёрнутым."""
+    drv = ctx.root / "include" / "st7789.h"
+    if not drv.is_file():
+        ctx.note("     SKIP panel_orientation_test: драйвера панели рядом нет")
+        return
+    src = drv.read_text(encoding="utf-8")
+    body = src[src.find("uint8_t _madctlValue()"):]
+    body = body[:body.find("\n  }") + 4] if "\n  }" in body else body
+    ctx.check("ландшафт собран подтверждённым отражением",
+              re.search(r"#else\s*\n\s*return ST7789_MADCTL_MX \| ST7789_MADCTL_MV;", body)
+              is not None,
+              "по умолчанию панель разворачивается не тем отражением: на живой плате это "
+              "изображение вверх ногами")
+    ctx.check("разворот переключается флагом сборки",
+              "TDECK_SCREEN_FLIP" in body and "TDECK_SCREEN_FLIP" in src,
+              "флага разворота нет: у партии с иначе поставленной панелью придётся править "
+              "драйвер")
+
+
+def battery_pin_test(ctx):
+    """Батарея меряется: пин и делитель заданы, иначе на экране вечный прочерк.
+
+    Пока пин не был подтверждён, измерение не включали намеренно — выдуманные проценты
+    хуже прочерка. Живая плата показала пустой корпус именно поэтому. У T-Deck VBAT
+    приходит на ADC1_CH3 (GPIO4) через делитель 1:2."""
+    pio = ctx.root / "platformio.ini"
+    if not pio.is_file():
+        ctx.note("     SKIP battery_pin_test: platformio.ini рядом нет")
+        return
+    t = pio.read_text(encoding="utf-8")
+    ctx.check("пин батареи задан",
+              re.search(r"(?m)^\s*-DPIN_VBAT_READ=4\b", t) is not None,
+              "измерения батареи нет: экран покажет пустой корпус с прочерком, сколько бы "
+              "заряда в аккумуляторе ни было")
+    ctx.check("делитель батареи задан",
+              re.search(r"-DPIN_VBAT_DIVIDER=2\.0f", t) is not None,
+              "делитель не задан: ядро возьмёт значение Heltec (4.9), и напряжение выйдет "
+              "вдвое с лишним больше настоящего")
+
+
+def keyboard_probe_read_only_test(ctx):
+    """Клавиатуру ищем чтением, а не записью.
+
+    Клавиатура T-Deck — отдельный ESP32-C3 со своей прошивкой, и что она делает с
+    полученной записью, мы не знаем. Пустая запись «есть ли кто по адресу» — тоже посылка
+    на шину: после того, как опрос клавиатуры стал повторяться, у живой платы погасла
+    подсветка клавиш. Чтение — ровно то, что прошивка делает в обычной работе, и оно
+    заведомо безопасно.
+
+    Проверка смотрит: в опросе клавиатуры нет записи, а чтение есть."""
+    inp = ctx.root / "src" / "tdeck_input.cpp"
+    if not inp.is_file():
+        ctx.note("     SKIP keyboard_probe_read_only_test: слоя ввода рядом нет")
+        return
+    t = inp.read_text(encoding="utf-8")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                      for ln in t.splitlines())
+    writes = re.findall(r"Wire\.beginTransmission\(\s*\(?u?int8?_?t?\)?\s*TDECK_KBD_ADDR",
+                        code)
+    ctx.check("в клавиатуру ничего не пишут", not writes,
+              "опрос клавиатуры идёт записью: чужая прошивка вольна понять её как команду "
+              "— так уже погасла подсветка клавиш")
+    ctx.check("клавиатура ищется чтением",
+              len(re.findall(r"Wire\.requestFrom\(\(int\)TDECK_KBD_ADDR", code)) >= 2,
+              "чтения для поиска клавиатуры нет: либо её не найдут, либо найдут записью")
+    ctx.check("общий обход шины обходит клавиатуру стороной",
+              re.search(r"a\s*==\s*\(uint8_t\)TDECK_KBD_ADDR", code) is not None,
+              "обход шины пишет во все адреса подряд, включая клавиатуру")
+    ctx.check("клавиатуру ждут на старте и переспрашивают потом",
+              "KBD_BOOT_WAIT_MS" in code and "KBD_REPROBE_MS" in code,
+              "без ожидания контроллер клавиатуры (ESP32-C3 грузится около секунды) не "
+              "успевает отозваться, и плата остаётся без клавиатуры до перезагрузки")
+
+
+def status_clock_contrast_test(ctx):
+    """Часы в строке состояния — белые и шрифтом значений.
+
+    На макете мягкий COL_TEXT (#C7D5E0) на тёмной полосе читался нормально, на живой
+    панели — нет: «часы почти не видно, они на заднем плане». Часы — единственное, что на
+    этой полосе читают намеренно, и контраст им нужен полный."""
+    draw = ctx.root / "src" / "tdeck_ui_draw.cpp"
+    pal = ctx.root / "include" / "tdeck_palette.h"
+    if not (draw.is_file() and pal.is_file()):
+        ctx.note("     SKIP status_clock_contrast_test: рисования рядом нет")
+        return
+    d, p = draw.read_text(encoding="utf-8"), pal.read_text(encoding="utf-8")
+    ctx.check("чистый белый есть в палитре",
+              re.search(r"#define\s+COL_WHITE\s+0xFFFF", p) is not None,
+              "белого в палитре нет: контраст придётся набирать случайными числами")
+    ctx.check("часы рисуются белым",
+              re.search(r"s\.clock\[0\]\)\s*textAtF\([^;]*COL_WHITE", d) is not None,
+              "часы рисуются мягким цветом: на живой панели они сливаются с полосой")
+    ctx.check("часы рисуются шрифтом значений",
+              re.search(r"s\.clock\[0\]\)\s*textAtF\([^;]*FONT_VALUE", d) is not None,
+              "часы мельче, чем нужно: на полосе 26 px они теряются среди пиктограмм")

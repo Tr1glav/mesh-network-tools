@@ -2027,6 +2027,42 @@ def version_rollover_test(ctx):
         ctx.note("     SKIP version_rollover_test: прошивок рядом нет")
 
 
+def cyrillic_decoder_flat_test(ctx):
+    """Декодер UTF-8 не зовёт сам себя: иначе приложения T-Deck не собираются вовсе.
+
+    Разбор битого хвоста последовательности был написан рекурсией (`reset(); return
+    decode(in, out);`) — глубиной ровно в один шаг, но для компилятора это рекурсия, и
+    функцию нельзя встроить: она остаётся отдельным символом. Приложение T-Deck собирается
+    отдельным DSO, и прямой вызов такого символа линкер отвергает («dangerous relocation:
+    invalid relocation for dynamic symbol»). Из-за одной строки в заголовке перестали
+    собираться ВСЕ приложения с русским текстом — и заметки, и календарь, и игра, — а
+    заметили это только тогда, когда понадобилось собрать новое.
+
+    Проверка смотрит обе копии заголовка: он лежит в lib/meshcore каждой прошивки."""
+    seen = 0
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        h = ctx.core.parent / sub / "lib" / "meshcore" / "include" / "cyrillic.h"
+        if not h.is_file():
+            continue
+        seen += 1
+        src = h.read_text(encoding="utf-8")
+        body = src[src.find("bool decode("):]
+        body = body[:body.find("\n  }") + 4] if "\n  }" in body else body
+        code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                          for ln in body.splitlines())
+        ctx.check("декодер %s не рекурсивный" % name,
+                  re.search(r"\breturn\s+decode\s*\(", code) is None,
+                  "decode зовёт сам себя: функция перестаёт встраиваться, становится "
+                  "отдельным символом, и ни одно приложение T-Deck с русским текстом не "
+                  "слинкуется")
+        ctx.check("битый хвост у %s всё равно разбирается" % name,
+                  "reset()" in code,
+                  "повторный разбор байта после сброса пропал: текст, обрезанный посреди "
+                  "последовательности, проглотит следующий символ")
+    if seen == 0:
+        ctx.note("     SKIP cyrillic_decoder_flat_test: прошивок рядом нет")
+
+
 def group_text_bound_test(ctx):
     """Расшифровка группового текста сама ограничивает длину, а не верит вызывающему.
 
