@@ -72,6 +72,7 @@ def run_fork(ctx):
                                  label=suite_fork.PURE_LABEL))
     suite_fork.button_compat_test(ctx)
     suite_fork.advert_path_prefix_test(ctx)
+    suite_fork.ack_confirm_test(ctx)
     suite_fork.companion_send_latency_test(ctx)
     suite_fork.companion_bounds_test(ctx)
     # Страница проверяется цепочкой: page_js_test читает web/app.js и передаёт его дальше —
