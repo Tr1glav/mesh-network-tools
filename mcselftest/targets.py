@@ -108,6 +108,7 @@ def run_tdeck(ctx):
     suite_tdeck.elf_headers_test(ctx)
     suite_tdeck.elf_sections_test(ctx)
     suite_tdeck.elf_iram_access_test(ctx)
+    suite_tdeck.apps_relative_data_only_test(ctx)
     suite_tdeck.app_frame_ms_test(ctx)
     suite_tdeck.snake_rules_test(ctx)
     suite_tdeck.board_power_guard_test(ctx)

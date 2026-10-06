@@ -662,29 +662,31 @@ def elf_iram_access_test(ctx):
     code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
                       for ln in t.splitlines())
 
-    ctx.check("образ собирается в обычной памяти",
-              re.search(r"heap_caps_malloc\(imageSize,\s*\n?\s*MALLOC_CAP_INTERNAL\s*\|\s*MALLOC_CAP_8BIT\)",
+    # Одна память, два окна. Живая плата прошла через ОБА падения подряд, и проверка
+    # держит именно их: сначала LoadStoreError (образ собирали по адресу окна команд, а
+    # байтовый доступ там запрещён), потом InstructionFetchError (всё перевели в окно
+    # данных, включая точки входа, и процессор пошёл выполнять код из окна данных).
+    ctx.check("образ собирается по адресу окна данных",
+              "MAP_IRAM_TO_DRAM" in code,
+              "образ собирается по адресу окна команд: любое байтовое обращение к нему "
+              "(релокация, строка, статика) роняет узел LoadStoreError")
+    ctx.check("переход в окно данных сверяется с диапазоном",
+              re.search(r"SOC_DIRAM_IRAM_LOW", code) is not None
+              and re.search(r"SOC_DIRAM_IRAM_HIGH", code) is not None,
+              "адрес переводится в другое окно без проверки диапазона: окно данных есть "
+              "только у совмещённой области, промах — это запись мимо своей памяти")
+    ctx.check("релокации считаются под окно данных",
+              re.search(r"base\s*=\s*\(uint32_t\)\(uintptr_t\)mem", code) is not None,
+              "адреса данных приложения пересчитаны под окно команд — байтовое чтение "
+              "собственных строк уронит приложение")
+    ctx.check("точки входа считаются под окно команд",
+              len(re.findall(r"lo,\s*deltaExec,", code)) >= 2,
+              "точки входа пересчитаны под окно данных: процессор пойдёт выполнять код "
+              "оттуда и упадёт InstructionFetchError")
+    ctx.check("конструкторы зовутся через окно команд",
+              re.search(r"addr\s*=\s*\(uint32_t\)\(\(int32_t\)addr\s*-\s*delta\s*\+\s*deltaExec\)",
                         code) is not None,
-              "рабочий буфер не в обычной памяти: релокации пишутся байтами, а в IRAM "
-              "байтовый доступ роняет узел")
-    ctx.check("исполняемый блок просится отдельно",
-              re.search(r"execMem\s*=\s*\(uint8_t\*\)heap_caps_malloc\(execSize,\s*MALLOC_CAP_EXEC\)",
-                        code) is not None,
-              "исполняемая память не выделяется отдельно — значит образ собирается прямо в "
-              "ней")
-    ctx.check("перенос в исполняемую память идёт словами",
-              re.search(r"volatile uint32_t\*\s*dst32", code) is not None
-              and re.search(r"dst32\[w\]\s*=\s*src32\[w\]", code) is not None,
-              "перенос образа идёт memcpy: он вправе копировать байтами, и на IRAM это "
-              "LoadStoreError")
-    ctx.check("адреса считаются под исполняемый блок",
-              re.search(r"base\s*=\s*\(uint32_t\)\(uintptr_t\)execMem", code) is not None,
-              "релокации считаются под адрес рабочего буфера: после переноса все адреса "
-              "будут указывать в освобождённую память")
-    ctx.check("таблица конструкторов читается словом",
-              re.search(r"\*\(const volatile uint32_t\*\)", code) is not None,
-              "адрес конструктора читается байтовым помощником — по образу в IRAM это "
-              "падение")
+              "конструктор зовётся по адресу окна данных — то же падение, только раньше")
 
     # --- защита от приложения, которое роняет плату ---
     ctx.check("имя приложения отмечается в NVS до загрузки",
@@ -698,3 +700,63 @@ def elf_iram_access_test(ctx):
     ctx.check("опасное приложение пропускается",
               re.search(r"strcmp\(elfBlocked,\s*apps\[i\]\.folder\)", code) is not None,
               "отметка есть, а пропуска нет: плата всё равно повторит падение")
+
+
+def apps_relative_data_only_test(ctx):
+    """Внутренние переходы в приложениях относительные: в коде нет пересчитываемых адресов.
+
+    На этом стоит вся схема загрузки: образ живёт в одной памяти, но работает через два
+    окна — данные читаются по адресу окна данных, код выполняется по адресу окна команд.
+    Это допустимо ровно потому, что приложение не хранит адресов СВОЕГО КОДА: внутренние
+    вызовы у него относительные (call8), а через литералы идут только вызовы наружу, чьи
+    адреса приходят из экспортной таблицы прошивки.
+
+    Проверка читает настоящие собранные приложения и смотрит каждую релокацию типа
+    RELATIVE: куда указывает значение, лежащее в месте релокации. Хоть одно попадание в
+    текстовую секцию — и схему надо менять (придётся разносить код и данные по разным
+    блокам), поэтому лучше узнать об этом здесь, чем по панике на плате."""
+    import struct as _st
+    apps = sorted((ctx.root / "apps").glob("*/*.elf"))
+    if not apps:
+        ctx.note("     SKIP apps_relative_data_only_test: собранных приложений рядом нет")
+        return
+    R_XTENSA_RELATIVE = 5
+    for elf in apps:
+        b = elf.read_bytes()
+        if len(b) < 64 or b[:4] != b"\x7fELF":
+            ctx.check("приложение %s читается" % elf.parent.name, False, "это не ELF")
+            continue
+        e_shoff, = _st.unpack_from("<I", b, 0x20)
+        e_shentsize, e_shnum, e_shstrndx = _st.unpack_from("<HHH", b, 0x2E)
+        secs = []
+        for i in range(e_shnum):
+            o = e_shoff + i * e_shentsize
+            nm, typ, flags, addr, off, size = _st.unpack_from("<6I", b, o)
+            secs.append(dict(nm=nm, typ=typ, flags=flags, addr=addr, off=off, size=size))
+        sh = secs[e_shstrndx]
+        for s in secs:
+            end = b.index(b"\0", sh["off"] + s["nm"])
+            s["name"] = b[sh["off"] + s["nm"]:end].decode(errors="replace")
+        text = [s for s in secs if s["flags"] & 0x4]          # SHF_EXECINSTR
+        rela = [s for s in secs if s["name"] == ".rela.dyn"]
+        if not text or not rela:
+            ctx.check("у %s есть код и релокации" % elf.parent.name, False,
+                      "нет текстовой секции или .rela.dyn")
+            continue
+        tlo = min(s["addr"] for s in text)
+        thi = max(s["addr"] + s["size"] for s in text)
+        bad = 0
+        for i in range(rela[0]["size"] // 12):
+            off, info, add = _st.unpack_from("<III", b, rela[0]["off"] + i * 12)
+            if (info & 0xFF) != R_XTENSA_RELATIVE:
+                continue
+            src = [s for s in secs if s["typ"] != 8 and s["addr"] <= off < s["addr"] + s["size"]]
+            if not src:
+                continue
+            val, = _st.unpack_from("<I", b, src[0]["off"] + (off - src[0]["addr"]))
+            if tlo <= val < thi:
+                bad += 1
+        ctx.check("%s: пересчитываемых адресов кода нет" % elf.parent.name, bad == 0,
+                  "в приложении %d адрес(ов) собственного кода хранится в данных: при "
+                  "загрузке они укажут в окно данных, и первый же вызов уронит узел "
+                  "InstructionFetchError" % bad)
