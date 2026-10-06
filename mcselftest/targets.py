@@ -45,6 +45,7 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.raw_rx_log_test(ctx)
     suite_core.repeater_req_test(ctx)
     suite_core.airtime_counters_test(ctx)
+    suite_core.version_rollover_test(ctx)
     suite_core.group_text_bound_test(ctx)
     suite_core.cfg_reply_queue_test(ctx)
     suite_core.airtime_budget_test(ctx)
