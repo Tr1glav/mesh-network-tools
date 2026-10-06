@@ -574,7 +574,8 @@ def dm_send_meta_test(ctx):
     # часами узла/нулём, и хэш подтверждения не сопоставится с приложением.
     ctx.check("метка и попытка из команды идут в сборщик кадра",
               "msgTs" in code and "attempt" in code
-              and re.search(r"buildPrivateTextFrame\([^;]*expAck\s*,\s*msgTs", code) is not None,
+              and re.search(r"buildPrivateTextFrame\([^;]*expAck\s*,[^;]*msgTs", code)
+              is not None,
               "сборщику кадра не передаются метка/попытка приложения: хэш подтверждения "
               "считается по чужим значениям, и галочки не будет никогда")
     ctx.check("метка читается из команды приложения",
@@ -878,6 +879,136 @@ def channel_push_ts_test(ctx):
               and "time(NULL)" not in body,
               "в V3 уходит время приёма (time(NULL)): приложение сопоставляет сообщение с "
               "журналом 0x88 по метке ОТПРАВИТЕЛЯ, и у узла с другими часами маршрут пропадёт")
+
+
+def repeater_control_test(ctx):
+    """Управление ретранслятором из приложения: вход, команды, запросы, ответы.
+
+    Половина прошивки. Ядро умеет собрать кадр входа и запроса и разобрать ответ, но
+    помнить, НА ЧТО пришёл ответ, может только тот, кто запрос отправлял, — а отправляет их
+    приложение через компаньона. Раскладки кадров — из оригинала (MyMesh::onContactResponse
+    и ветки CMD_SEND_LOGIN/STATUS/TELEMETRY): приложение читает их по смещениям, и
+    перестановка поля превращает метрики в мусор на экране телефона.
+
+    Отдельно важна командная строка: именно ею приложение управляет ретранслятором
+    (`reboot`, `set name ...`). Пока компаньон отвергал всё, кроме обычного текста,
+    управление не работало вовсе."""
+    comp = ctx.root / "lib" / "meshcore" / "src" / "companion.cpp"
+    proto = ctx.root / "lib" / "meshcore" / "src" / "companion_proto.cpp"
+    hdr = ctx.root / "lib" / "meshcore" / "include" / "companion_internal.h"
+    if not (comp.is_file() and proto.is_file() and hdr.is_file()):
+        ctx.note("     SKIP repeater_control_test: кода компаньона рядом нет")
+        return
+    ctxt, ptxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, proto, hdr))
+    pcode = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                       for ln in ptxt.splitlines())
+
+    # --- команды приложения на месте ---
+    for name, num in (("CMD_SEND_LOGIN", 26), ("CMD_SEND_STATUS_REQ", 27),
+                      ("CMD_HAS_CONNECTION", 28), ("CMD_LOGOUT", 29),
+                      ("CMD_SEND_TELEMETRY_REQ", 39), ("CMD_SEND_BINARY_REQ", 50),
+                      ("CMD_GET_STATS", 56)):
+        ctx.check("команда %s (%d) разбирается" % (name, num),
+                  re.search(r"#define\s+%s\s+%d\b" % (name, num), htxt) is not None
+                  and re.search(r"case\s+%s\s*:" % name, pcode) is not None,
+                  "команда %s не разобрана или её номер не тот: приложение шлёт именно "
+                  "этот номер, и ответом на незнакомую команду будет отказ" % name)
+
+    # --- вход ---
+    ctx.check("вход собирается сборщиком ядра",
+              "buildLoginFrame(" in pcode,
+              "вход собирается не ядром: конверт ANON_REQ отличается от лички, и собрать "
+              "его мимо ядра значит завести вторую раскладку кадра")
+    ctx.check("вход уходит через очередь передачи",
+              re.search(r"buildLoginFrame\([^;]*;[\s\S]{0,400}?floodSendQueued", pcode)
+              is not None,
+              "вход выходит в эфир прямо из обработчика: ответ приложению задержится на "
+              "ожидание канала и время кадра")
+    ctx.check("приложению отвечают меткой и оценкой ожидания",
+              re.search(r"static void sendReqSent", pcode) is not None
+              and "RESP_CODE_SENT" in pcode and "radioAirtimeMs" in pcode,
+              "ответ на команду запроса без метки или с постоянной оценкой: приложение не "
+              "сопоставит ответ либо перестанет его ждать раньше времени")
+
+    # --- ожидания и ответы ---
+    ctx.check("прошивка закрывает хук ответа",
+              re.search(r"(?m)^void\s+mcOnResponseRecv\s*\(", ctxt) is not None,
+              "mcOnResponseRecv не переопределён: ответы ретранслятора дойдут до ядра и "
+              "растворятся в заглушке")
+    ctx.check("новый запрос сбрасывает прежние ожидания",
+              "reqPendingClear()" in pcode,
+              "ожидания не сбрасываются: ответ на отменённый запрос подставится под новый, "
+              "и приложение получит чужие метрики")
+    body = _handler_body(ctxt, "void mcOnResponseRecv(")
+    ctx.check("вход и состояние сопоставляются по началу ключа",
+              re.search(r"memcmp\(pendingLoginPub,\s*srcPub,\s*4\)", body) is not None
+              and re.search(r"memcmp\(pendingStatusPub,\s*srcPub,\s*4\)", body) is not None,
+              "вход и состояние сопоставляются не по ключу узла: так делает оригинал, и "
+              "иначе ответ чужой прошивки не опознается")
+    ctx.check("телеметрия и произвольный запрос сопоставляются по метке",
+              re.search(r"tag\s*==\s*pendingTelemetryTag", body) is not None
+              and re.search(r"tag\s*==\s*pendingBinaryTag", body) is not None,
+              "телеметрия и произвольный запрос сопоставляются не по метке запроса — "
+              "ответы перепутаются между собой")
+    for code in ("PUSH_CODE_LOGIN_SUCCESS", "PUSH_CODE_LOGIN_FAIL",
+                 "PUSH_CODE_STATUS_RESPONSE", "PUSH_CODE_TELEMETRY_RESPONSE",
+                 "PUSH_CODE_BINARY_RESPONSE"):
+        ctx.check("приложению уходит %s" % code,
+                  code in htxt and code in body,
+                  "кода %s нет: приложение не узнает об ответе ретранслятора" % code)
+    ctx.check("старый ответ на вход понимается тоже",
+              re.search(r'memcmp\(body,\s*"OK",\s*2\)', body) is not None,
+              "ответ «OK» старых ретрансляторов не понимается: в сети стоят узлы обеих "
+              "прошивок, и вход на старые будет выглядеть отказом")
+
+    # --- сессия входа ---
+    ctx.check("сессия входа удерживается продлением",
+              "sessionsTick()" in ptxt and "REQ_TYPE_KEEP_ALIVE" in ctxt,
+              "сессия не продлевается: ретранслятор забудет нас по тишине, и следующая "
+              "команда уйдёт в никуда, а приложение будет считать вход живым")
+    ctx.check("продление идёт раньше названного срока",
+              "KEEP_ALIVE_EARLY_PCT" in htxt
+              and "KEEP_ALIVE_EARLY_PCT" in ctxt,
+              "продление уходит ровно в срок: кадр летит по эфиру секунды, и прийти он "
+              "должен ДО того, как узел нас забудет")
+
+    # --- командная строка ---
+    ctx.check("командная строка доходит до ретранслятора",
+              re.search(r"cli\s*=\s*\(txtType\s*==\s*1\)", pcode) is not None
+              and re.search(r"txtType\s*==\s*0\s*\|\|\s*cli", pcode) is not None,
+              "компаньон отвергает всё, кроме обычного текста: командой ретранслятором не "
+              "управить")
+    ctx.check("команда уходит с часами узла, а не телефона",
+              re.search(r"cli\s*\?\s*0\s*:\s*msgTs", pcode) is not None,
+              "команда собирается с меткой телефона: ретранслятор отбивает повторы по "
+              "метке, и команда с чужими часами может выглядеть повтором")
+    ctx.check("подтверждения на команду не ждут",
+              re.search(r"if\s*\(fl\s*>\s*0\s*&&\s*!cli\)\s*ackExpect", pcode) is not None,
+              "на командную строку ждут подтверждение: его не будет (ответом служит сам "
+              "ответ командной строки), и слот ожидания займётся впустую")
+
+    # --- метрики своего узла ---
+    stats = pcode[pcode.find("case CMD_GET_STATS"):]
+    stats = stats[:stats.find("case CMD_SEND_SELF_ADVERT")] if "case CMD_SEND_SELF_ADVERT" in stats else stats
+    ctx.check("метрики своего узла отдаются тремя видами",
+              all(t in stats for t in ("STATS_TYPE_CORE", "STATS_TYPE_RADIO",
+                                       "STATS_TYPE_PACKETS")),
+              "не все виды метрик своего узла отдаются: приложение показывает их тремя "
+              "разными экранами")
+    ctx.check("метрики берутся из счётчиков ядра",
+              all(n in stats for n in ("txAirtimeMs", "rxAirtimeMs", "recvFloodCount",
+                                       "rxErrorCount", "meshTxQueuedCount")),
+              "метрики считаются в прошивке заново или прибиты нулями: складывать их может "
+              "только ядро, где и происходит эфир")
+    ctx.check("неизвестный вид метрик отвергается",
+              re.search(r"ERR_CODE_ILLEGAL_ARG", stats) is not None,
+              "на незнакомый вид метрик уйдёт пустой кадр вместо отказа, и приложение "
+              "разберёт его как настоящий")
+    ctx.check("своя телеметрия кодируется как у оригинала",
+              "TELEM_CHANNEL_SELF" in pcode and "TELEM_TYPE_VOLTAGE" in pcode
+              and re.search(r"v100\s*>>\s*8", pcode) is not None,
+              "своя телеметрия закодирована не по CayenneLPP (канал, тип, значение старшим "
+              "байтом вперёд) — приложение прочитает мусор")
 
 
 def contacts_rotation_test(ctx):

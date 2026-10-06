@@ -1649,11 +1649,19 @@ def dm_frame_app_meta_test(ctx):
     # Номер попытки обязан попасть в открытый текст (байт после метки) — иначе повторы
     # приложения (та же метка, попытка 1, 2, ...) соберут один и тот же кадр, и дедуп
     # съест копии: до получателя дойдёт только первый с тем же текстом.
-    ctx.check("номер попытки идёт в открытый текст после метки",
-              re.search(r"data\[dlen\+\+\]\s*=\s*\(?\s*uint8_t\s*\)?\s*\(\s*attempt\s*&\s*3\s*\)?",
-                        code) is not None,
-              "попытка не попадает в открытый текст: повторы с той же меткой собирают "
-              "одинаковый кадр, и дедуп съест их как копии")
+    # Байт флагов несёт ДВА поля: в младших двух битах номер попытки, в старших шести —
+    # тип текста. Попытка нужна, чтобы повторы приложения не собрали побайтово одинаковый
+    # кадр (дедуп съел бы их как копии), а тип — чтобы узел на той стороне отличил команду
+    # командной строки от беседы; без него управлять чужим ретранслятором нельзя.
+    ctx.check("байт флагов несёт и попытку, и тип текста",
+              re.search(r"data\[dlen\+\+\]\s*=[^;]*attempt\s*&\s*3", code) is not None
+              and re.search(r"data\[dlen\+\+\]\s*=[^;]*txtType[^;]*<<\s*2", code) is not None,
+              "в байте флагов нет попытки или типа текста: повторы схлопнет дедуп, а "
+              "команда ретранслятору уедет как обычное сообщение")
+    ctx.check("тип текста принимается сборщиком лички",
+              re.search(r"uint8_t\s+txtType\s*=\s*0", hdr) is not None,
+              "buildPrivateTextFrame не принимает тип текста — командную строку собрать "
+              "нечем, и управление ретранслятором из приложения не работает")
     # Пять байт до текста ([время 4][попытка 1]) — ровно столько пропускает приёмник
     # (dm_decrypt_test считает это отдельно, здесь же смотрим, что правка не сдвинула).
     txt_at = code.find("msg.c_str()")
@@ -1838,6 +1846,133 @@ def raw_rx_log_test(ctx):
     m = re.search(r"__attribute__\(\(weak\)\)\s*\nvoid\s+mcOnRawRx\s*\(", stub)
     ctx.check("у хука сырого приёма есть слабая заглушка", m is not None,
               "без слабой заглушки узлы без приложения (сенсоры, координатор) не слинкуются")
+
+
+def repeater_req_test(ctx):
+    """Эфирная часть управления ретранслятором: вход и запрос.
+
+    Приложение управляет чужим ретранслятором так: вход по паролю кадром ANON_REQ, дальше
+    команды командной строкой в личке и запросы состояния/телеметрии кадром REQ. Ответ на
+    всё это приходит кадром RESPONSE с меткой запроса в первых четырёх байтах.
+
+    В ядре живёт эфирная половина — сборка кадров и разбор ответа; помнить, на что ответ, и
+    показывать его приложению обязана прошивка (см. repeater_control_test в suite_fork).
+
+    Главное отличие входа от всего остального, и оно не косметическое: конверт ANON_REQ
+    несёт НАШ ПОЛНЫЙ ключ вместо короткого хэша. Ретранслятор нас ещё не знает, и вывести
+    общий секрет ему больше неоткуда — с коротким хэшем вход не состоится никогда."""
+    tx = (ctx.core / "src" / "mesh_tx.cpp").read_text(encoding="utf-8")
+    rx = (ctx.core / "src" / "mesh_rx.cpp").read_text(encoding="utf-8")
+    cfg = (ctx.core / "include" / "config.h").read_text(encoding="utf-8")
+    login = ctx.grab(ctx.core / "src/mesh_tx.cpp", "int buildLoginFrame(")
+    req = ctx.grab(ctx.core / "src/mesh_tx.cpp", "int buildReqFrame(")
+    lcode = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                       for ln in login.splitlines())
+    rcode = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                       for ln in req.splitlines())
+    rxc = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                     for ln in rx.splitlines())
+
+    ctx.check("типы запросов названы, а не вписаны числами",
+              re.search(r"#define\s+REQ_TYPE_GET_STATUS\s+0x01", cfg) is not None
+              and re.search(r"#define\s+REQ_TYPE_KEEP_ALIVE\s+0x02", cfg) is not None
+              and re.search(r"#define\s+REQ_TYPE_GET_TELEMETRY_DATA\s+0x03", cfg) is not None,
+              "числа типов запросов не вынесены в config.h: на них отвечают ЧУЖИЕ узлы, и "
+              "подобрать их заново нельзя")
+
+    # --- вход ---
+    ctx.check("вход уходит кадром ANON_REQ",
+              re.search(r"PAYLOAD_TYPE_ANON_REQ\s*<<\s*2", lcode) is not None,
+              "вход собран не тем типом кадра — ретранслятор не поймёт, что это вход")
+    ctx.check("в кадре входа наш ПОЛНЫЙ ключ",
+              re.search(r"memcpy\(frame \+ f, bot_pub, 32\)", lcode) is not None,
+              "в конверте входа короткий хэш вместо полного ключа: ретранслятор нас не "
+              "знает, общий секрет ему вывести неоткуда, и вход не состоится")
+    ctx.check("пароль обрезается по пределу оригинала",
+              re.search(r"LOGIN_PASSWORD_MAX", lcode) is not None,
+              "длина пароля не ограничена: оригинал принимает 15 знаков, лишнее уедет в "
+              "эфир мусором и вход провалится необъяснимо")
+    ctx.check("вход шифруется общим секретом",
+              "ed25519_key_exchange(" in lcode and "encryptGroupText(" in lcode,
+              "пароль уходит в эфир открытым текстом")
+
+    # --- запрос ---
+    ctx.check("запрос уходит кадром REQ",
+              re.search(r"PAYLOAD_TYPE_REQ\s*<<\s*2", rcode) is not None,
+              "запрос собран чужим типом кадра — ответа не будет")
+    ctx.check("метка запроса возвращается наружу",
+              re.search(r"\*outTag\s*=\s*tag", rcode) is not None,
+              "метка не отдаётся наружу: ответ придёт с ней, и сопоставить его будет нечем")
+    ctx.check("две метки подряд не повторяются",
+              re.search(r"tag\s*==\s*lastTag", rcode) is not None,
+              "метка берётся прямо из часов: два запроса в одну секунду дадут одинаковый "
+              "кадр, и дедуп отбросит второй как копию")
+
+    # --- приём ответа ---
+    ctx.check("ответ доходит до разбора конверта",
+              re.search(r"payload_type\s*!=\s*PAYLOAD_TYPE_RESPONSE", rxc) is not None
+              and re.search(r"payload_type\s*==\s*PAYLOAD_TYPE_RESPONSE", rxc) is not None,
+              "RESPONSE отбрасывается: конверт у него тот же, что у лички, и разбирать его "
+              "обязана та же ветка — иначе ответы ретранслятора теряются молча")
+    ctx.check("короткий ответ не читается за концом",
+              re.search(r"dmPlainLen\s*<\s*4", rxc) is not None,
+              "длина ответа не проверяется против метки: битый кадр уведёт чтение за "
+              "границу расшифрованного")
+    ctx.check("ответ уходит в прошивку хуком",
+              "mcOnResponseRecv(" in rxc,
+              "ядро не отдаёт ответ наружу: помнить, на что он, может только отправитель "
+              "запроса, то есть прошивка с приложением")
+    # Ответ на запрос, ушедший ФЛУДОМ, приходит довеском к возврату маршрута — без этой
+    # ветки первый запрос (пока путь неизвестен) не получал бы ответа никогда.
+    ctx.check("ответ принимается и довеском возврата маршрута",
+              re.search(r"extraType\s*==\s*PAYLOAD_TYPE_RESPONSE", rxc) is not None,
+              "довесок возврата маршрута с ответом игнорируется: на запрос, ушедший флудом, "
+              "ответ так и не дойдёт")
+    plat = (ctx.core / "include" / "mc_platform.h").read_text(encoding="utf-8")
+    ctx.check("хук ответа объявлен в контракте",
+              re.search(r"(?m)^void\s+mcOnResponseRecv\s*\(", plat) is not None,
+              "mcOnResponseRecv не объявлен в mc_platform.h — переопределение линкер не увидит")
+
+
+def airtime_counters_test(ctx):
+    """Метрики эфира считаются там, где эфир и происходит.
+
+    Приложение показывает на экране узла занятый эфир, счётчики пакетов и ошибки приёма
+    (в оригинале это CMD_GET_STATS). Складывать их можно только в ядре: передача и приём
+    живут здесь, а прошивка лишь перекладывает числа в кадр приложения.
+
+    Время эфира складывается РАСЧЁТОМ по длине кадра (radioAirtimeMs), а не измерением:
+    измерять нечем, а формула LoRa точна до миллисекунд — это уже проверено отдельно
+    (airtime_budget_test) на живом радио."""
+    g = (ctx.core / "src" / "globals.cpp").read_text(encoding="utf-8")
+    radio = (ctx.core / "src" / "radio.cpp").read_text(encoding="utf-8")
+    rrx = (ctx.core / "src" / "radio_rx.cpp").read_text(encoding="utf-8")
+    rx = (ctx.core / "src" / "mesh_rx.cpp").read_text(encoding="utf-8")
+
+    for name in ("txAirtimeMs", "rxAirtimeMs", "rxErrorCount", "recvFloodCount",
+                 "recvDirectCount"):
+        ctx.check("счётчик %s объявлен" % name,
+                  re.search(r"uint32_t\s+%s\s*=\s*0" % name, g) is not None,
+                  "счётчика %s нет: показывать приложению нечего" % name)
+    ctx.check("эфир передачи складывается в передаче",
+              re.search(r"txAirtimeMs\s*\+=\s*\(uint32_t\)radioAirtimeMs", radio) is not None,
+              "время наших передач не складывается: занятость эфира приложение не покажет")
+    ctx.check("эфир приёма складывается в приёме",
+              re.search(r"rxAirtimeMs\s*\+=\s*\(uint32_t\)radioAirtimeMs", rrx) is not None,
+              "время принятых кадров не складывается — половина занятого эфира пропадёт")
+    ctx.check("ошибки приёма считаются там, где кадр развалился",
+              re.search(r"rxErrorCount\+\+", rrx) is not None,
+              "кадры с битым CRC не считаются: «тишина» и «слышим, но не разбираем» станут "
+              "неразличимы")
+    ctx.check("приём делится на флуд и направленный",
+              re.search(r"recvFloodCount\+\+", rx) is not None
+              and re.search(r"recvDirectCount\+\+", rx) is not None,
+              "разбивки приёма нет: не видно, пользуется ли сеть известными путями")
+    tx = (ctx.core / "src" / "mesh_tx.cpp").read_text(encoding="utf-8")
+    ctx.check("длина очереди передачи видна наружу",
+              re.search(r"(?m)^int\s+meshTxQueuedCount\s*\(", tx) is not None,
+              "длину очереди передачи наружу не отдать: приложение не покажет, успевает "
+              "узел отдавать эфир или копит")
 
 
 def group_text_bound_test(ctx):
