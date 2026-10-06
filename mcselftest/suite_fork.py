@@ -530,7 +530,7 @@ def ack_confirm_test(ctx):
 
     # Хэш обязан приходить ИЗ ЯДРА вместе с кадром, а не считаться здесь заново.
     ctx.check("ожидаемый хэш берётся у сборщика кадра",
-              re.search(r"buildPrivateTextFrame\([^;]*expAck\s*\)", ptxt) is not None
+              re.search(r"buildPrivateTextFrame\([^;]*expAck\s*,", ptxt) is not None
               and "ackExpect(" in ptxt,
               "компаньон не запоминает ожидаемый хэш при отправке: сверять пришедшее "
               "подтверждение будет не с чем")
@@ -546,6 +546,52 @@ def ack_confirm_test(ctx):
               re.search(r"used\s*=\s*false", ack_fn) is not None,
               "подтверждение приходит копиями, и без освобождения слота приложение получит "
               "несколько пушей об одном сообщении")
+
+
+def dm_send_meta_test(ctx):
+    """Ответ на отправку лички несёт настоящую метку подтверждения и оценку времени.
+
+    Половина отметки «доставлено» в приложении: команда 2 (CMD_SEND_TXT_MSG) раньше
+    отвечала `expected_ack = 0` и `est = 3000`. Приложение ждёт подтверждение ровно по той
+    метке, что мы ему вернули: метка «ноль» не приходит никогда, и сообщение навсегда
+    остаётся без галочки, хоть и доставлено.
+
+    Правка в два места: метку времени и номер попытки из команды приложения надо ПЕРЕДАТЬ
+    сборщику кадра (они входят в хэш подтверждения — см. dm_frame_app_meta_test в
+    suite_core.py), а в ответе вернуть настоящий `expAck` и оценку времени до ACK,
+    как в оригинальном companion_radio."""
+    proto = ctx.root / "lib" / "meshcore" / "src" / "companion_proto.cpp"
+    if not proto.is_file():
+        ctx.note("     SKIP dm_send_meta_test: кода компаньона рядом нет")
+        return
+    txt = proto.read_text(encoding="utf-8")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                      for ln in txt.splitlines())
+    hdr = (ctx.root / "lib" / "meshcore" / "include" / "companion_internal.h").read_text(
+        encoding="utf-8")
+
+    # Метка времени и попытка из команды доходят до сборщика кадра: иначе кадр собран с
+    # часами узла/нулём, и хэш подтверждения не сопоставится с приложением.
+    ctx.check("метка и попытка из команды идут в сборщик кадра",
+              "msgTs" in code and "attempt" in code
+              and re.search(r"buildPrivateTextFrame\([^;]*expAck\s*,\s*msgTs", code) is not None,
+              "сборщику кадра не передаются метка/попытка приложения: хэш подтверждения "
+              "считается по чужим значениям, и галочки не будет никогда")
+    ctx.check("метка читается из команды приложения",
+              re.search(r"&f\[3\]", code) is not None,
+              "метка времени не разбирается из кадра приложения: приложение показывает "
+              "сообщение по метке, а в эфир ушла своя")
+
+    # Ответ несёт НАСТОЯЩИЙ хэш, а не ноль: приложение ждёт подтверждение по этой метке.
+    ctx.check("в ответе — настоящий ожидаемый хэш",
+              re.search(r"memcpy\(\s*&out\[i\]\s*,\s*expAck\s*,\s*4\s*\)", code) is not None,
+              "в ответе команды 2 метка подтверждения нулевая/чужая: приложение ждёт по "
+              "ней подтверждение и не дождётся никогда")
+    ctx.check("оценка времени до ACK считается, а не константа",
+              "RESP_CODE_SENT" in hdr
+              and re.search(r"est\s*=", code) is not None and "radioAirtimeMs" in code,
+              "оценка времени фиксированная: приложение перестанет ждать раньше, чем "
+              "придёт подтверждение, либо будет ждать вечно")
 
 
 def companion_send_latency_test(ctx):
@@ -664,6 +710,164 @@ def raw_rx_push_test(ctx):
               "bleConnected" in body,
               "журнал собирается и шлётся без подключённого приложения: это работа на "
               "каждый принятый кадр впустую")
+
+
+def path_recv_lastmod_test(ctx):
+    """Возврат маршрута поднимает lastmod контакта — иначе до приложения не доедет.
+
+    `mcOnPathRecv` сохраняет дорогу до узла в `outPath` контакта и шлёт пуш 0x81, но этого
+    мало: приложение берёт контакт инкрементальной синхронизацией (команда 4), а её фильтр
+    `c.lastmod <= contactIterSince` выбрасывает записи, которые приложение «уже знает».
+    Пока lastmod не двигался, обновлённый маршрут дожидался только следующего адверта —
+    узла с пассивным приёмом могло не быть часами, и в переписке продолжал стоять старый
+    путь («обратный маршрут посмотреть нельзя»). Поднятие lastmod при ИЗМЕНЕНИИ пути —
+    ровно то, что заставляет синк переотдать контакт."""
+    comp = ctx.root / "lib" / "meshcore" / "src" / "companion.cpp"
+    if not comp.is_file():
+        ctx.note("     SKIP path_recv_lastmod_test: кода компаньона рядом нет")
+        return
+    ctxt = comp.read_text(encoding="utf-8")
+    body = _handler_body(ctxt, "void mcOnPathRecv(")
+    ctx.check("путь кладётся в outPath контакта",
+              "c.outPath" in body,
+              "mcOnPathRecv не сохраняет маршрут: приложению нечего показывать даже после синка")
+    ctx.check("изменённый путь поднимает lastmod",
+              re.search(r"if\s*\(changed\)\s*c\.lastmod\s*=", body) is not None,
+              "lastmod при изменении пути не поднимается: фильтр контактного синка "
+              "(c.lastmod <= contactIterSince) продолжит выбрасывать контакт, и новый путь "
+              "до приложения не доедет до следующего адверта")
+    ctx.check("lastmod растёт по часам узла, как у адверта",
+              "time(NULL)" in body,
+              "lastmod считается не по часам узла: синк приложения сверяет его со своей "
+              "шкалой времени")
+
+
+def raw_rx_diag_test(ctx):
+    """Диагностика потока 0x88 не пропадает и не врут счётчики.
+
+    Отметка «принято ретранслятором» строится на кадрах 0x88, которые уходят приложению на
+    каждый принятый радио-кадр ДО дедупа. Когда приложение не показывает отметку, первое,
+    что нужно понять, — поток вообще доходит до телефона или рвётся где-то внутри. Для этого
+    счётчики стоят по концам потока, а эхо собственного пакета печатается отдельной строкой:
+
+      принято радио -> ушло в BLE (0x88) / потеряно без телефона; из принятых — «эхо своих»,
+      то есть переиздания, по которым приложение и ставит отметку.
+
+    Проверка держит именно связку: без счётчика «ушло» поток мог молча обрываться, а без
+    «потерь» обрыв был бы неотличим от того, что радио вообще не слышит."""
+    comp = ctx.root / "lib" / "meshcore" / "src" / "companion.cpp"
+    proto = ctx.root / "lib" / "meshcore" / "src" / "companion_proto.cpp"
+    hdr = ctx.root / "lib" / "meshcore" / "include" / "companion_internal.h"
+    if not (comp.is_file() and proto.is_file() and hdr.is_file()):
+        ctx.note("     SKIP raw_rx_diag_test: кода компаньона рядом нет")
+        return
+    ctxt, ptxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, proto, hdr))
+
+    # Счётчики объявлены один раз и доступны обоим файлам.
+    ctx.check("счётчики 0x88 объявлены в компаньоне",
+              re.search(r"uint32_t\s+diagLogRxRecv\s*=", ctxt) is not None
+              and "diagLogRxPushed" in ctxt and "diagLogRxLost" in ctxt and "diagEchoOwn" in ctxt,
+              "нет счётчиков diagLogRx*: поток 0x88 нельзя измерить по концам")
+    ctx.check("заголовок объявляет счётчики для разбора кадров",
+              "extern uint32_t diagLogRxRecv" in htxt
+              and re.search(r"extern uint32_t\s+diagLogRxRecv[^;]*diagEchoOwn", htxt) is not None,
+              "счётчики не вынесены в companion_internal.h: сводка в companionTick их не увидит")
+
+    # Отправка: каждый ушедший приложению 0x88 считается и печатается короткой строкой.
+    frame_body = _handler_body(ctxt, "void sendFrameToApp(")
+    ctx.check("ушедший 0x88 считается в sendFrameToApp",
+              "diagLogRxPushed" in frame_body,
+              "счётчик «ушло в BLE» не растёт при отправке: по чему тогда понимать, что поток "
+              "жив?")
+    ctx.check("0x88 печатается коротким счётчиком",
+              re.search(r"0x88[\s\S]{0,60}diagLogRxPushed", frame_body) is not None,
+              "короткая строка для 0x88 пропала: без неё ушедший кадр не отличить от [RX]")
+
+    # Приём: эхо своего пакета и счётчик потерь живут в mcOnRawRx.
+    body = _handler_body(ctxt, "void mcOnRawRx(")
+    ctx.check("эхо своего кадра опознаётся по src",
+              re.search(r"raw\[3\]\s*==\s*ownShortHash", body) is not None,
+              "эхо собственного пакета не ищется: переиздание ретранслятором неотличимо от "
+              "чужого кадра")
+    ctx.check("эхо ищется среди лички и возврата маршрута",
+              "PAYLOAD_TYPE_TXT_MSG" in body and "PAYLOAD_TYPE_PATH" in body,
+              "эхо ищется не там: src в конверте есть у лички и возврата маршрута, у "
+              "канального кадра хэша источника нет вовсе")
+    ctx.check("счётчик эха растёт на каждом совпадении",
+              "diagEchoOwn++" in body,
+              "счётчик эха не растёт: сколько раз ретранслятор переиздал наш пакет, видно "
+              "не будет")
+    ctx.check("потери потока без BLE считаются",
+              "diagLogRxLost" in body,
+              "нет счётчика потерь: обрыв потока неотличим от тишины радио")
+
+    # Сводка раз в 30 с живёт в такте.
+    tick = ptxt[ptxt.find("void companionTick()"):]
+    ctx.check("сводка 0x88 печатается из такта",
+              "diagLogRxRecv" in tick and "diagEchoOwn" in tick,
+              "сводки счётчиков в companionTick нет: итоговые числа приходится собирать по "
+              "строкам вручную")
+
+
+def channel_push_ts_test(ctx):
+    """В очередь канального сообщения ложится метка ОТПРАВИТЕЛЯ, а не время приёма.
+
+    Владелец: «видно хопы у ответов наших хостов, а у чужих (с оригинальной прошивкой) не
+    видно». Маршрут приложение берёт из сырого журнала 0x88 по хэшу SHA256(метка + текст):
+    там оно расшифровывает кадр САМО и считает хэш по метке ОТПРАВИТЕЛЯ из открытого
+    текста. Метку для поиска приложение берёт из кадра V3 (`sender_timestamp`) — значит,
+    в неё обязан лечь тот же самый ts из кадра, иначе для отправителя с другими часами
+    хэши разойдутся и маршрута не будет, хоть кадр в журнале и есть. Раньше `m.ts =
+    time(NULL)` (секунда приёма) совпадал с меткой отправителя только у узлов с одинаково
+    идущими часами — потому «наши» и светились, а «чужие» нет. Оригинал
+    (`MyMesh.cpp:629`) кладёт в V3 метку отправителя; мы делаем то же."""
+    comp = ctx.root / "lib" / "meshcore" / "src" / "companion.cpp"
+    hdr = ctx.root / "lib" / "meshcore" / "include" / "companion.h"
+    core_hdr = ctx.core / "include" / "mc_platform.h"
+    if not (comp.is_file() and hdr.is_file() and core_hdr.is_file()):
+        ctx.note("     SKIP channel_push_ts_test: кода компаньона рядом нет")
+        return
+    ctxt = comp.read_text(encoding="utf-8")
+    htxt = hdr.read_text(encoding="utf-8")
+    plat = core_hdr.read_text(encoding="utf-8")
+
+    # Сигнатура: ядро и форк обязаны договориться о шестом параметре хука.
+    ctx.check("хук канала принимает метку отправителя в ядре",
+              re.search(r"companionOnChannelText\([^;]*uint32_t\s+senderTs", plat) is not None,
+              "mc_platform.h не объявил senderTs у хука канала: время приёма (time(NULL)) "
+              "снова уедет в очередь, и у чужих часов маршрут не найдётся")
+    ctx.check("сигнатура форка повторяет контракт ядра",
+              re.search(r"companionOnChannelText\([^;]*uint32_t\s+senderTs", htxt) is not None,
+              "companion.h не объявил senderTs: объявление и определение разъехались, и "
+              "компилятор молча оборвёт вызов")
+
+    # Исходящая половина: метка из команды приложения обязана дойти до сборщика кадра.
+    proto = ctx.root / "lib" / "meshcore" / "src" / "companion_proto.cpp"
+    if proto.is_file():
+        pc = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                        for ln in proto.read_text(encoding="utf-8").splitlines())
+        ctx.check("метка приложения уходит в кадр канала",
+                  re.search(r"buildGroupFrameFlood\([^;]*chMsgTs", pc) is not None
+                  and re.search(r"memcpy\(&chMsgTs,\s*&f\[3\],\s*4\)", pc) is not None,
+                  "команда отправки в канал не отдаёт метку приложения сборщику кадра: "
+                  "приложение ищет собственное сообщение в журнале 0x88 по своей метке, а в "
+                  "эфир уйдёт метка узла — маршрут у своих исходящих не покажется")
+
+    body = _handler_body(ctxt, "void companionOnChannelText(")
+    # Метку, которую увидит приложение, обязательно видно и в журнале узла: когда в
+    # переписке стоит не то время, по строке сразу понятно, чьи часы врут.
+    ctx.check("метка сообщения печатается при постановке в очередь",
+              "logMsgTs(" in ctxt
+              and re.search(r'logMsgTs\(\s*"личка"', ctxt) is not None
+              and re.search(r'logMsgTs\(\s*"канал"', ctxt) is not None,
+              "метка времени не печатается: расхождение часов отправителя и узла видно "
+              "только в приложении, а по журналу узла не разобрать")
+
+    ctx.check("метка отправителя идёт в очередь, а не время приёма",
+              re.search(r"m\.ts\s*=\s*senderTs", body) is not None
+              and "time(NULL)" not in body,
+              "в V3 уходит время приёма (time(NULL)): приложение сопоставляет сообщение с "
+              "журналом 0x88 по метке ОТПРАВИТЕЛЯ, и у узла с другими часами маршрут пропадёт")
 
 
 def contacts_rotation_test(ctx):
