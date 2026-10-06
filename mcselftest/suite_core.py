@@ -1909,9 +1909,14 @@ def repeater_req_test(ctx):
               "кадр, и дедуп отбросит второй как копию")
 
     # --- приём ответа ---
+    # Два условия, и оба обязательны: верхний фильтр функции пропускает тип дальше, а
+    # условие ветки конверта лички берёт его в разбор. Искать просто «== PAYLOAD_TYPE_
+    # RESPONSE» мало — оно есть и внутри самой ветки разбора, поэтому откат, убравший тип
+    # из УСЛОВИЯ ветки, проверка не замечала.
     ctx.check("ответ доходит до разбора конверта",
               re.search(r"payload_type\s*!=\s*PAYLOAD_TYPE_RESPONSE", rxc) is not None
-              and re.search(r"payload_type\s*==\s*PAYLOAD_TYPE_RESPONSE", rxc) is not None,
+              and re.search(r"PAYLOAD_TYPE_PATH\s*\|\|\s*payload_type\s*==\s*"
+                            r"PAYLOAD_TYPE_RESPONSE", rxc) is not None,
               "RESPONSE отбрасывается: конверт у него тот же, что у лички, и разбирать его "
               "обязана та же ветка — иначе ответы ретранслятора теряются молча")
     ctx.check("короткий ответ не читается за концом",

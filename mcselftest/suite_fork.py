@@ -935,10 +935,14 @@ def repeater_control_test(ctx):
               re.search(r"(?m)^void\s+mcOnResponseRecv\s*\(", ctxt) is not None,
               "mcOnResponseRecv не переопределён: ответы ретранслятора дойдут до ядра и "
               "растворятся в заглушке")
-    ctx.check("новый запрос сбрасывает прежние ожидания",
-              "reqPendingClear()" in pcode,
-              "ожидания не сбрасываются: ответ на отменённый запрос подставится под новый, "
-              "и приложение получит чужие метрики")
+    # Сброс обязан стоять в КАЖДОЙ команде запроса, а не в одной: ответ приходит секундами
+    # позже, и ожидание от прошлого запроса подставится под новый ответ. Поэтому сверяем
+    # число сбросов с числом заведённых ожиданий, а не наличие слова.
+    pend = len(re.findall(r"reqPending(?:Login|Status|Telemetry|Binary)\(", pcode))
+    clears = len(re.findall(r"reqPendingClear\(\)", pcode))
+    ctx.check("каждый запрос сбрасывает прежние ожидания", pend > 0 and clears == pend,
+              "ожиданий заведено %d, а сбросов %d: ответ на отменённый запрос подставится "
+              "под новый, и приложение получит чужие метрики" % (pend, clears))
     body = _handler_body(ctxt, "void mcOnResponseRecv(")
     ctx.check("вход и состояние сопоставляются по началу ключа",
               re.search(r"memcmp\(pendingLoginPub,\s*srcPub,\s*4\)", body) is not None
@@ -1000,8 +1004,11 @@ def repeater_control_test(ctx):
                                        "rxErrorCount", "meshTxQueuedCount")),
               "метрики считаются в прошивке заново или прибиты нулями: складывать их может "
               "только ядро, где и происходит эфир")
+    # Именно ветка else, а не любое упоминание отказа в этой команде: отказ по короткому
+    # кадру стоит в её начале, и по нему проверка проходила даже без разбора вида метрик.
     ctx.check("неизвестный вид метрик отвергается",
-              re.search(r"ERR_CODE_ILLEGAL_ARG", stats) is not None,
+              re.search(r"\}\s*else\s*\{\s*sendErr\(ERR_CODE_ILLEGAL_ARG\);\s*break;",
+                        stats) is not None,
               "на незнакомый вид метрик уйдёт пустой кадр вместо отказа, и приложение "
               "разберёт его как настоящий")
     ctx.check("своя телеметрия кодируется как у оригинала",
