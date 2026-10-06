@@ -111,6 +111,8 @@ def run_tdeck(ctx):
     suite_tdeck.apps_relative_data_only_test(ctx)
     suite_tdeck.app_frame_ms_test(ctx)
     suite_tdeck.snake_rules_test(ctx)
+    suite_tdeck.snake_moves_test(ctx)
+    suite_tdeck.wifi_switch_test(ctx)
     suite_tdeck.board_power_guard_test(ctx)
     suite_tdeck.panel_orientation_test(ctx)
     suite_tdeck.battery_pin_test(ctx)
