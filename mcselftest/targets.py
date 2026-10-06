@@ -37,6 +37,7 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.button_in_core_test(ctx)
     suite_core.peer_cache_test(ctx)
     suite_core.dm_decrypt_test(ctx)
+    suite_core.dm_ack_test(ctx)
     suite_core.group_text_bound_test(ctx)
     suite_core.cfg_reply_queue_test(ctx)
     suite_core.airtime_budget_test(ctx)
