@@ -477,6 +477,130 @@ static void foodPlace() { food = (uint16_t)((food + 7u) % (COLS * ROWS)); }
     ctx.check("правила змейки сошлись", ok, out.strip()[:400])
 
 
+# ===== Главный экран: карусель вместо сетки страниц =====
+# Меню было сеткой плиток по шесть на страницу: вверх-вниз листались страницы, понять
+# место в списке можно было только по точкам. Теперь это лента в один ряд — выделенная
+# плитка всегда по центру экрана, соседние частично уезжают за края, ряд листается вбок
+# с заворотом. Раскладка живёт в tdeck_ui_draw.cpp и задаёт три вещи сразу: рисование
+# (drawHome), попадание пальцем (tdeckMenuHit) и навигацию (tdeckMenuStep) — числа в
+# одном месте, поэтому проверка числит геометрию той же функцией, что рисует.
+MENU_MAIN = r"""
+#include <stdio.h>
+
+static int fails = 0;
+static void mcap(const char* what, int got, int want) {
+    if (got != want) {
+        printf("карусель: %s: получили %d, ждали %d\n", what, got, want);
+        fails++;
+    }
+}
+static void mccap(const char* what, int got) {
+    if (!got) {
+        printf("карусель: %s: ложь\n", what);
+        fails++;
+    }
+}
+
+int main() {
+    const int W = 320, H = 240;
+    // Страниц больше нет: pages всегда 1, pageOf всегда 0 — оболочка, которая листала
+    // страницы, видит единственную. Вернись сетка — pages посчитает страницы и упадёт.
+    mcap("pages всегда 1", tdeckMenuPages(W, H), 1);
+    mcap("pageOf всегда 0", tdeckMenuPageOf(W, H, 5), 0);
+    // Выделенная плитка стоит по центру оси экрана при любом выделении.
+    for (int sel = 0; sel < 8; sel++)
+        mcap("выделенная по центру", tileX(W, sel, sel), W / 2 - TILE / 2);
+    // Соседние плитки — на шаг ленты по бокам, а не в клетках сетки.
+    mcap("сосед справа на ROW_STEP", tileX(W, 3, 4) - tileX(W, 3, 3), ROW_STEP);
+    mcap("сосед слева на ROW_STEP", tileX(W, 3, 3) - tileX(W, 3, 2), ROW_STEP);
+    // Плитка, уехавшая за экран целиком, не рисуется и не ловит касание.
+    mccap("дальняя плитка невидима", !tileVisible(W, 0, 8));
+    mccap("сосед виден краем", tileVisible(W, 0, 1));
+    // Касание: центр выделенной плитки возвращает её индекс, центр соседа — соседа,
+    // щель между плитками и всё за пределами ленты — промах.
+    const int cy = tileY(H) + TILE / 2;
+    mcap("тап в центр выделенной", tdeckMenuHit(W, H, 3, W / 2, cy), 3);
+    mcap("тап в центр соседа справа", tdeckMenuHit(W, H, 3, W / 2 + ROW_STEP, cy), 4);
+    mcap("тап в щель между плитками",
+         tdeckMenuHit(W, H, 3, tileX(W, 3, 3) + TILE + 12, cy), -1);
+    mcap("тап ниже ленты",
+         tdeckMenuHit(W, H, 3, W / 2, tileY(H) + TILE + 10), -1);
+    mcap("тап в строку состояния", tdeckMenuHit(W, H, 3, W / 2, 10), -1);
+    // Навигация: ±1 по горизонтали, заворот за края, вертикаль ничего не двигает
+    // (рядов больше нет — в сетке drow переносил бы на нижнюю плитку).
+    mcap("шаг вправо", tdeckMenuStep(W, H, 3, 1, 0), 4);
+    mcap("шаг влево", tdeckMenuStep(W, H, 3, -1, 0), 2);
+    mcap("заворот с первой на последнюю", tdeckMenuStep(W, H, 0, -1, 0), 7);
+    mcap("заворот с последней на первую", tdeckMenuStep(W, H, 7, 1, 0), 0);
+    mcap("drow вниз не двигает", tdeckMenuStep(W, H, 3, 0, 1), 3);
+    mcap("drow вверх не двигает", tdeckMenuStep(W, H, 3, 0, -1), 3);
+    mcap("выход за предел справа", tdeckMenuStep(W, H, 20, 1, 0), 1);
+    mcap("выход за предел слева", tdeckMenuStep(W, H, -3, -1, 0), 7);
+    if (fails == 0) printf("карусель: раскладка сошлась\n");
+    return fails == 0 ? 0 : 1;
+}
+"""
+
+
+def menu_carousel_test(ctx):
+    """Главный экран — карусель плиток в один ряд, а не сетка страниц.
+
+    Старая сетка была по шесть плиток на страницу: вверх-вниз листались страницы, и у
+    каждой плитки было только экранное место. Карусель центрирует выделенную плитку,
+    листается вбок с заворотом и не знает страниц вовсе. Геометрия живёт одной функцией
+    с рисованием — проверяем её, а не повторяем числами."""
+    draw = ctx.root / "src" / "tdeck_ui_draw.cpp"
+    if not draw.is_file():
+        ctx.note("     SKIP menu_carousel_test: исходника экрана нет")
+        return
+    src = draw.read_text(encoding="utf-8")
+
+    # Константы ленты берём из того же файла, что рисует, — проверяем исходник, а не
+    # свою копию чисел. Снова страницы — ROW_STEP исчезнет, и это уже падение.
+    prelude = """#include <stdint.h>
+#include <stdio.h>
+"""
+    for name in ("TILE", "COL_GAP", "ROW_STEP", "TILE_ICON_H", "MENU_TOP"):
+        m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, src)
+        ctx.check("в раскладке задан %s" % name, m is not None,
+                  "константа %s не найдена — проверять карусель не на чем" % name)
+        if m is None:
+            return
+        prelude += "#define %s%s\n" % (name, m.group(1))
+    ui_h = ctx.root / "include" / "tdeck_ui.h"
+    mt = ui_h.read_text(encoding="utf-8") if ui_h.is_file() else ""
+    m = re.search(r"(?m)^#define\s+TDECK_BAR_H\b(.*)$", mt)
+    ctx.check("высота строки состояния задана", m is not None,
+              "TDECK_BAR_H не найден — вертикальную геометрию не на чем считать")
+    if m is None:
+        return
+    prelude += "#define TDECK_BAR_H%s\n" % m.group(1)
+
+    # tdeckAppCount на хосте нет — стаб на 8 приложений (3 встроенных + 5 установленных,
+    # как в макете). Навигация и попадание от него зависят только через n.
+    prelude += "static int tdeckAppCount() { return 8; }\n"
+
+    # Порядок важен: tdeckMenuHit зовёт tileX/tileVisible/tileY, они должны быть
+    # определены раньше. Сам g++ бы не дал вызвать необъявленную — статики идут первой.
+    for sig in ("static int tileX(int screenW, int sel, int i)",
+                "static bool tileVisible(int screenW, int sel, int i)",
+                "static int tileY(int screenH)",
+                "int tdeckMenuPages(int screenW, int screenH)",
+                "int tdeckMenuPageOf(int screenW, int screenH, int index)",
+                "int tdeckMenuHit(int screenW, int screenH, int sel, int x, int y)",
+                "int tdeckMenuStep(int screenW, int screenH, int cur, int dcol, int drow)"):
+        try:
+            code = ctx.grab(draw, sig)
+        except RuntimeError:
+            ctx.check("вырезана %s" % sig.split("(")[0].split()[-1], False,
+                      "функция не нашлась — раскладка вернулась к сетке?")
+            return
+        prelude += code + "\n"
+
+    ok, out = ctx.host_run(prelude + MENU_MAIN, "menu.cpp", "карусель главного экрана")
+    if ok is None:
+        return
+    ctx.check("карусель сошлась", ok, out.strip()[:400])
 
 
 def board_power_guard_test(ctx):

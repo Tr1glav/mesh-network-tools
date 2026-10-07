@@ -112,6 +112,7 @@ def run_tdeck(ctx):
     suite_tdeck.app_frame_ms_test(ctx)
     suite_tdeck.snake_rules_test(ctx)
     suite_tdeck.snake_moves_test(ctx)
+    suite_tdeck.menu_carousel_test(ctx)
     suite_tdeck.wifi_switch_test(ctx)
     suite_tdeck.touch_calibration_test(ctx)
     suite_tdeck.board_power_guard_test(ctx)
