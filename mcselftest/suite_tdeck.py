@@ -1219,3 +1219,122 @@ def touch_calibration_test(ctx):
               and re.search(r"y = H - TOUCH_TARGET_PAD", a) is not None,
               "мишени расставлены иначе: ход пальца между первой и второй обязан быть "
               "чисто горизонтальным, между первой и третьей — чисто вертикальным")
+
+
+def chat_client_test(ctx):
+    """Переписка на самой плате: клиент сети вместо телефонного приложения.
+
+    То же, что компаньон делает телефоном, T-Deck делает своим экраном и клавиатурой:
+    список бесед (каналы и услышанные узлы), история, ввод, отправка, подтверждение
+    доставки.
+
+    Главное правило здесь — РАЗДЕЛЕНИЕ. Клиент (src/tdeck_chat.cpp) не знает про радио
+    ничего: принятое ему приносят, отправку он просит. Радиочасть живёт отдельно
+    (src/tdeck_chat_net.cpp) и закрывает хуки ядра. Без этого клиент не собрался бы в
+    макет экрана на настольной машине, где нет ни радио, ни ключей, — а макет это
+    единственный способ увидеть экраны переписки, не прошивая плату."""
+    chat = ctx.root / "src" / "tdeck_chat.cpp"
+    net = ctx.root / "src" / "tdeck_chat_net.cpp"
+    if not (chat.is_file() and net.is_file()):
+        ctx.note("     SKIP chat_client_test: переписки рядом нет")
+        return
+    c, n = chat.read_text(encoding="utf-8"), net.read_text(encoding="utf-8")
+    ccode = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                       for ln in c.splitlines())
+
+    # --- разделение ---
+    ctx.check("клиент не знает про радио",
+              not re.search(r'#include "(mesh|globals|config|radio)\.h"', ccode)
+              and "floodSend" not in ccode and "buildPrivateTextFrame" not in ccode,
+              "в клиент переписки затесался эфир: тогда он не соберётся в макет экрана, и "
+              "проверять его экраны будет негде, кроме живой платы")
+    ctx.check("отправка идёт просьбой",
+              "tdeckChatOutbox" in ccode and "tdeckChatOutbox" in n,
+              "клиент отправляет сам или прошивка не забирает очередь — сообщение никуда "
+              "не уйдёт")
+
+    # --- радиочасть закрывает хуки ядра ---
+    for hook in ("companionOnChannelText", "companionOnDirectText", "companionOnAdvert",
+                 "mcOnAckRecv"):
+        ctx.check("радиочасть закрывает %s" % hook,
+                  re.search(r"(?m)^void\s+%s\s*\(" % hook, n) is not None,
+                  "хук %s не переопределён: сработает заглушка ядра, и принятое до "
+                  "переписки не дойдёт" % hook)
+    ctx.check("личка отправляется с хэшем подтверждения",
+              re.search(r"buildPrivateTextFrame\([^;]*expAck", n) is not None
+              and "tdeckChatSent(true, expAck)" in n,
+              "личное сообщение уходит без запоминания хэша: галочки о доставке не будет")
+    ctx.check("ответы командной строки в переписку не кладутся",
+              re.search(r"txtType != 0\) return", n) is not None,
+              "служебный обмен с ретранслятором попадёт в беседу как сообщение")
+
+    # --- контакты на карте ---
+    ctx.check("услышанные узлы переживают перезагрузку",
+              "tdeckChatContactsSave" in ccode and "tdeckChatContactsLoad" in ccode
+              and "SD.open(TDECK_CHAT_STORE_PATH" in n,
+              "контакты живут только в памяти: после включения список бесед будет пуст, "
+              "пока узлы не объявятся заново — а это минуты")
+    ctx.check("запись на карту отложена",
+              "CHAT_STORE_DELAY_MS" in ccode and "tdeckChatStoreDue" in n,
+              "карта пишется на каждый адверт: они приходят пачками, а шина общая с радио")
+
+    # --- перенос строки ---
+    ctx.check("длинное сообщение переносится по словам",
+              "chatWrap" in ccode,
+              "сообщение рисуется одной строкой: длинное обрежется краем экрана, и "
+              "половина разговора будет не видна")
+    ctx.check("перенос не рвёт букву посередине",
+              re.search(r"0xC0\) == 0x80", ccode) is not None,
+              "перенос режет по байтам: в UTF-8 русская буква занимает два байта, и на "
+              "экране получится мусор")
+    # --- вид переписки ---
+    ctx.check("сообщение обрамлено пузырём",
+              re.search(r"fillRoundRect\(bx, by, bw, bh", ccode) is not None,
+              "сообщения идут строками подряд: где кончается одно и начинается другое, "
+              "видно только по цвету — а подряд идущие реплики одного собеседника "
+              "сливаются")
+    ctx.check("у сообщения есть время",
+              "chatStamp(" in ccode and re.search(r"%02d:%02d", ccode) is not None,
+              "времени у сообщения нет: по переписке нельзя понять, когда это было")
+    ctx.check("время считается по часовому поясу узла",
+              "chatTzHours" in ccode and "tdeckChatSetTz" in n,
+              "время показывается по UTC: на экране будет не то, что на часах в строке "
+              "состояния")
+    ctx.check("имя отправителя отделено цветом",
+              re.search(r'strstr\(m->text, ": "\)', ccode) is not None
+              and re.search(r"COL_GOOD, FONT_UI, nm", ccode) is not None,
+              "имя и текст одного цвета: в канале сообщение приходит строкой «Имя: текст», "
+              "и глазу приходится каждый раз искать двоеточие")
+
+    ctx.check("поле ввода показывает хвост набранного",
+              re.search(r"while \(textWF\(g, FONT_UI, tail\) > room", ccode) is not None,
+              "поле ввода показывает начало строки: человеку нужны последние буквы, "
+              "которые он печатает")
+
+
+def rename_confirm_test(ctx):
+    """Переименование узла требует подтверждения.
+
+    Имя узла знает вся сеть: по нему его видят соседи, по нему приходит прошивка, по нему
+    он подписывает сообщения в каналах. Строка «Node name» стоит первой в настройках, и
+    одно случайное нажатие открывало правку — человек начинал стирать своё имя, не поняв,
+    куда попал."""
+    apps = ctx.root / "src" / "tdeck_apps.cpp"
+    if not apps.is_file():
+        ctx.note("     SKIP rename_confirm_test: разделов рядом нет")
+        return
+    a = apps.read_text(encoding="utf-8")
+    ctx.check("правка имени открывается только после согласия",
+              re.search(r"if \(!nameConfirm\)", a) is not None
+              and re.search(r"ev == TDECK_EV_ENTER\) \{ nameConfirm = true", a) is not None,
+              "раздел имени сразу открывает правку: случайное нажатие в списке настроек "
+              "уводит в переименование узла")
+    ctx.check("до согласия показано текущее имя",
+              re.search(r"this node is known as", a) is not None,
+              "экран подтверждения не показывает имя: тогда он спрашивает о том, чего "
+              "человек не видит")
+    ctx.check("согласие сбрасывается при заходе",
+              re.search(r"static void nameEnter\(\) \{\s*\n\s*nameConfirm = false;", a)
+              is not None,
+              "согласие остаётся с прошлого раза: второй заход в раздел снова откроет "
+              "правку сразу")

@@ -115,6 +115,8 @@ def run_tdeck(ctx):
     suite_tdeck.menu_carousel_test(ctx)
     suite_tdeck.wifi_switch_test(ctx)
     suite_tdeck.touch_calibration_test(ctx)
+    suite_tdeck.chat_client_test(ctx)
+    suite_tdeck.rename_confirm_test(ctx)
     suite_tdeck.board_power_guard_test(ctx)
     suite_tdeck.panel_orientation_test(ctx)
     suite_tdeck.battery_pin_test(ctx)
