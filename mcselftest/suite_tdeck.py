@@ -571,6 +571,22 @@ int main() {
     mcap("drow вверх не двигает", tdeckMenuStep(W, H, 3, 0, -1), 3);
     mcap("выход за предел справа", tdeckMenuStep(W, H, 20, 1, 0), 1);
     mcap("выход за предел слева", tdeckMenuStep(W, H, -3, -1, 0), 7);
+    // Проворот живёт не только кадрами, но и путём: заворот едет через край короткой
+    // дорогой — с первой плитки влево через виртуальную −1 (последняя приезжает слева),
+    // с последней вправо через виртуальную n (первая приезжает справа). Полный круг на
+    // экране выглядит как «вернулось в центр»: лента проезжает всю окружность и ложится,
+    // как лежала, а выделение дёргается на своё место.
+    curSel = 0;
+    menuScrollStart(tdeckMenuStep(W, H, 0, -1, 0));
+    mcap("заворот влево: путь через −1", (int)menuScrollTo, -1);
+    curSel = 7;
+    menuScrollStart(tdeckMenuStep(W, H, 7, 1, 0));
+    mcap("заворот вправо: путь через n", (int)menuScrollTo, 8);
+    curSel = 3;
+    menuScrollStart(tdeckMenuStep(W, H, 3, -1, 0));
+    mcap("шаг влево: сосед, не заворот", (int)menuScrollTo, 2);
+    menuScrollStart(tdeckMenuStep(W, H, 3, 1, 0));
+    mcap("шаг вправо: сосед, не заворот", (int)menuScrollTo, 4);
     // Проворот живёт кадрами: первый кадр — единица, дальше растёт, по истечении — ноль.
     mcap("проворот: первый кадр фаза 1", menuScrollPhaseOf(0), 1);
     mcap("проворот: кадр на шаге анимации", menuScrollPhaseOf(TDECK_ANIM_FRAME_MS), 2);
@@ -637,13 +653,19 @@ def menu_carousel_test(ctx):
     # как в макете). Навигация и попадание от него зависят только через n.
     prelude += "static int tdeckAppCount() { return 8; }\n"
 
-    # Функции проворота грабим из обвязки: фаза — признак кадра, по ней рисование решает,
-    # какое выделение показывать. Без неё промежуточный кадр проверить нечем.
+    # Обвязка проворота вырезается одним куском: состояние (curSel), фаза кадра, плавность
+    # и старт. Старт считает виртуальный путь через край (−1/n) — короткую дорогу, а не
+    # полный круг; без него промежуточный кадр и путь заворота не проверить. millis на
+    # хосте нет — стаб, он нужен menuScrollStart.
     try:
-        prelude += ctx.grab(cpp, "static uint16_t menuScrollPhaseOf(uint32_t ageMs)") + "\n"
-    except RuntimeError:
-        ctx.check("вырезана menuScrollPhaseOf", False,
-                  "функция не нашлась — проворота ленты нет?")
+        prelude += ctx.span(cpp, "static uint8_t curSel = 0;",
+                            "static uint8_t curSel = 0;") + "\n"
+        prelude += "static unsigned long millis() { return 0; }\n"
+        prelude += ctx.span(cpp, "static bool menuScrollActive = false;",
+                            "    menuScrollActive = (next != from);\n}") + "\n"
+    except (RuntimeError, ValueError):
+        ctx.check("вырезана обвязка проворота", False,
+                  "функции нет — проворота ленты нет?")
         return
 
     # Порядок важен: каждый хелпер зовёт предыдущие, и g++ бы не дал собрать тест, где
