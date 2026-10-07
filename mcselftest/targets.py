@@ -119,6 +119,7 @@ def run_tdeck(ctx):
     suite_tdeck.panel_orientation_test(ctx)
     suite_tdeck.battery_pin_test(ctx)
     suite_tdeck.keyboard_probe_read_only_test(ctx)
+    suite_tdeck.trackball_step_debounce_test(ctx)
     suite_tdeck.status_clock_contrast_test(ctx)
     suite_font.cyrillic_font_test(ctx)
 

@@ -481,9 +481,10 @@ static void foodPlace() { food = (uint16_t)((food + 7u) % (COLS * ROWS)); }
 # Меню было сеткой плиток по шесть на страницу: вверх-вниз листались страницы, понять
 # место в списке можно было только по точкам. Теперь это лента в один ряд — выделенная
 # плитка всегда по центру экрана, соседние частично уезжают за края, ряд листается вбок
-# с заворотом. Раскладка живёт в tdeck_ui_draw.cpp и задаёт три вещи сразу: рисование
-# (drawHome), попадание пальцем (tdeckMenuHit) и навигацию (tdeckMenuStep) — числа в
-# одном месте, поэтому проверка числит геометрию той же функцией, что рисует.
+# с заворотом. Боковые плитки мельче центральной, чтобы по каждую руку влезало по две.
+# Раскладка живёт в tdeck_ui_draw.cpp и задаёт три вещи сразу: рисование (drawHome),
+# попадание пальцем (tdeckMenuHit) и навигацию (tdeckMenuStep) — числа в одном месте,
+# поэтому проверка числит геометрию той же функцией, что рисует.
 MENU_MAIN = r"""
 #include <stdio.h>
 
@@ -500,6 +501,11 @@ static void mccap(const char* what, int got) {
         fails++;
     }
 }
+// Дробный левый край плитки в целых пикселях.
+static int mf(int selF10, int i) {
+    float f = tileXf(320.0f, (float)selF10 / 10.0f, i);
+    return (int)(f + (f >= 0 ? 0.5f : -0.5f));
+}
 
 int main() {
     const int W = 320, H = 240;
@@ -510,21 +516,50 @@ int main() {
     // Выделенная плитка стоит по центру оси экрана при любом выделении.
     for (int sel = 0; sel < 8; sel++)
         mcap("выделенная по центру", tileX(W, sel, sel), W / 2 - TILE / 2);
-    // Соседние плитки — на шаг ленты по бокам, а не в клетках сетки.
-    mcap("сосед справа на ROW_STEP", tileX(W, 3, 4) - tileX(W, 3, 3), ROW_STEP);
-    mcap("сосед слева на ROW_STEP", tileX(W, 3, 3) - tileX(W, 3, 2), ROW_STEP);
-    // Плитка, уехавшая за экран целиком, не рисуется и не ловит касание.
-    mccap("дальняя плитка невидима", !tileVisible(W, 0, 8));
-    mccap("сосед виден краем", tileVisible(W, 0, 1));
-    // Касание: центр выделенной плитки возвращает её индекс, центр соседа — соседа,
-    // щель между плитками и всё за пределами ленты — промах.
+    // Соседние плитки — на ход ленты по бокам, а не в клетках сетки. Ходы по центрам:
+    // ±1 на STEP1, ±2 на ещё STEP2 (ходит центр, края уезжают на разницу размеров).
+    mcap("центр ±1 справа на STEP1", tileX(W, 3, 4) + TILE_S1 / 2 - (tileX(W, 3, 3) + TILE / 2), STEP1);
+    mcap("центр ±1 слева на STEP1", tileX(W, 3, 3) + TILE / 2 - (tileX(W, 3, 2) + TILE_S1 / 2), STEP1);
+    mcap("центр ±2 на STEP1+STEP2", tileX(W, 3, 5) + TILE_S2 / 2 - (tileX(W, 3, 4) + TILE_S1 / 2), STEP2);
+    // Левые края ленты на 320 пикселях: ±2 почти упираются в края экрана (3..69 и 251..317).
+    mcap("левый край ±2 слева", tileX(W, 3, 1), W / 2 - (STEP1 + STEP2) - TILE_S2 / 2);
+    mcap("левый край ±2 справа", tileX(W, 3, 5), W / 2 + (STEP1 + STEP2) - TILE_S2 / 2);
+    // Все четыре боковые плитки видны на 320 пикселях, дальше пары шагов — нет.
+    mccap("±1 слева видна", tileVisible(W, 3, 2));
+    mccap("±1 справа видна", tileVisible(W, 3, 4));
+    mccap("±2 слева видна", tileVisible(W, 3, 1));
+    mccap("±2 справа видна", tileVisible(W, 3, 5));
+    mccap("дальше пары шагов не видна", !tileVisible(W, 3, 0));
+    mccap("дальше пары шагов справа не видна", !tileVisible(W, 3, 6));
+    // Заворот: дальняя плитка круга — по-настоящему ближний сосед.
+    mccap("заворот: сосед через край виден", tileVisible(W, 0, 7));
+    // Промежуточный кадр проворота: полшага — правый край на полхода вправо, левый влево,
+    // размер — средний между раскладками.
+    mcap("промежуточный кадр: размер на полшага",
+         (int)(tileSizeF(0.5f) + 0.5f), (TILE + TILE_S1) / 2);
+    mcap("промежуточный кадр: правая на полхода", mf(35, 4) + (TILE + TILE_S1) / 4,
+         W / 2 + STEP1 / 2);
+    mcap("промежуточный кадр: левая на полхода", mf(35, 3) + (TILE + TILE_S1) / 4,
+         W / 2 - STEP1 / 2);
+    // На целом шаге дробная раскладка сходится с целой.
+    mcap("дробный край на целом шаге", mf(30, 4), tileX(W, 3, 4));
+    // Заворот едет через край: выделение 7→0 — плитка 0 приезжает справа, 7 уходит влево.
+    mcap("заворот: плитка 0 на полшага справа", mf(75, 0) + (TILE + TILE_S1) / 4,
+         W / 2 + STEP1 / 2);
+    mcap("заворот: плитка 7 на полшага слева", mf(75, 7) + (TILE + TILE_S1) / 4,
+         W / 2 - STEP1 / 2);
+    // Касание: центры плиток возвращают свои индексы, за пределами ленты — промах.
+    // Координаты из той же геометрии: центр ±1 на STEP1, ±2 на STEP1+STEP2.
     const int cy = tileY(H) + TILE / 2;
     mcap("тап в центр выделенной", tdeckMenuHit(W, H, 3, W / 2, cy), 3);
-    mcap("тап в центр соседа справа", tdeckMenuHit(W, H, 3, W / 2 + ROW_STEP, cy), 4);
-    mcap("тап в щель между плитками",
-         tdeckMenuHit(W, H, 3, tileX(W, 3, 3) + TILE + 12, cy), -1);
-    mcap("тап ниже ленты",
-         tdeckMenuHit(W, H, 3, W / 2, tileY(H) + TILE + 10), -1);
+    mcap("тап в центр ±1 справа", tdeckMenuHit(W, H, 3, W / 2 + STEP1, cy), 4);
+    mcap("тап в центр ±1 слева", tdeckMenuHit(W, H, 3, W / 2 - STEP1, cy), 2);
+    mcap("тап в центр ±2 справа", tdeckMenuHit(W, H, 3, W / 2 + STEP1 + STEP2, cy), 5);
+    mcap("тап в центр ±2 слева", tdeckMenuHit(W, H, 3, W / 2 - STEP1 - STEP2, cy), 1);
+    // Заворот показывают и касания: с выделенной первой плитки сосед слева — последняя.
+    mcap("тап в ±1 слева через заворот", tdeckMenuHit(W, H, 0, W / 2 - STEP1, cy), 7);
+    mcap("тап ниже ленты", tdeckMenuHit(W, H, 3, W / 2, tileY(H) + TILE + 10), -1);
+    mcap("тап над лентой", tdeckMenuHit(W, H, 3, W / 2, TDECK_BAR_H + MENU_TOP - 1), -1);
     mcap("тап в строку состояния", tdeckMenuHit(W, H, 3, W / 2, 10), -1);
     // Навигация: ±1 по горизонтали, заворот за края, вертикаль ничего не двигает
     // (рядов больше нет — в сетке drow переносил бы на нижнюю плитку).
@@ -536,6 +571,10 @@ int main() {
     mcap("drow вверх не двигает", tdeckMenuStep(W, H, 3, 0, -1), 3);
     mcap("выход за предел справа", tdeckMenuStep(W, H, 20, 1, 0), 1);
     mcap("выход за предел слева", tdeckMenuStep(W, H, -3, -1, 0), 7);
+    // Проворот живёт кадрами: первый кадр — единица, дальше растёт, по истечении — ноль.
+    mcap("проворот: первый кадр фаза 1", menuScrollPhaseOf(0), 1);
+    mcap("проворот: кадр на шаге анимации", menuScrollPhaseOf(TDECK_ANIM_FRAME_MS), 2);
+    mcap("проворот: кончился — фаза 0", menuScrollPhaseOf(TDECK_SCROLL_MS), 0);
     if (fails == 0) printf("карусель: раскладка сошлась\n");
     return fails == 0 ? 0 : 1;
 }
@@ -547,8 +586,9 @@ def menu_carousel_test(ctx):
 
     Старая сетка была по шесть плиток на страницу: вверх-вниз листались страницы, и у
     каждой плитки было только экранное место. Карусель центрирует выделенную плитку,
-    листается вбок с заворотом и не знает страниц вовсе. Геометрия живёт одной функцией
-    с рисованием — проверяем её, а не повторяем числами."""
+    листается вбок с заворотом и не знает страниц вовсе. Боковые плитки мельче, чтобы по
+    каждую руку влезало по две. Геометрия живёт одной функцией с рисованием — проверяем
+    её, а не повторяем числами."""
     draw = ctx.root / "src" / "tdeck_ui_draw.cpp"
     if not draw.is_file():
         ctx.note("     SKIP menu_carousel_test: исходника экрана нет")
@@ -556,11 +596,11 @@ def menu_carousel_test(ctx):
     src = draw.read_text(encoding="utf-8")
 
     # Константы ленты берём из того же файла, что рисует, — проверяем исходник, а не
-    # свою копию чисел. Снова страницы — ROW_STEP исчезнет, и это уже падение.
+    # свою копию чисел. Вернись сетка — TILE_S1/STEP1 исчезнут, и это уже падение.
     prelude = """#include <stdint.h>
 #include <stdio.h>
 """
-    for name in ("TILE", "COL_GAP", "ROW_STEP", "TILE_ICON_H", "MENU_TOP"):
+    for name in ("TILE", "TILE_S1", "TILE_S2", "STEP1", "STEP2", "TILE_ICON_H", "MENU_TOP"):
         m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, src)
         ctx.check("в раскладке задан %s" % name, m is not None,
                   "константа %s не найдена — проверять карусель не на чем" % name)
@@ -575,16 +615,50 @@ def menu_carousel_test(ctx):
     if m is None:
         return
     prelude += "#define TDECK_BAR_H%s\n" % m.group(1)
+    # Шаг кадра проворота и его длительность: фаза считается в шагах кадра, и без
+    # констант проворот ни посчитать, ни проверить. TDECK_ANIM_FRAME_MS лежит в шапке
+    # рядом с TDECK_BAR_H, TDECK_SCROLL_MS — в обвязке, которая проворот заводит.
+    m = re.search(r"(?m)^#define\s+TDECK_ANIM_FRAME_MS\b(.*)$", mt)
+    ctx.check("шаг кадра анимации задан", m is not None,
+              "TDECK_ANIM_FRAME_MS не найден — фазу проворота не на чем считать")
+    if m is None:
+        return
+    prelude += "#define TDECK_ANIM_FRAME_MS%s\n" % m.group(1)
+    cpp = ctx.root / "src" / "tdeck_ui.cpp"
+    ct = cpp.read_text(encoding="utf-8") if cpp.is_file() else ""
+    m = re.search(r"(?m)^#define\s+TDECK_SCROLL_MS\b(.*)$", ct)
+    ctx.check("длительность проворота задана", m is not None,
+              "TDECK_SCROLL_MS не найден — проворота ленты нет?")
+    if m is None:
+        return
+    prelude += "#define TDECK_SCROLL_MS%s\n" % m.group(1)
 
     # tdeckAppCount на хосте нет — стаб на 8 приложений (3 встроенных + 5 установленных,
     # как в макете). Навигация и попадание от него зависят только через n.
     prelude += "static int tdeckAppCount() { return 8; }\n"
 
-    # Порядок важен: tdeckMenuHit зовёт tileX/tileVisible/tileY, они должны быть
-    # определены раньше. Сам g++ бы не дал вызвать необъявленную — статики идут первой.
-    for sig in ("static int tileX(int screenW, int sel, int i)",
+    # Функции проворота грабим из обвязки: фаза — признак кадра, по ней рисование решает,
+    # какое выделение показывать. Без неё промежуточный кадр проверить нечем.
+    try:
+        prelude += ctx.grab(cpp, "static uint16_t menuScrollPhaseOf(uint32_t ageMs)") + "\n"
+    except RuntimeError:
+        ctx.check("вырезана menuScrollPhaseOf", False,
+                  "функция не нашлась — проворота ленты нет?")
+        return
+
+    # Порядок важен: каждый хелпер зовёт предыдущие, и g++ бы не дал собрать тест, где
+    # статика определена позже вызова. Порядок здесь — порядок зависимостей сверху вниз
+    # по файлу раскладки.
+    for sig in ("static int tileSizeAt(int d)",
+                "static int tileOffsetAt(int d)",
+                "static float tileSizeF(float d)",
+                "static float tileOffsetF(float d)",
+                "static float tileDistF(int i, float selF)",
+                "static float tileXf(int screenW, float selF, int i)",
+                "static int tileX(int screenW, int sel, int i)",
                 "static bool tileVisible(int screenW, int sel, int i)",
                 "static int tileY(int screenH)",
+                "static int tileTop(int screenH, int size)",
                 "int tdeckMenuPages(int screenW, int screenH)",
                 "int tdeckMenuPageOf(int screenW, int screenH, int index)",
                 "int tdeckMenuHit(int screenW, int screenH, int sel, int x, int y)",
@@ -601,6 +675,39 @@ def menu_carousel_test(ctx):
     if ok is None:
         return
     ctx.check("карусель сошлась", ok, out.strip()[:400])
+
+
+def trackball_step_debounce_test(ctx):
+    """Щелчки трекбола за полсекунды — это один шаг, а не несколько.
+
+    Шарик даёт пачку импульсов на каждый щелчок пальца, и без общего окна один щелчок
+    листал ленту на несколько плиток. Окно одно на все оси: диагональный толчок — один
+    шаг, а не два."""
+    inp = ctx.root / "src" / "tdeck_input.cpp"
+    if not inp.is_file():
+        ctx.note("     SKIP trackball_step_debounce_test: исходника ввода нет")
+        return
+    src = inp.read_text(encoding="utf-8")
+    m = re.search(r"(?m)^#define\s+TRACKBALL_STEP_MS\s+(\d+)", src)
+    ctx.check("окно антидребезга трекбола задано", m is not None,
+              "TRACKBALL_STEP_MS не найден — щелчки трекбола не схлопываются")
+    if m is None:
+        return
+    ctx.check("окно не меньше полсекунды", int(m.group(1)) >= 500,
+              "окно %s мс: пачка щелчков всё ещё размазывается" % m.group(1))
+    try:
+        code = ctx.grab(inp, "static TdeckEvent pollTrackball()")
+    except RuntimeError:
+        ctx.check("вырезан pollTrackball", False, "функция не нашлась")
+        return
+    ctx.check("окно общее для всех осей", "lastStepMs" in code,
+              "нет общего времени последнего шага — оси дребезжат независимо")
+    ctx.check("внутри окна щелчок гасится",
+              "TRACKBALL_STEP_MS" in code and "return TDECK_EV_NONE" in code,
+              "нет ветки, которая глошит серию щелчков окном")
+    ctx.check("отданный шаг двигает окно", "lastStepMs = millis()" in code,
+              "время последнего шага не обновляется — все щелчки после первого потонут "
+              "в окне")
 
 
 def board_power_guard_test(ctx):
