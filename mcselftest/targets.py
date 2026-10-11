@@ -119,6 +119,8 @@ def run_tdeck(ctx):
     suite_tdeck.map_zoom_scale_test(ctx)
     suite_tdeck.map_area_queue_test(ctx)
     suite_tdeck.png_memory_test(ctx)
+    suite_tdeck.tile_miss_cache_test(ctx)
+    suite_tdeck.log_rotation_test(ctx)
     suite_tdeck.shadow_frame_test(ctx)
     suite_tdeck.wifi_switch_test(ctx)
     suite_tdeck.touch_calibration_test(ctx)

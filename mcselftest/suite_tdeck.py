@@ -1267,6 +1267,173 @@ def png_memory_test(ctx):
               "будет")
 
 
+TILEMISS_MAIN = r"""
+#include <stdio.h>
+#include <string.h>
+
+static int fails = 0;
+static void mccheck(const char* what, int got) {
+    if (!got) { printf("тайлы: %s: ложь\n", what); fails++; }
+}
+
+uint32_t g_now = 1000;
+static unsigned long millis() { return g_now; }
+
+int main() {
+    // Отсутствующий тайл спрашивается у карты ОДИН раз, а не каждый кадр. Поиск имени в
+    // каталоге FAT идёт перебором и стоит 8-18 мс; на обзорном зуме пустых тайлов полный
+    // экран, и без этой памяти цикл занят только ими — ровно так плата и ушла в
+    // перезагрузку по сторожу задачи.
+    memset(tileMiss, 0, sizeof(tileMiss));
+    mccheck("незнакомый тайл спрашиваем", !tileMissKnown(8, 156, 81));
+    tileMissRemember(8, 156, 81);
+    mccheck("про отсутствующий помним", tileMissKnown(8, 156, 81));
+    mccheck("соседний не задет", !tileMissKnown(8, 157, 81));
+    mccheck("другой зум не задет", !tileMissKnown(9, 156, 81));
+
+    // Срок короткий: тайл может приехать из очереди в любую секунду.
+    g_now += MISS_TTL_MS - 1;
+    mccheck("до срока ещё помним", tileMissKnown(8, 156, 81));
+    g_now += 2;
+    mccheck("после срока спрашиваем заново", !tileMissKnown(8, 156, 81));
+
+    // Приехал — забываем немедленно, иначе он не появится на экране ещё целый срок.
+    g_now += 100;
+    tileMissRemember(8, 156, 81);
+    mccheck("снова помним", tileMissKnown(8, 156, 81));
+    tileMissForget(8, 156, 81);
+    mccheck("приехавший забыт сразу", !tileMissKnown(8, 156, 81));
+
+    // Кольцо не переполняется и не врёт: после MISS_N записей самая старая вытеснена,
+    // самая свежая на месте.
+    memset(tileMiss, 0, sizeof(tileMiss));
+    for (int i = 0; i < MISS_N + 4; i++) tileMissRemember(8, 1000 + i, 7);
+    mccheck("свежая запись на месте", tileMissKnown(8, 1000 + MISS_N + 3, 7));
+    mccheck("вытесненная забыта", !tileMissKnown(8, 1000, 7));
+
+    // Момент времени, попавший ровно в ноль: ноль означает «ячейка пуста», и запись не
+    // должна превратиться в пустую.
+    memset(tileMiss, 0, sizeof(tileMiss));
+    g_now = 0;
+    tileMissRemember(8, 5, 5);
+    mccheck("запись в нулевой момент не теряется", tileMissKnown(8, 5, 5));
+
+    if (fails == 0) printf("память о пустых тайлах: сошлась\n");
+    return fails == 0 ? 0 : 1;
+}
+"""
+
+
+def tile_miss_cache_test(ctx):
+    """Отсутствующий тайл не спрашивается у карты каждый кадр и не пишется в журнал.
+
+    Тайл, который ещё не скачали, — обычное состояние, а не сбой: на обзорных зумах пустым
+    бывает весь экран. Но каждый промах стоит поиска имени в каталоге FAT (перебор, 8-18
+    мс), а рядом стояла строка в журнал — то есть ещё одна запись на ту же карту. На
+    четырёх пустых тайлах это десятки строк в секунду: в журнале с платы виден поток
+    «size check failed» на z8, а за ним перезагрузка со сторожем задачи («цикл не
+    отпускал»). Память о промахе и молчание о норме — обе половины лечения."""
+    src = ctx.root / "apps" / "gps" / "gps.cpp"
+    if not src.is_file():
+        ctx.note("     SKIP tile_miss_cache_test: приложения карты рядом нет")
+        return
+    t = src.read_text(encoding="utf-8")
+    prelude = "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
+    for name in ("MISS_N", "MISS_TTL_MS"):
+        m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, t)
+        ctx.check("в карте задан %s" % name, m is not None,
+                  "константа %s не найдена — памяти о пустых тайлах нет" % name)
+        if m is None:
+            return
+        prelude += "#define %s%s\n" % (name, m.group(1))
+    try:
+        prelude += ctx.span(src, "struct TileMiss {", "static uint8_t  tileMissNext = 0;") + "\n"
+    except (RuntimeError, ValueError):
+        ctx.check("вырезана память о промахах", False, "объявлений нет")
+        return
+    for sig in ("static bool tileMissKnown(", "static void tileMissRemember(",
+                "static void tileMissForget("):
+        try:
+            prelude += ctx.grab(src, sig) + "\n"
+        except RuntimeError:
+            ctx.check("вырезана %s" % sig.rstrip("("), False, "функции нет")
+            return
+    # millis объявлен в прологе теста, а не здесь: вырезанные функции его зовут.
+    prelude = prelude.replace("#include <string.h>\n",
+                              "#include <string.h>\nstatic unsigned long millis();\n")
+    ok, out = ctx.host_run(prelude + TILEMISS_MAIN, "tilemiss.cpp", "память о пустых тайлах")
+    if ok is None:
+        return
+    ctx.check("память о пустых тайлах: сошлась", ok, out.strip()[:600])
+
+    # И вторая половина: про норму в журнал не пишем. Строка идёт на ту же карту, по
+    # строке на тайл на кадр — это и укладывало цикл.
+    try:
+        get = ctx.grab(src, "static uint16_t* tileGet(")
+    except RuntimeError:
+        ctx.check("подъём тайла на месте", False, "tileGet не нашлась")
+        return
+    miss = get[get.find("if (sz < 0)"):get.find("if (sz < 33")] if "if (sz < 0)" in get else ""
+    ctx.check("отсутствие тайла не пишется в журнал",
+              "if (sz < 0)" in get and "APP_DBG" not in miss,
+              "про отсутствующий тайл снова пишется строка: на обзорном зуме это десятки "
+              "записей на карту в секунду, и цикл перестаёт отпускать процессор")
+    ctx.check("отсутствие тайла запоминается",
+              "tileMissRemember" in get and "tileMissKnown" in get,
+              "tileGet не пользуется памятью о промахах — каждый кадр снова пойдёт искать "
+              "имя в каталоге")
+
+
+def log_rotation_test(ctx):
+    """Журнал хранит полсотни прошлых файлов, а не один.
+
+    При включённой отладке 256 КБ набегают примерно за полторы минуты. С одним прошлым
+    файлом это значило, что к моменту, когда плата перезагрузилась и человек дошёл до
+    журнала, причина уже уехала в .1, а следующая ротация стёрла и её — ровно так и
+    потерялись первые две перезагрузки."""
+    hdr = ctx.root / "include" / "tdeck_log.h"
+    src = ctx.root / "src" / "tdeck_log.cpp"
+    if not (hdr.is_file() and src.is_file()):
+        ctx.note("     SKIP log_rotation_test: журнала рядом нет")
+        return
+    ht, st = hdr.read_text(encoding="utf-8"), src.read_text(encoding="utf-8")
+    m = re.search(r"(?m)^#define\s+TDECK_LOG_KEEP\s+(\d+)", ht)
+    ctx.check("глубина журнала задана", m is not None,
+              "TDECK_LOG_KEEP не найден — прошлый файл снова один")
+    if m is None:
+        return
+    ctx.check("прошлых файлов десятки", int(m.group(1)) >= 20,
+              "TDECK_LOG_KEEP = %s: при 256 КБ на файл это меньше часа истории, а причину "
+              "перезагрузки ищут позже" % m.group(1))
+    try:
+        rot = ctx.grab(src, "static void rotateIfNeeded(")
+    except RuntimeError:
+        ctx.check("ротация на месте", False, "rotateIfNeeded не нашлась")
+        return
+    ctx.check("ротация сдвигает всю очередь", "TDECK_LOG_KEEP" in rot,
+              "ротация не знает про глубину: переименует только текущий, и прошлые файлы "
+              "будут копиться или теряться")
+    ctx.check("самый старый файл удаляется", "SD.remove" in rot,
+              "ротация ничего не удаляет — карта заполнится журналом")
+    try:
+        clr = ctx.grab(src, "bool tdeckLogClear(")
+        ctx.check("очистка убирает и прошлые файлы", "TDECK_LOG_KEEP" in clr,
+                  "«очистить» оставляет полсотни прошлых файлов — это не очистка")
+    except RuntimeError:
+        pass
+
+    # Причина перезагрузки — первой строкой загрузки, иначе её неоткуда взять.
+    ctx.check("причина прошлой перезагрузки попадает в журнал",
+              "esp_reset_reason" in st,
+              "esp_reset_reason нигде не спрашивается: сторож, паника и просадка питания "
+              "в журнале выглядят одинаково — никак")
+    ui = ctx.root / "src" / "tdeck_ui.cpp"
+    if ui.is_file():
+        ctx.check("причину спрашивают на старте",
+                  "tdeckLogResetReason()" in ui.read_text(encoding="utf-8"),
+                  "tdeckLogResetReason никто не зовёт — строки в журнале не появится")
+
+
 def trackball_step_debounce_test(ctx):
     """Щелчки трекбола за полсекунды — это один шаг, а не несколько.
 
