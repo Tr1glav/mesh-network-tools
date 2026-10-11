@@ -591,6 +591,67 @@ int main() {
     mcap("проворот: первый кадр фаза 1", menuScrollPhaseOf(0), 1);
     mcap("проворот: кадр на шаге анимации", menuScrollPhaseOf(TDECK_ANIM_FRAME_MS), 2);
     mcap("проворот: кончился — фаза 0", menuScrollPhaseOf(TDECK_SCROLL_MS), 0);
+
+    // ===== Подписи плиток =====
+    // Они живут ПОД лентой общей строкой. Внутри плиток их держать нельзя: лента уходит
+    // клином, соседняя плитка заходит под выделенную на (TILE - TILE_S1)/2 + (TILE_S1 -
+    // STEP1) пикселей, и центрированная подпись соседа уезжала под неё обрубком
+    // («Senso», «otes»). Убрать их у соседей тоже не вышло — имя пропадало на глазах,
+    // стоило ленте тронуться. Поэтому проверяем ровно три обещания раскладки: подпись
+    // есть у КАЖДОЙ видимой плитки, подписи не налезают друг на друга, и выделенной
+    // место достаётся целиком.
+    {
+        // Пять плиток ленты в покое: расстояния −2…+2, выделенная в середине массива.
+        const float sd5[5] = { -2.0f, -1.0f, 0.0f, 1.0f, 2.0f };
+        // Имена пошире настоящих: «Settings» в шрифте интерфейса около 55 пикселей.
+        int want5[5] = { 60, 60, 60, 60, 60 };
+        MenuCap c5[5];
+        menuCapLayout(W, sd5, want5, 5, 2, c5);
+        for (int k = 0; k < 5; k++) {
+            char what[128];
+            snprintf(what, sizeof(what), "подпись %d есть", k);
+            mccap(what, c5[k].w >= MENU_CAP_MIN);
+            snprintf(what, sizeof(what), "подпись %d на экране", k);
+            mccap(what, c5[k].x >= MENU_CAP_EDGE && c5[k].x + c5[k].w <= W - MENU_CAP_EDGE);
+        }
+        // Выделенной место достаётся целиком — ради её имени в меню и смотрят.
+        mcap("выделенной подписи место целиком", c5[2].w, want5[2]);
+        // И она стоит по центру экрана, а не подвинутая соседями.
+        mcap("выделенная подпись по центру оси", c5[2].x + c5[2].w / 2, W / 2);
+        // Соседние не налезают: отрезки идут слева направо с просветом.
+        for (int k = 1; k < 5; k++) {
+            char what[128];
+            snprintf(what, sizeof(what), "подписи %d и %d не налезают", k - 1, k);
+            mccap(what, c5[k - 1].x + c5[k - 1].w <= c5[k].x);
+        }
+        // Каждая — под своей плиткой: середина подписи не дальше полушага от центра
+        // плитки. Без этого «не налезают» выполнила бы и раскладка в одну кучу у края.
+        for (int k = 0; k < 5; k++) {
+            const int mid = c5[k].x + c5[k].w / 2;
+            const int tc = (int)(tileCenterF(W, sd5[k]) + 0.5f);
+            char what[128];
+            snprintf(what, sizeof(what), "подпись %d под своей плиткой", k);
+            mccap(what, (mid - tc < STEP1 / 2) && (tc - mid < STEP1 / 2));
+        }
+        // Кадр проворота: лента стоит между раскладками, нулевого расстояния в ней нет
+        // вовсе — и подписи обязаны остаться. Пока сторона считалась по знаку расстояния,
+        // здесь пропадали ВСЕ: обе стороны упирались в стену, которую некому отодвинуть.
+        const float sdHalf[5] = { -1.5f, -0.5f, 0.5f, 1.5f, 2.5f };
+        MenuCap ch[5];
+        menuCapLayout(W, sdHalf, want5, 5, 2, ch);   // выделена та, что приехала к центру
+        for (int k = 0; k < 4; k++) {                // пятая на полшага уже за краем
+            char what[128];
+            snprintf(what, sizeof(what), "на провороте подпись %d не пропала", k);
+            mccap(what, ch[k].w >= MENU_CAP_MIN);
+        }
+        // Длинное имя у соседа не крадёт место у выделенной: ей по-прежнему целиком.
+        int wantLong[5] = { 60, 300, 60, 60, 60 };
+        MenuCap cl[5];
+        menuCapLayout(W, sd5, wantLong, 5, 2, cl);
+        mcap("длинный сосед не сжал выделенную", cl[2].w, wantLong[2]);
+        mccap("длинный сосед обрезан по месту", cl[1].w < wantLong[1]);
+        mccap("длинный сосед не налез на выделенную", cl[1].x + cl[1].w <= cl[2].x);
+    }
     if (fails == 0) printf("карусель: раскладка сошлась\n");
     return fails == 0 ? 0 : 1;
 }
@@ -616,7 +677,8 @@ def menu_carousel_test(ctx):
     prelude = """#include <stdint.h>
 #include <stdio.h>
 """
-    for name in ("TILE", "TILE_S1", "TILE_S2", "STEP1", "STEP2", "TILE_ICON_H", "MENU_TOP"):
+    for name in ("TILE", "TILE_S1", "TILE_S2", "STEP1", "STEP2", "MENU_TOP", "MENU_CAP_DY",
+                 "MENU_CAP_EDGE", "MENU_CAP_GAP", "MENU_CAP_MIN"):
         m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, src)
         ctx.check("в раскладке задан %s" % name, m is not None,
                   "константа %s не найдена — проверять карусель не на чем" % name)
@@ -671,11 +733,15 @@ def menu_carousel_test(ctx):
     # Порядок важен: каждый хелпер зовёт предыдущие, и g++ бы не дал собрать тест, где
     # статика определена позже вызова. Порядок здесь — порядок зависимостей сверху вниз
     # по файлу раскладки.
+    # MenuCap — тип, а не функция: объявление берём как есть, иначе menuCapLayout не
+    # соберётся. Он объявлен рядом с самой раскладкой подписей.
+    prelude += "struct MenuCap { int x; int w; };\n"
     for sig in ("static int tileSizeAt(int d)",
                 "static int tileOffsetAt(int d)",
                 "static float tileSizeF(float d)",
                 "static float tileOffsetF(float d)",
                 "static float tileDistF(int i, float selF)",
+                "static float tileCenterF(int screenW, float d)",
                 "static float tileXf(int screenW, float selF, int i)",
                 "static int tileX(int screenW, int sel, int i)",
                 "static bool tileVisible(int screenW, int sel, int i)",
@@ -684,7 +750,8 @@ def menu_carousel_test(ctx):
                 "int tdeckMenuPages(int screenW, int screenH)",
                 "int tdeckMenuPageOf(int screenW, int screenH, int index)",
                 "int tdeckMenuHit(int screenW, int screenH, int sel, int x, int y)",
-                "int tdeckMenuStep(int screenW, int screenH, int cur, int dcol, int drow)"):
+                "int tdeckMenuStep(int screenW, int screenH, int cur, int dcol, int drow)",
+                "static void menuCapLayout("):
         try:
             code = ctx.grab(draw, sig)
         except RuntimeError:
@@ -697,6 +764,216 @@ def menu_carousel_test(ctx):
     if ok is None:
         return
     ctx.check("карусель сошлась", ok, out.strip()[:400])
+
+
+CHAT_NODES_MAIN = r"""
+#include <stdio.h>
+
+static int fails = 0;
+static void ncap(const char* what, int got, int want) {
+    if (got != want) { printf("узлы: %s: получили %d, ждали %d\n", what, got, want); fails++; }
+}
+static void nccap(const char* what, int got) {
+    if (!got) { printf("узлы: %s: ложь\n", what); fails++; }
+}
+
+// Ключ узла номер n: первый байт — номер, остальное ноль. Контакт опознаётся ключом,
+// больше от ключа в этой проверке ничего не нужно.
+static void keyOf(int n, uint8_t* pub) {
+    memset(pub, 0, 32);
+    pub[0] = (uint8_t)(n + 1);
+}
+
+// Слышим узел n: имя по номеру, место — ненулевое, иначе на карту он не попадёт.
+static void hear(int n, uint32_t at) {
+    uint8_t pub[32];
+    keyOf(n, pub);
+    char name[16];
+    snprintf(name, sizeof(name), "node%d", n);
+    g_unix = at;
+    tdeckChatOnAdvert(pub, name, 54000000 + n, 37000000 + n);
+}
+
+// Есть ли узел n среди тех, что уйдут на карту.
+static bool onMap(int n) {
+    const int cnt = tdeckChatNodeCount();
+    char want[16];
+    snprintf(want, sizeof(want), "node%d", n);
+    for (int i = 0; i < cnt; i++) {
+        int32_t la = 0, lo = 0;
+        char nm[24];
+        if (!tdeckChatNodeAt(i, &la, &lo, nm, sizeof(nm))) continue;
+        if (strcmp(nm, want) == 0) return true;
+    }
+    return false;
+}
+
+int main() {
+    // Каналов на узле бывает до восьми (MAX_CHANNELS ядра), и они лежат в том же списке,
+    // что услышанные соседи. Заводим их все: именно так список и переполнялся.
+    for (int c = 0; c < 8; c++) {
+        char nm[16];
+        snprintf(nm, sizeof(nm), "#chan%d", c);
+        tdeckChatAddChannel(c, nm);
+    }
+    // Соседей — столько, сколько осталось мест. Их должно быть ровно TDECK_CHAT_MAX - 8,
+    // и ни один не должен вытеснить другого: прежде мест оставалось четыре на всю сеть, и
+    // на карте узлы «замещали друг друга» — число точек не росло, сколько ни ходи.
+    const int ROOM = TDECK_CHAT_MAX - 8;
+    nccap("мест соседям больше десятка", ROOM >= 12);
+    for (int n = 0; n < ROOM; n++) hear(n, 1000 + (uint32_t)n);
+    ncap("все услышанные на карте", tdeckChatNodeCount(), ROOM);
+    for (int n = 0; n < ROOM; n++) {
+        char what[128];
+        snprintf(what, sizeof(what), "узел %d на карте", n);
+        nccap(what, onMap(n));
+    }
+
+    // Список полон. Новый сосед вытесняет САМОГО ДАВНЕГО, а не случайного.
+    hear(ROOM, 9000);
+    ncap("после вытеснения мест столько же", tdeckChatNodeCount(), ROOM);
+    nccap("новый узел на карте", onMap(ROOM));
+    nccap("ушёл самый давний", !onMap(0));
+    nccap("второй по давности остался", onMap(1));
+
+    // Главное: заново услышанный узел перестаёт быть кандидатом на вылет. Прежде срок
+    // ставился ОДИН раз, при первом адверте, и живой сосед вылетал из списка, пока
+    // говорил в эфире, — а на его место тут же приходил следующий, и так по кругу.
+    hear(1, 9100);                       // узел 1 снова в эфире
+    hear(ROOM + 1, 9200);                // и приходит ещё один незнакомый
+    nccap("заново услышанный остался", onMap(1));
+    nccap("вместо него ушёл следующий по давности", !onMap(2));
+
+    // Каналы не вытесняются никогда: они заданы настройками узла, а не услышаны случайно.
+    // Проверяем числом бесед: соседей ровно ROOM, остальное — каналы.
+    int used = 0, chans = 0;
+    for (int i = 0; i < TDECK_CHAT_MAX; i++) {
+        if (!chats[i].used) continue;
+        used++;
+        if (chats[i].isChannel) chans++;
+    }
+    ncap("каналы на месте", chans, 8);
+    ncap("список полон целиком", used, TDECK_CHAT_MAX);
+
+    // Переживание перезагрузки: что сохранили, то и подняли, и порядок вытеснения у
+    // поднятых — по времени последнего адверта, а не по порядку записей в файле.
+    static TdeckChatContact saved[TDECK_CHAT_MAX];
+    const int nsaved = tdeckChatContactsSave(saved, TDECK_CHAT_MAX);
+    ncap("сохранили всех соседей", nsaved, ROOM);
+    memset(chats, 0, sizeof(chats));
+    ringReady = false;
+    memset(ringOwner, 0, sizeof(ringOwner));
+    chatSeen = 0;
+    // Порядок как при настоящем включении: сперва каналы из настроек узла, потом
+    // контакты с карты. Без каналов в списке остались бы свободные места, и вытеснение
+    // не случилось бы вовсе — проверять было бы нечего.
+    for (int c = 0; c < 8; c++) {
+        char nm[16];
+        snprintf(nm, sizeof(nm), "#chan%d", c);
+        tdeckChatAddChannel(c, nm);
+    }
+    tdeckChatContactsLoad(saved, nsaved);
+    ncap("подняли всех соседей", tdeckChatNodeCount(), ROOM);
+    // Самый давний из поднятых уходит первым — он и уходит.
+    int oldest = -1;
+    uint32_t oldestAt = 0xFFFFFFFFu;
+    for (int i = 0; i < nsaved; i++)
+        if (saved[i].heardUnix < oldestAt) { oldestAt = saved[i].heardUnix; oldest = i; }
+    nccap("самый давний найден", oldest >= 0);
+    char oldName[24];
+    snprintf(oldName, sizeof(oldName), "%s", saved[oldest >= 0 ? oldest : 0].name);
+    hear(500, 9999);
+    bool stillThere = false;
+    for (int i = 0; i < tdeckChatNodeCount(); i++) {
+        int32_t la = 0, lo = 0;
+        char nm[24];
+        if (tdeckChatNodeAt(i, &la, &lo, nm, sizeof(nm)) && strcmp(nm, oldName) == 0)
+            stillThere = true;
+    }
+    nccap("после перезагрузки первым уходит самый давний", !stillThere);
+
+    if (fails == 0) printf("узлы на карте: список сошёлся\n");
+    return fails == 0 ? 0 : 1;
+}
+"""
+
+
+def chat_nodes_test(ctx):
+    """Услышанные узлы помещаются на карту все, и никто не вытесняет живого соседа.
+
+    На плате это выглядело так: на карте четыре точки, и они «замещают друг друга» —
+    сколько ни ходи по городу, точек не прибавляется, а те, что были, пропадают. Причин
+    было две, и обе в списке бесед (узел с координатами — это контакт переписки, см.
+    tdeck_chat.h). Первая: список один на каналы и на соседей, мест в нём было двенадцать,
+    а каналов на узле до восьми — соседям оставалось четыре. Вторая: срок, по которому
+    выбирают, кого вытеснить, ставился ОДИН раз, при первом адверте, поэтому давно
+    знакомый, но вполне живой сосед навсегда оставался первым кандидатом на вылет.
+
+    Проверяем настоящим кодом списка: восемь каналов, полный список соседей, вытеснение
+    и перезагрузка."""
+    src = ctx.root / "src" / "tdeck_chat.cpp"
+    hdr = ctx.root / "include" / "tdeck_chat.h"
+    if not (src.is_file() and hdr.is_file()):
+        ctx.note("     SKIP chat_nodes_test: переписки рядом нет")
+        return
+    ht = hdr.read_text(encoding="utf-8")
+
+    prelude = """#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stddef.h>
+"""
+    for name in ("TDECK_CHAT_MAX", "TDECK_CHAT_MSG_MAX", "TDECK_CHAT_RINGS",
+                 "TDECK_CHAT_TEXT_MAX"):
+        m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, ht)
+        ctx.check("в переписке задан %s" % name, m is not None,
+                  "константа %s не найдена — список бесед проверять не на чем" % name)
+        if m is None:
+            return
+        prelude += "#define %s%s\n" % (name, m.group(1))
+    # Часы и millis на хосте свои: адверт ставит heardUnix по time(NULL), а оно и решает,
+    # кого вытеснять после перезагрузки.
+    prelude += """static unsigned long millis() { return 0; }
+static uint32_t g_unix = 1000;
+static long time(const void*) { return (long)g_unix; }
+"""
+    try:
+        prelude += ctx.span(hdr, "struct TdeckChatContact {", "};") + "\n"
+        prelude += ctx.span(src, "struct ChatMsg {", "};") + "\n"
+        prelude += ctx.span(src, "struct Chat {", "};") + "\n"
+        prelude += ctx.span(src, "static Chat chats[TDECK_CHAT_MAX];",
+                            "static uint32_t chatSeen = 0;") + "\n"
+        prelude += """static int chatOpen = -1;
+static uint32_t chatGen = 0;
+static bool storeDirty = false;
+static void storeTouch() { storeDirty = true; }
+"""
+    except (RuntimeError, ValueError):
+        ctx.check("вырезан список бесед", False,
+                  "объявлений списка нет — переписка перестроена?")
+        return
+    for sig in ("static void chatSeenTouch(",
+                "static int chatIndexOf(",
+                "static ChatMsg* chatRing(",
+                "static ChatMsg* chatRingIf(",
+                "static Chat* chatFind(",
+                "int tdeckChatNodeCount(",
+                "bool tdeckChatNodeAt(",
+                "int tdeckChatContactsSave(",
+                "void tdeckChatContactsLoad(",
+                "void tdeckChatAddChannel(",
+                "void tdeckChatOnAdvert("):
+        try:
+            prelude += ctx.grab(src, sig) + "\n"
+        except RuntimeError:
+            ctx.check("вырезана %s" % sig.rstrip("("), False,
+                      "функции нет — список услышанных узлов перестроен?")
+            return
+
+    ok, out = ctx.host_run(prelude + CHAT_NODES_MAIN, "chatnodes.cpp", "узлы на карте")
+    if ok is None:
+        return
+    ctx.check("узлы на карте: список сошёлся", ok, out.strip()[:600])
 
 
 def trackball_step_debounce_test(ctx):
@@ -886,12 +1163,70 @@ def status_clock_contrast_test(ctx):
     ctx.check("чистый белый есть в палитре",
               re.search(r"#define\s+COL_WHITE\s+0xFFFF", p) is not None,
               "белого в палитре нет: контраст придётся набирать случайными числами")
+    # Между условием и вызовом допускается что угодно, кроме точки с запятой: к «часы
+    # есть» с тех пор добавилось «и журнал не показывает свою строку», а проверка цвета
+    # требовала закрывающей скобки сразу после s.clock[0] и объявляла белые часы мягкими.
     ctx.check("часы рисуются белым",
-              re.search(r"s\.clock\[0\]\)\s*textAtF\([^;]*COL_WHITE", d) is not None,
+              re.search(r"s\.clock\[0\][^;]*textAtF\([^;]*COL_WHITE", d) is not None,
               "часы рисуются мягким цветом: на живой панели они сливаются с полосой")
     ctx.check("часы рисуются шрифтом значений",
-              re.search(r"s\.clock\[0\]\)\s*textAtF\([^;]*FONT_VALUE", d) is not None,
+              re.search(r"s\.clock\[0\][^;]*textAtF\([^;]*FONT_VALUE", d) is not None,
               "часы мельче, чем нужно: на полосе 26 px они теряются среди пиктограмм")
+
+
+def shadow_frame_test(ctx):
+    """Теневая копия кадра: вывод по разнице строк не должен врать о том, что вывел.
+
+    Панель получает только изменившиеся строки — драйвер сравнивает буфер с копией того,
+    что уже стоит на экране, и выталкивает различия. Механизм дешёвый (сравнение около
+    восьми миллисекунд на кадр против полного вывода в шестьдесят), но у него есть ровно
+    одно смертельное свойство: строка, записанная в теневую копию, считается выведенной
+    НАВСЕГДА. Поэтому вложенный вызов недопустим — он вытолкнет недорисованный кадр и
+    запишет его строки как выведенные, после чего внешний проход их не выведет никогда, и
+    на экране останется мешанина из двух кадров до следующей полной перерисовки. Повод для
+    вложенного вызова живой: ожидание эфира прошивка вправе занять рисованием (mcAirPump).
+
+    Вторая половина — про честность профиля: время рисования знает только тот, кто рисует.
+    Драйвер видит готовый буфер, и когда он передавал за рисование ноль, журнал печатал
+    «рисование 0 мс» на кадрах, которые рисовались по сто миллисекунд."""
+    drv = ctx.root / "include" / "st7789.h"
+    if not drv.is_file():
+        ctx.note("     SKIP shadow_frame_test: драйвера панели рядом нет")
+        return
+    d = drv.read_text(encoding="utf-8")
+    try:
+        disp = ctx.grab(drv, "void display(void)")
+    except RuntimeError:
+        ctx.check("вывод кадра на месте", False, "display() не нашлась — драйвер перестроен?")
+        return
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                      for ln in disp.splitlines())
+    ctx.check("вывод кадра закрыт от повторного входа",
+              re.search(r"if\s*\(\s*_inDisplay\s*\)\s*return\s*;", code) is not None,
+              "display() пускает вложенный вызов: он вытолкнет недорисованный кадр и "
+              "запишет его строки в теневую копию как выведенные")
+    # Сторож обязан сниматься на КАЖДОМ выходе после подъёма, иначе первый же ранний
+    # возврат выключит вывод кадров навсегда — экран замрёт целиком, и это хуже мешанины.
+    # Считаем только то, что ПОСЛЕ подъёма: выходы до него сторожа не трогают.
+    raised = code.find("_inDisplay = true")
+    tail = code[raised:] if raised >= 0 else ""
+    ctx.check("сторож снимается на каждом выходе",
+              raised >= 0
+              and tail.count("_inDisplay = false") >= tail.count("return;") + 1,
+              "у display() есть выход, на котором сторож остаётся поднятым: следующий "
+              "кадр не выведется никогда")
+    ctx.check("теневая копия обновляется только выведенным",
+              "memcpy(_srow(" in code or "memcpy(_shadow" in code,
+              "строки больше не переносятся в теневую копию — вывод по разнице сломан")
+    ctx.check("драйвер не выдумывает время рисования",
+              re.search(r"tdeckProfFrame\s*\(\s*0\s*,", d) is None,
+              "драйвер снова передаёт за рисование ноль: журнал будет печатать "
+              "«рисование 0 мс» на кадрах любой тяжести")
+    ui = ctx.root / "src" / "tdeck_ui.cpp"
+    if ui.is_file():
+        ctx.check("время рисования меряет тот, кто рисует",
+                  "tdeckProfFrameDraw(" in ui.read_text(encoding="utf-8"),
+                  "никто не сообщает профилю время рисования — в журнале оно будет нулём")
 
 
 def elf_iram_access_test(ctx):

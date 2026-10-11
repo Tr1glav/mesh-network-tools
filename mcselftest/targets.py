@@ -113,6 +113,8 @@ def run_tdeck(ctx):
     suite_tdeck.snake_rules_test(ctx)
     suite_tdeck.snake_moves_test(ctx)
     suite_tdeck.menu_carousel_test(ctx)
+    suite_tdeck.chat_nodes_test(ctx)
+    suite_tdeck.shadow_frame_test(ctx)
     suite_tdeck.wifi_switch_test(ctx)
     suite_tdeck.touch_calibration_test(ctx)
     suite_tdeck.board_power_guard_test(ctx)
