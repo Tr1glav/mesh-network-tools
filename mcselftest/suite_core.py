@@ -86,12 +86,21 @@ def host_functions_test(ctx, extra_funcs=(), extra_main="", extra_label=()):
         return
     code = (
         "#include <cstdint>\n#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n"
+        "#include <cstdarg>\n"
         "#define OTA_RAW_CHUNK_BYTES 240\n"
         "#define OTA_RAW_FRAME_MAX (11 + OTA_RAW_CHUNK_BYTES)\n"
         "#define RAW_MAGIC0 0xBE\n#define RAW_MAGIC1 0xEF\n"
+        # Таблицы полубайтов: без них CRC не соберётся. Берём настоящие, а не свои —
+        # проверка обязана проверять те же числа, что уйдут на плату.
+        + ctx.span(ctx.core / "src/crypto.cpp", "static const uint32_t CRC32_NIB[16] = {",
+                   "static const uint16_t CRC16_NIB[16] = {\n    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,\n    0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,\n};") + "\n"
         + ctx.grab(ctx.core / "src/crypto.cpp", "uint16_t crc16buf(") + "\n"
         + ctx.grab(ctx.core / "src/crypto.cpp", "uint32_t crc32_upd(") + "\n"
         + ctx.grab(ctx.core / "src/crypto.cpp", "void jsonEscape(") + "\n"
+        # buildPingReply дописывает через strAppend — без него не соберётся. Берём
+        # настоящую функцию, а не заглушку: проверка границ обязана проверять ту же
+        # арифметику, что работает на плате.
+        + ctx.grab(ctx.core / "src/strbuf.cpp", "size_t strAppend(").replace('extern "C" ', "", 1) + "\n"
         + ctx.grab(ctx.core / "src/mesh_rx.cpp", "void buildPingReply(") + "\n"
         + ctx.grab(ctx.core / "src/ota.cpp", "int rawBuildFrame(") + "\n"
         + "".join(ctx.grab(h, sig) + "\n" for h, sig in extra_funcs)
@@ -230,6 +239,10 @@ def pure_functions_test(ctx, extra_funcs=(), extra_main="", extra_prelude="",
             + ctx.grab(ctx.core / "src/appconfig.cpp", "bool cfgRangeOk(") + "\n"
             + ctx.grab(ctx.core / "src/crypto.cpp", "char* fmtFix(") + "\n"
             + ctx.grab(ctx.core / "src/crypto.cpp", "float parseFixed(") + "\n"
+            # Таблицы полубайтов: без них CRC не соберётся. Берём настоящие, а не свои —
+            # проверка обязана проверять те же числа, что уйдут на плату.
+            + ctx.span(ctx.core / "src/crypto.cpp", "static const uint32_t CRC32_NIB[16] = {",
+                   "static const uint16_t CRC16_NIB[16] = {\n    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,\n    0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,\n};") + "\n"
             + ctx.grab(ctx.core / "src/crypto.cpp", "uint16_t crc16buf(") + "\n"
             + ctx.grab(ctx.core / "src/crypto.cpp", "char* fmtUdeg(") + "\n"
             + "".join(ctx.grab(h, sig) + "\n" for h, sig in extra_funcs)
@@ -2881,6 +2894,183 @@ def flood_tx_queue_test(ctx):
         ctx.note("     прошивок рядом нет — вызов тика не проверяется")
 
 
+STRAPPEND_MAIN = r"""
+#include <stdio.h>
+#include <string.h>
+
+static int fails = 0;
+static void acap(const char* what, int got, int want) {
+    if (got != want) { printf("строка: %s: получили %d, ждали %d\n", what, got, want); fails++; }
+}
+static void accap(const char* what, int got) {
+    if (!got) { printf("строка: %s: ложь\n", what); fails++; }
+}
+
+int main() {
+    // Главное свойство: позиция НИКОГДА не уезжает за буфер, сколько в него ни лей.
+    // Отсюда всё остальное — следующий вызов считает остаток от этой позиции, и если
+    // она за буфером, он пишет по произвольному адресу.
+    {
+        char b[16];
+        size_t at = strAppend(b, sizeof(b), 0, "%s", "0123456789");
+        acap("влезло целиком", (int)at, 10);
+        at = strAppend(b, sizeof(b), at, "%s", "ABCDEFGHIJKLMNOP");   // заведомо не влезет
+        accap("позиция не ушла за буфер", at <= sizeof(b) - 1);
+        acap("строка обрезана по буферу", (int)strlen(b), (int)sizeof(b) - 1);
+        // И ещё раз поверх полного буфера: здесь прежний код и писал за его пределы.
+        const size_t again = strAppend(b, sizeof(b), at, "%s", "ещё");
+        acap("из полного буфера позиция не двигается", (int)again, (int)at);
+        acap("строка цела", (int)strlen(b), (int)sizeof(b) - 1);
+    }
+    // Ровно впритык: последний байт отдан под завершающий ноль, а не под текст.
+    {
+        char b[5];
+        const size_t at = strAppend(b, sizeof(b), 0, "%s", "abcd");
+        acap("впритык занято всё, кроме нуля", (int)at, 4);
+        accap("впритык строка та же", strcmp(b, "abcd") == 0);
+    }
+    // Вырожденные входы не роняют и не портят.
+    {
+        char b[8] = "xyz";
+        acap("нулевой буфер", (int)strAppend(b, 0, 0, "a"), 0);
+        accap("нулевой буфер не тронул строку", strcmp(b, "xyz") == 0);
+        acap("нулевой указатель", (int)strAppend(0, 16, 0, "a"), 0);
+        acap("позиция за пределом прижимается к концу", (int)strAppend(b, 8, 99, "a"), 7);
+    }
+    // Тот самый сценарий со страницы координатора: четыре прошивальщика с именами
+    // предельной длины в буфер на 320 байт. Прежний код уводил позицию за 320 и писал
+    // закрывающую скобку мимо стека; под ASan это падение, а не «ну обрезалось».
+    {
+        char sups[320] = "";
+        size_t at = strAppend(sups, sizeof(sups), 0, "[");
+        for (int i = 0; i < 4 && at < sizeof(sups) - 80; i++) {
+            char nm[48], sv[24], se[40];
+            memset(nm, 'N', sizeof(nm)); nm[sizeof(nm) - 1] = 0;
+            memset(sv, 'V', sizeof(sv)); sv[sizeof(sv) - 1] = 0;
+            memset(se, 'E', sizeof(se)); se[sizeof(se) - 1] = 0;
+            at = strAppend(sups, sizeof(sups), at,
+                           "%s{\"n\":\"%s\",\"ip\":\"%s\",\"v\":\"%s\",\"e\":\"%s\"}",
+                           i ? "," : "", nm, "255.255.255.255", sv, se);
+        }
+        strAppend(sups, sizeof(sups), at, "]");
+        accap("список прошивальщиков не вышел за буфер", strlen(sups) < sizeof(sups));
+    }
+    if (fails == 0) printf("дописывание в строку: сошлось\n");
+    return fails == 0 ? 0 : 1;
+}
+"""
+
+
+def str_append_test(ctx):
+    """Дописывание в строку не умеет выйти за буфер — и так пишут ВЕЗДЕ.
+
+    Было «at += snprintf(buf + at, cap - at, ...)», и это ловушка: snprintf возвращает,
+    сколько БЫ он записал. Стоит тексту не влезть — возврат больше остатка, at уезжает за
+    буфер, и следующий вызов считает остаток как (cap - at) в size_t, то есть число под
+    четыре миллиарда, а buf + at смотрит мимо. Обрезка превращается в запись по
+    произвольному адресу. На странице координатора это было достижимо данными из сети:
+    четыре прошивальщика с длинными именами уводили позицию за 320-байтный буфер на
+    стеке, и закрывающая скобка с нулём писались за него.
+
+    Проверяется сама функция под ASan, и отдельно — что старая форма не вернулась ни в
+    одном файле обеих прошивок и ядра."""
+    try:
+        code = ctx.grab(ctx.core / "src/strbuf.cpp", "size_t strAppend(")
+    except RuntimeError:
+        ctx.check("дописывание в строку вынесено в ядро", False,
+                  "strAppend не найдена — каждый файл снова складывает возвраты snprintf")
+        return
+    prelude = "#include <stdarg.h>\n#include <stdio.h>\n#include <stddef.h>\n"
+    prelude += code.replace('extern "C" ', "", 1) + "\n"
+    ok, out = ctx.host_run(prelude + STRAPPEND_MAIN, "strappend.cpp", "дописывание в строку")
+    if ok is None:
+        return
+    ctx.check("дописывание в строку: сошлось", ok, out.strip()[:600])
+
+    # Старая форма не должна вернуться НИГДЕ: один такой вызов — это снова запись мимо
+    # буфера, и искать её потом будут по обвалу, а не по этой строке.
+    bad = []
+    roots = [ctx.core / "src"]
+    for sub in ("meshcore-fork", "tdeck"):
+        for d in ("src", "lib/meshcore/src", "apps"):
+            p = ctx.tree / sub / d
+            if p.is_dir():
+                roots.append(p)
+    for root in roots:
+        for f in sorted(root.rglob("*.cpp")) + sorted(root.rglob("*.c")):
+            for i, ln in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                cut = ln.split("//")[0]
+                if re.search(r"\+=\s*(sn|vsn)printf\s*\(", cut):
+                    bad.append("%s:%d" % (f.relative_to(ctx.tree), i))
+    ctx.check("возвраты snprintf нигде не складываются с позицией", not bad,
+              "складывают: " + ", ".join(bad[:6]) +
+              " — возврат snprintf это «сколько БЫ записал», и позиция уезжает за буфер")
+
+
+def hot_path_crypto_test(ctx):
+    """Горячий путь не настраивает SHA заново на каждый кадр и не считает CRC битами.
+
+    Дедуп-хэш считается на КАЖДЫЙ принятый и каждый отправленный кадр, подтверждения
+    доставки — на каждую личку. А mbedtls_md_setup внутри делает calloc, и
+    md_info_from_type — линейный поиск по списку алгоритмов: это malloc/free в эфирном
+    темпе, такт процессора и фрагментация хипа разом. Возвраты при этом никто не
+    проверял: не хватило памяти — контекст остался ненастроенным, а код пошёл считать.
+
+    CRC та же история масштабом крупнее: crc16 на каждый кадр OTA, crc32 — на весь образ,
+    мегабайт с лишним за сессию, и всё это по биту (восемь итераций на байт)."""
+    crypto = ctx.core / "src" / "crypto.cpp"
+    mesh = ctx.core / "src" / "mesh.cpp"
+    if not (crypto.is_file() and mesh.is_file()):
+        ctx.note("     SKIP hot_path_crypto_test: ядра рядом нет")
+        return
+    ct = crypto.read_text(encoding="utf-8")
+    mt = mesh.read_text(encoding="utf-8")
+
+    # Настройка контекста — РОВНО в одном месте на всё ядро.
+    setups = []
+    for f in sorted((ctx.core / "src").rglob("*.cpp")):
+        txt = f.read_text(encoding="utf-8", errors="replace")
+        for i, ln in enumerate(txt.splitlines(), 1):
+            if "mbedtls_md_setup" in ln.split("//")[0]:
+                setups.append("%s:%d" % (f.name, i))
+    ctx.check("контекст SHA настраивается в одном месте", len(setups) == 1,
+              "mbedtls_md_setup зовётся из %d мест (%s): setup делает calloc, и на горячем "
+              "пути это malloc на каждый кадр" % (len(setups), ", ".join(setups)))
+    ctx.check("общий контекст заведён", "mbedtls_md_context_t* sha256Ctx()" in ct,
+              "sha256Ctx нет — значит каждый считающий настраивает контекст сам")
+    ctx.check("настройка контекста проверяет возврат",
+              re.search(r"mbedtls_md_setup\([\s\S]{0,80}?\)\s*!=\s*0", ct) is not None,
+              "возврат mbedtls_md_setup не проверяется: при нехватке памяти код пойдёт "
+              "считать ненастроенным контекстом")
+    try:
+        fh = ctx.grab(mesh, "static bool meshFrameHash(")
+    except RuntimeError:
+        ctx.check("дедуп-хэш на месте", False, "meshFrameHash не нашлась")
+        return
+    ctx.check("дедуп-хэш берёт общий контекст", "sha256Ctx()" in fh,
+              "meshFrameHash снова настраивает свой контекст — а зовут его на каждый кадр")
+    ctx.check("дедуп-хэш не молчит об отказе", "return false" in fh.split("sha256Ctx()")[-1],
+              "meshFrameHash не проверяет, что контекст есть: посчитает мусор и выдаст "
+              "его за хэш кадра")
+
+    # CRC по таблицам, а не по биту. Признак — таблица и отсутствие цикла по восьми битам.
+    for name, tbl in (("crc32_upd", "CRC32_NIB"), ("crc16buf", "CRC16_NIB")):
+        try:
+            body = ctx.grab(crypto, ("uint32_t " if name == "crc32_upd" else "uint16_t ") + name + "(")
+        except RuntimeError:
+            ctx.check("%s на месте" % name, False, "функции нет")
+            continue
+        ctx.check("%s считает по таблице" % name, tbl in body,
+                  "%s снова крутит восемь итераций на байт" % name)
+        ctx.check("%s без побитового цикла" % name,
+                  re.search(r"for\s*\(\s*int\s+b\s*=\s*0;\s*b\s*<\s*8", body) is None,
+                  "в %s остался цикл по битам" % name)
+        ctx.check("таблица %s лежит во флеше" % tbl,
+                  re.search(r"static const u?int(16|32)_t\s+%s\[16\]" % tbl, ct) is not None,
+                  "таблица %s не const-массив на 16 записей: либо её строят в RAM, либо "
+                  "она разрослась" % tbl)
+
+
 def relay_policy_test(ctx):
     """Правила переиздания — перенос из оригинального MeshCore, и перенос честный.
 
@@ -3024,19 +3214,20 @@ def relay_queue_test(ctx):
             + ctx.grab(ctx.core / "src/mesh_relay.cpp", "void meshRelayTick(") + "\n"
             + RELAY_MAIN)
     # Хэш считается через mbedtls; подменяем его собственным, иначе на хосте не соберётся
-    code = code.replace("""    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
-    mbedtls_md_starts(&ctx);
-    mbedtls_md_update(&ctx, &pt, 1);
-    mbedtls_md_update(&ctx, &data[offset], len - offset);
-    mbedtls_md_finish(&ctx, out);
-    mbedtls_md_free(&ctx);""",
-                        """    MdCtx ctx;
-    md_starts(&ctx);
-    md_update(&ctx, &pt, 1);
-    md_update(&ctx, &data[offset], len - offset);
-    md_finish(&ctx, out);""")
+    # Контекст SHA-256 в ядре теперь ОДИН на всю прошивку (sha256Ctx, см. crypto.cpp):
+    # setup делает calloc, а хэш считается на каждый кадр. Подменяем ровно эту форму.
+    code = code.replace("""    mbedtls_md_context_t* ctx = sha256Ctx();
+    if (!ctx) return false;
+    if (mbedtls_md_starts(ctx) != 0) return false;
+    mbedtls_md_update(ctx, &pt, 1);
+    mbedtls_md_update(ctx, &data[offset], len - offset);
+    if (mbedtls_md_finish(ctx, out) != 0) return false;""",
+                        """    MdCtx c;
+    MdCtx* ctx = &c;
+    md_starts(ctx);
+    md_update(ctx, &pt, 1);
+    md_update(ctx, &data[offset], len - offset);
+    md_finish(ctx, out);""")
     if "mbedtls_md_starts" in code:
         ctx.check("подмена mbedtls в тесте ретранслятора", False,
               "вид функции meshFrameHash изменился — подмена не сработала, проверка фиктивна")

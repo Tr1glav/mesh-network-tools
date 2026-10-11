@@ -1105,6 +1105,168 @@ def map_zoom_scale_test(ctx):
                   "запасает — они откроются пустыми")
 
 
+MAPAREA_MAIN = r"""
+#include <stdio.h>
+#include <string.h>
+
+static int fails = 0;
+static void rcap(const char* what, int got, int want) {
+    if (got != want) { printf("область: %s: получили %d, ждали %d\n", what, got, want); fails++; }
+}
+
+// Что заказали в очередь. Поле 64x64 тайла с запасом — области в проверке меньше.
+#define FIELD 64
+static bool asked[FIELD][FIELD];
+static int  askedN = 0;
+static bool present[FIELD][FIELD];
+
+static void reset() {
+    memset(asked, 0, sizeof(asked));
+    memset(present, 0, sizeof(present));
+    askedN = 0;
+}
+
+int main() {
+    // Прямоугольник 20x20 — это 400 тайлов. Прежний код ставил в очередь 256 и молчал:
+    // оба цикла были обрезаны по idx < 256, то есть область больше 16 тайлов по стороне
+    // закачивалась частично, и узнать об этом было неоткуда.
+    reset();
+    tdeckMapDownloadAddRect(15, 10, 10, 29, 29);
+    rcap("прямоугольник 20x20 заказан целиком", askedN, 400);
+    for (int x = 10; x <= 29; x++)
+        for (int y = 10; y <= 29; y++)
+            if (!asked[x][y]) { printf("область: тайл %d,%d потерян\n", x, y); fails++; }
+
+    // Углы, заданные наоборот, — та же область.
+    reset();
+    tdeckMapDownloadAddRect(15, 29, 29, 10, 10);
+    rcap("перевёрнутые углы дают ту же область", askedN, 400);
+
+    // Что уже лежит на карте, в очередь не просим.
+    reset();
+    for (int x = 10; x <= 19; x++) present[x][10] = true;        // целый ряд уже есть
+    tdeckMapDownloadAddRect(15, 10, 10, 19, 19);
+    rcap("имеющееся не перезаказывается", askedN, 100 - 10);
+
+    // Круг: ровно те тайлы, что внутри радиуса, и ни одного сверх.
+    reset();
+    const int cx = 30, cy = 30, r = 12;
+    tdeckMapDownloadAddCircle(15, cx, cy, r);
+    int want = 0;
+    for (int dx = -r; dx <= r; dx++)
+        for (int dy = -r; dy <= r; dy++)
+            if (dx * dx + dy * dy <= r * r) want++;
+    rcap("круг радиуса 12 заказан целиком", askedN, want);
+    for (int dx = -r; dx <= r; dx++)
+        for (int dy = -r; dy <= r; dy++) {
+            const bool inside = dx * dx + dy * dy <= r * r;
+            if (inside != asked[cx + dx][cy + dy]) {
+                printf("область: угол круга %d,%d: внутри=%d заказан=%d\n",
+                       dx, dy, (int)inside, (int)asked[cx + dx][cy + dy]);
+                fails++;
+            }
+        }
+
+    // Вырожденные входы: один тайл и нулевой радиус.
+    reset();
+    tdeckMapDownloadAddRect(15, 5, 5, 5, 5);
+    rcap("область в один тайл", askedN, 1);
+    reset();
+    tdeckMapDownloadAddCircle(15, 5, 5, 0);
+    rcap("круг нулевого радиуса — один тайл", askedN, 1);
+
+    if (fails == 0) printf("область карты: заказана целиком\n");
+    return fails == 0 ? 0 : 1;
+}
+"""
+
+
+def map_area_queue_test(ctx):
+    """Область карты уходит в очередь ЦЕЛИКОМ, а не первыми 256 тайлами.
+
+    Было так: кэш на 256 проверок «есть ли тайл» и два одинаковых прохода по области —
+    первый наполнял кэш, второй по нему ставил задания. Оба цикла обрезаны по idx < 256,
+    поэтому область больше шестнадцати тайлов по стороне уходила в очередь частично. Без
+    записи в журнал и без отказа: заказал двести километров — получил уголок, и понять
+    это можно было только по тому, что карта не появляется."""
+    src = ctx.root / "src" / "tdeck_mapdownload.cpp"
+    if not src.is_file():
+        ctx.note("     SKIP map_area_queue_test: закачки карты рядом нет")
+        return
+    prelude = """#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define FIELD 64
+extern bool asked[FIELD][FIELD];
+extern int  askedN;
+extern bool present[FIELD][FIELD];
+#define TDECK_DBG(...) do { } while (0)
+static bool tdeckMapDownloadTileExists(int, int x, int y) { return present[x][y]; }
+static bool tdeckMapDownloadAddTile(int, int x, int y) {
+    if (!asked[x][y]) { asked[x][y] = true; askedN++; }
+    return true;
+}
+"""
+    for sig in ("static void mapAddArea(",
+                "void tdeckMapDownloadAddRect(",
+                "void tdeckMapDownloadAddCircle("):
+        try:
+            prelude += ctx.grab(src, sig) + "\n"
+        except RuntimeError:
+            ctx.check("вырезана %s" % sig.rstrip("("), False,
+                      "функции нет — постановка области в очередь перестроена?")
+            return
+    # Объявления заказанного идут ПОСЛЕ вырезанных функций: в main они определяются, а
+    # extern выше даёт их видеть заглушкам.
+    body = MAPAREA_MAIN.replace("static bool asked[FIELD][FIELD];", "bool asked[FIELD][FIELD];")
+    body = body.replace("static int  askedN = 0;", "int askedN = 0;")
+    body = body.replace("static bool present[FIELD][FIELD];", "bool present[FIELD][FIELD];")
+    body = body.replace("#define FIELD 64\n", "")
+    ok, out = ctx.host_run(prelude + body, "maparea.cpp", "область карты в очередь")
+    if ok is None:
+        return
+    ctx.check("область карты: заказана целиком", ok, out.strip()[:600])
+
+
+def png_memory_test(ctx):
+    """Декодер PNG берёт крупное из PSRAM и не молчит, когда памяти нет.
+
+    Внутренней памяти на плате 320 КБ, и она же самый дефицитный ресурс. А декодер просит
+    много: палитровый тайл 256x256 — это 64 КБ под распакованные строки (h * (stride+1)),
+    RGB того же размера — под двести. Остальной крупный код давно кладёт такое в PSRAM;
+    декодер был исключением, и отказ у него к тому же молчал — `goto done` без единого
+    слова, то есть тайл просто не появлялся, и понять почему было неоткуда."""
+    src = ctx.root / "src" / "tdeck_png.cpp"
+    if not src.is_file():
+        ctx.note("     SKIP png_memory_test: декодера рядом нет")
+        return
+    t = src.read_text(encoding="utf-8")
+    # Смотрим ТЕЛО функции разбора, а не весь файл: мелкие malloc в нём законны.
+    try:
+        dec = ctx.grab(src, "bool tdeckPngDecode565(")
+    except RuntimeError:
+        ctx.check("декодер на месте", False, "tdeckPngDecode565 не нашлась")
+        return
+    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
+                      for ln in dec.splitlines())
+    ctx.check("строки и IDAT берутся не из внутренней памяти",
+              re.search(r"raw\s*=\s*\(uint8_t\*\)\s*pngBigAlloc", code) is not None
+              and re.search(r"idatBuf\s*=\s*\(uint8_t\*\)\s*pngBigAlloc", code) is not None,
+              "самые большие буферы декодера снова идут из внутреннего хипа: палитровый "
+              "тайл это 64 КБ, RGB — под двести")
+    ctx.check("крупное пробует PSRAM прежде внутренней памяти",
+              re.search(r"pngBigAlloc[\s\S]{0,400}MALLOC_CAP_SPIRAM", t) is not None,
+              "pngBigAlloc не спрашивает PSRAM — тогда он ничем не отличается от malloc")
+    ctx.check("размер картинки ограничен",
+              "PNG_RAW_MAX" in code,
+              "предела на размер нет: порченый заголовок попросит гигабайты, и отказ "
+              "придёт позже и глуше")
+    ctx.check("нехватка памяти попадает в журнал",
+              re.search(r"if\s*\(!d \|\| !raw[\s\S]{0,200}TDECK_DBG", code) is not None,
+              "отказ по памяти снова молчит: тайл не появится, а причины в журнале не "
+              "будет")
+
+
 def trackball_step_debounce_test(ctx):
     """Щелчки трекбола за полсекунды — это один шаг, а не несколько.
 
