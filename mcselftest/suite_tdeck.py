@@ -983,6 +983,128 @@ static void storeTouch() { storeDirty = true; }
     ctx.check("узлы на карте: список сошёлся", ok, out.strip()[:600])
 
 
+ZOOM_MAIN = r"""
+#include <stdio.h>
+
+static int fails = 0;
+static void zcap(const char* what, int got, int want) {
+    if (got != want) { printf("зум: %s: получили %d, ждали %d\n", what, got, want); fails++; }
+}
+static void zccap(const char* what, int got) {
+    if (!got) { printf("зум: %s: ложь\n", what); fails++; }
+}
+
+int main() {
+    // Шкала обязана доходить до края. Именно здесь она и врала: квадратиков было
+    // «половина уровней с округлением вверх», то есть на один больше, чем шкала умеет
+    // заполнить, и на самом близком зуме последний оставался пустым — указатель обещал
+    // запас приближения, которого нет.
+    zcap("квадратиков ровно половина уровней", ZOOM_CELLS, ZOOM_STEPS / 2);
+    {
+        int full = -1; bool half = true;
+        zoomCells(ZOOM_STEPS - 1, &full, &half);
+        zcap("на пределе закрашены все квадратики", full, ZOOM_CELLS);
+        zccap("на пределе половинки нет", !half);
+    }
+    {
+        int full = -1; bool half = true;
+        zoomCells(0, &full, &half);
+        zcap("на дальнем краю не закрашен ни один", full, 0);
+        zccap("на дальнем краю половинки нет", !half);
+    }
+    // Каждый уровень виден отдельно: пара «целых + половинка» своя у каждого. Без этого
+    // шкала могла бы выглядеть одинаково на двух разных зумах.
+    for (int a = 0; a < ZOOM_STEPS; a++)
+        for (int b = a + 1; b < ZOOM_STEPS; b++) {
+            int fa = 0, fb = 0; bool ha = false, hb = false;
+            zoomCells(a, &fa, &ha);
+            zoomCells(b, &fb, &hb);
+            if (fa == fb && ha == hb) {
+                printf("зум: уровни %d и %d выглядят одинаково\n", a, b);
+                fails++;
+            }
+        }
+    // Закрашенного не бывает больше, чем квадратиков.
+    for (int l = 0; l < ZOOM_STEPS; l++) {
+        int f = 0; bool h = false;
+        zoomCells(l, &f, &h);
+        if (f > ZOOM_CELLS || (h && f >= ZOOM_CELLS)) {
+            printf("зум: уровень %d не влезает в шкалу: целых %d, половинка %d\n", l, f, (int)h);
+            fails++;
+        }
+    }
+    // Касание достаёт оба края шкалы и идёт по ней без провалов. По квадратикам уровень
+    // не вычислить: их вдвое меньше, и край шкалы касанием не достаётся вовсе.
+    zcap("касание у левого края — дальний обзор", zoomLevelAt(ZOOM_X0), 0);
+    zcap("касание у правого края — предел", zoomLevelAt(ZOOM_X0 + ZOOM_W), ZOOM_STEPS - 1);
+    zcap("касание левее шкалы не уводит ниже нуля", zoomLevelAt(ZOOM_X0 - 20), 0);
+    zcap("касание правее шкалы не уводит выше предела",
+         zoomLevelAt(ZOOM_X0 + ZOOM_W + 20), ZOOM_STEPS - 1);
+    {
+        int prev = -1, seen = 0;
+        for (int x = ZOOM_X0; x <= ZOOM_X0 + ZOOM_W; x++) {
+            const int l = zoomLevelAt(x);
+            if (l < prev) { printf("зум: касание пошло вспять на x=%d\n", x); fails++; }
+            if (l != prev) { seen++; prev = l; }
+        }
+        zcap("касанием достаётся каждый уровень", seen, ZOOM_STEPS);
+    }
+    if (fails == 0) printf("указатель зума: шкала сошлась\n");
+    return fails == 0 ? 0 : 1;
+}
+"""
+
+
+def map_zoom_scale_test(ctx):
+    """Указатель зума на карте — шкала, которая доходит до обоих краёв.
+
+    Пять квадратиков по два уровня: пусто, половинка, один, полтора… пять. Это
+    одиннадцать положений, и столько же уровней зума (ZOOM_MIN..ZOOM_MAX). Пока
+    квадратиков было «половина уровней с округлением ВВЕРХ», их выходило на один больше,
+    чем шкала умеет заполнить: на самом близком зуме последний оставался пустым, и
+    указатель обещал запас приближения, которого нет. А касание считалось по квадратикам,
+    которых вдвое меньше уровней, — предел шкалы пальцем не достаётся вовсе."""
+    src = ctx.root / "apps" / "gps" / "gps.cpp"
+    if not src.is_file():
+        ctx.note("     SKIP map_zoom_scale_test: приложения карты рядом нет")
+        return
+    t = src.read_text(encoding="utf-8")
+    prelude = """#include <stdint.h>
+#include <stdio.h>
+"""
+    for name in ("MAP_X1", "MAP_Y0", "ZOOM_MIN", "ZOOM_MAX", "ZOOM_STEPS", "ZOOM_CELLS",
+                 "ZOOM_CS", "ZOOM_CGAP", "ZOOM_W", "ZOOM_X0"):
+        m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, t)
+        ctx.check("в карте задан %s" % name, m is not None,
+                  "константа %s не найдена — шкалу зума проверять не на чем" % name)
+        if m is None:
+            return
+        prelude += "#define %s%s\n" % (name, m.group(1))
+    for sig in ("static void zoomCells(", "static int zoomLevelAt("):
+        try:
+            prelude += ctx.grab(src, sig) + "\n"
+        except RuntimeError:
+            ctx.check("вырезана %s" % sig.rstrip("("), False,
+                      "функции нет — шкала зума снова считается внутри рисования?")
+            return
+    ok, out = ctx.host_run(prelude + ZOOM_MAIN, "zoom.cpp", "указатель зума")
+    if ok is None:
+        return
+    ctx.check("указатель зума: шкала сошлась", ok, out.strip()[:600])
+
+    # Что карта умеет показать, то обязана и предзагружать: иначе обзорный зум
+    # открывается в пустоту и ждёт сети.
+    dl = ctx.root / "src" / "tdeck_mapdownload.cpp"
+    if dl.is_file():
+        zmin = re.search(r"(?m)^#define\s+MAPDL_ZMIN\s+(\d+)", dl.read_text(encoding="utf-8"))
+        zlo = re.search(r"(?m)^#define\s+ZOOM_MIN\s+(\d+)", t)
+        ctx.check("предзагрузка доходит до самого дальнего зума карты",
+                  zmin is not None and zlo is not None
+                  and int(zmin.group(1)) <= int(zlo.group(1)),
+                  "MAPDL_ZMIN выше ZOOM_MIN: обзорные уровни карта показывает, но не "
+                  "запасает — они откроются пустыми")
+
+
 def trackball_step_debounce_test(ctx):
     """Щелчки трекбола за полсекунды — это один шаг, а не несколько.
 

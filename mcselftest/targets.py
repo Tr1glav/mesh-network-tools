@@ -114,6 +114,7 @@ def run_tdeck(ctx):
     suite_tdeck.snake_moves_test(ctx)
     suite_tdeck.menu_carousel_test(ctx)
     suite_tdeck.chat_nodes_test(ctx)
+    suite_tdeck.map_zoom_scale_test(ctx)
     suite_tdeck.shadow_frame_test(ctx)
     suite_tdeck.wifi_switch_test(ctx)
     suite_tdeck.touch_calibration_test(ctx)
