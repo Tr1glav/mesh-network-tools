@@ -26,7 +26,7 @@
   английские подписи) и что на кириллице мера больше, чем насчитано по сырым UTF-8 байтам
   (иначе она вообще ничего не меряет).
 """
-import io
+
 import pathlib
 import re
 import shutil
@@ -38,20 +38,21 @@ import tempfile
 # самого заголовка, а не константой: если раскладку в cyrillic.h поменяют, проверка
 # перестанет быть верной без всякой правки здесь.
 def _cp866_slots(ctx):
-    src = (ctx.root / "lib" / "meshcore" / "include" / "cyrillic.h")
+    src = ctx.root / "lib" / "meshcore" / "include" / "cyrillic.h"
     if not src.is_file():
         return None, str(src)
     txt = src.read_text(encoding="utf-8")
-    body = txt[txt.index("uint8_t unicodeToCp866("):]
-    body = body[:body.index("}")]
+    body = txt[txt.index("uint8_t unicodeToCp866(") :]
+    body = body[: body.index("}")]
     slots = {}
     # Диапазоны вида `cp >= 0x0410 && cp <= 0x041F) return 0x80 + (uint8_t)(cp - 0x0410)`.
     # Вычитается именно начало диапазона, поэтому нижняя граница в выражении и есть
     # начало отсчёта — своей группы для неё не заводим.
     for lo, hi, base, sub in re.findall(
-            r"cp\s*>=\s*(0x[0-9A-Fa-f]{4})\s*&&\s*cp\s*<=\s*(0x[0-9A-Fa-f]{4})\)\s*"
-            r"return\s*(0x[0-9A-Fa-f]{2})\s*\+\s*\(uint8_t\)\(cp\s*-\s*(0x[0-9A-Fa-f]{4})\)",
-            body):
+        r"cp\s*>=\s*(0x[0-9A-Fa-f]{4})\s*&&\s*cp\s*<=\s*(0x[0-9A-Fa-f]{4})\)\s*"
+        r"return\s*(0x[0-9A-Fa-f]{2})\s*\+\s*\(uint8_t\)\(cp\s*-\s*(0x[0-9A-Fa-f]{4})\)",
+        body,
+    ):
         lo, hi, base, sub = int(lo, 16), int(hi, 16), int(base, 16), int(sub, 16)
         if sub != lo:
             # Отсчёт не с начала диапазона: раскладка сложнее, чем мы разбираем, и
@@ -71,28 +72,50 @@ def _parse_font(path):
     gi = t.index("Glyphs[] PROGMEM")
     gj = t.index("};", gi)
     glyphs = []
-    for m in re.finditer(r"\{\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(-?\d+),\s*(-?\d+)\s*\}",
-                         t[gi:gj]):
+    for m in re.finditer(r"\{\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(-?\d+),\s*(-?\d+)\s*\}", t[gi:gj]):
         # Порядок полей GFXglyph: bitmapOffset, width, height, xAdvance, xOffset, yOffset.
         glyphs.append(tuple(int(x) for x in m.groups()))
     bi = t.index("Bitmaps[] PROGMEM")
     raster = [int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{2})", t[bi:gi])]
-    m = re.search(r"PROGMEM\s*=\s*\{\s*\(uint8_t\s*\*\).*?,\s*(?:\(GFXglyph\s*\*\)[^,]+,)?"
-                  r"\s*(0x[0-9A-Fa-f]+)\s*,\s*(0x[0-9A-Fa-f]+)\s*,\s*(\d+)\s*\}", t, re.S)
+    m = re.search(
+        r"PROGMEM\s*=\s*\{\s*\(uint8_t\s*\*\).*?,\s*(?:\(GFXglyph\s*\*\)[^,]+,)?"
+        r"\s*(0x[0-9A-Fa-f]+)\s*,\s*(0x[0-9A-Fa-f]+)\s*,\s*(\d+)\s*\}",
+        t,
+        re.S,
+    )
     if not m:
         return None
-    return dict(glyphs=glyphs, raster=raster,
-                first=int(m.group(1), 16), last=int(m.group(2), 16),
-                yAdvance=int(m.group(3)))
+    return {
+        "glyphs": glyphs,
+        "raster": raster,
+        "first": int(m.group(1), 16),
+        "last": int(m.group(2), 16),
+        "yAdvance": int(m.group(3)),
+    }
 
 
 # Латинские двойники кириллических букв: кодовая точка -> ASCII-буква. Список явный, а не
 # «похожие буквы»: автоматический подбор проверял бы сам с собой и пропустил бы ровно тот
 # случай, ради которого написан.
 _TWINS = {
-    0x410: "A", 0x412: "B", 0x415: "E", 0x41A: "K", 0x41C: "M", 0x41D: "H",
-    0x41E: "O", 0x420: "P", 0x421: "C", 0x422: "T", 0x423: "Y", 0x425: "X",
-    0x430: "a", 0x435: "e", 0x43E: "o", 0x440: "p", 0x441: "c", 0x443: "y",
+    0x410: "A",
+    0x412: "B",
+    0x415: "E",
+    0x41A: "K",
+    0x41C: "M",
+    0x41D: "H",
+    0x41E: "O",
+    0x420: "P",
+    0x421: "C",
+    0x422: "T",
+    0x423: "Y",
+    0x425: "X",
+    0x430: "a",
+    0x435: "e",
+    0x43E: "o",
+    0x440: "p",
+    0x441: "c",
+    0x443: "y",
     0x445: "x",
 }
 
@@ -127,8 +150,11 @@ def _font_tables_test(ctx):
     if slots is None:
         ctx.check("раскладка CP866 читается из cyrillic.h", False, why)
         return
-    ctx.check("раскладка CP866 читается из cyrillic.h: %d букв" % len(slots),
-              len(slots) == 66, "разобрано %d слотов, ожидалось 66" % len(slots))
+    ctx.check(
+        "раскладка CP866 читается из cyrillic.h: %d букв" % len(slots),
+        len(slots) == 66,
+        "разобрано %d слотов, ожидалось 66" % len(slots),
+    )
 
     gfx = _gfx_dir(ctx)
     if gfx is None:
@@ -158,13 +184,19 @@ def _font_tables_test(ctx):
             bo, w, h, adv, xo, yo = g[i]
             if w == 0 or h == 0 or adv == 0:
                 missing.append("0x%02X U+%04X пуст" % (slot, cp))
-        ctx.check("%s: все %d букв CP866 на месте" % (new_name, len(slots)),
-                  not missing, "не нарисованы: " + ", ".join(missing[:8]))
+        ctx.check(
+            "%s: все %d букв CP866 на месте" % (new_name, len(slots)),
+            not missing,
+            "не нарисованы: " + ", ".join(missing[:8]),
+        )
 
         # 2. last обязан доставать до последнего слота, иначе последние буквы (я, ё)
         #    выпадут из диапазона шрифта — write() их просто не нарисует.
-        ctx.check("%s: last достаёт до 0xF1" % new_name, f["last"] >= max(slots),
-                  "last = 0x%02X, нужен не меньше 0x%02X" % (f["last"], max(slots)))
+        ctx.check(
+            "%s: last достаёт до 0xF1" % new_name,
+            f["last"] >= max(slots),
+            "last = 0x%02X, нужен не меньше 0x%02X" % (f["last"], max(slots)),
+        )
 
         # 3. Слоты, которых декодер не выдаёт, обязаны быть пустыми: если там окажется
         #    мусор, а кодер когда-нибудь начнёт ими пользоваться, на экране будет мусор.
@@ -176,8 +208,7 @@ def _font_tables_test(ctx):
             bo, w, h = g[slot - f["first"]][:3]
             if w or h or adv_nonzero(g[slot - f["first"]]):
                 alien.append("0x%02X" % slot)
-        ctx.check("%s: незанятые слоты пусты" % new_name, not alien,
-                  "не пусты: " + ", ".join(alien[:8]))
+        ctx.check("%s: незанятые слоты пусты" % new_name, not alien, "не пусты: " + ", ".join(alien[:8]))
 
         # 4. Латиница — байт в байт из библиотеки. Иначе английские подписи поедут, а
         #    заметить это можно только на экране.
@@ -193,10 +224,13 @@ def _font_tables_test(ctx):
             continue
         n_latin = ref["last"] - ref["first"] + 1
         same_glyphs = g[:n_latin] == ref["glyphs"][:n_latin]
-        same_raster = f["raster"][:len(ref["raster"])] == ref["raster"]
-        ctx.check("%s: латиница не тронута" % new_name, same_glyphs and same_raster,
-                  "глифы: %s, растр: %s" % ("совпали" if same_glyphs else "разошлись",
-                                            "совпал" if same_raster else "разошёлся"))
+        same_raster = f["raster"][: len(ref["raster"])] == ref["raster"]
+        ctx.check(
+            "%s: латиница не тронута" % new_name,
+            same_glyphs and same_raster,
+            "глифы: %s, растр: %s"
+            % ("совпали" if same_glyphs else "разошлись", "совпал" if same_raster else "разошёлся"),
+        )
 
         # 5. Базовая линия. Кириллическая буква и её латинский двойник обязаны стоять на
         #    одной линии: сверху Ё выше на 3 пикселя (у неё две точки), а снизу р уходит
@@ -231,15 +265,17 @@ def _font_tables_test(ctx):
             # пикселя: два пикселя на высоте прописной (13) видно глазом, и их ловит эта же
             # проверка.
             if abs((yo + h) - (ryo + rh)) > 1:
-                base_bad.append("U+%04X против '%c': низ %d, у '%c' %d (допуск 1 px)"
-                                % (cp, latin, yo + h, latin, ryo + rh))
+                base_bad.append(
+                    "U+%04X против '%c': низ %d, у '%c' %d (допуск 1 px)" % (cp, latin, yo + h, latin, ryo + rh),
+                )
         # Число реально сверенных пар — в названии проверки, а не в подробности: пустой
         # список сравнений даёт «всё совпало» на самом деле ничего не проверив.
-        ctx.check("%s: кириллица на базовой линии латиницы (%d пар)" % (new_name, checked),
-                  not base_bad and checked == len(_TWINS),
-                  "; ".join(base_bad[:6]) or
-                  ("сверено пар: %d из %d — раскладка слотов разошлась с _TWINS"
-                   % (checked, len(_TWINS))))
+        ctx.check(
+            "%s: кириллица на базовой линии латиницы (%d пар)" % (new_name, checked),
+            not base_bad and checked == len(_TWINS),
+            "; ".join(base_bad[:6])
+            or ("сверено пар: %d из %d — раскладка слотов разошлась с _TWINS" % (checked, len(_TWINS))),
+        )
 
 
 def adv_nonzero(gl):
@@ -262,23 +298,33 @@ def _wiring_test(ctx):
         txt = path.read_text(encoding="utf-8")
         body = _write_body(txt)
         if not body:
-            ctx.check("%s: найден write() с веткой на пропорциональный шрифт" % what, False,
-                      "в %s нет write(uint8_t) либо нет ветки `if (gfxFont)`" % rel)
+            ctx.check(
+                "%s: найден write() с веткой на пропорциональный шрифт" % what,
+                False,
+                "в %s нет write(uint8_t) либо нет ветки `if (gfxFont)`" % rel,
+            )
             continue
         # Короткое замыкание `if (gfxFont) return Adafruit_GFX::write(c);` — ровно то, что
         # было: байт UTF-8 уходит в библиотеку и теряется. Проверяется именно тело
         # write(), а не всё mentions: комментарий можно переписать вместе с откатом.
-        ctx.check("%s: UTF-8 переводится в CP866 при шрифте" % what,
-                  "writeUtf8GfxByte" in body and not re.search(r"gfxFont[^;{}]*\)\s*"
-                                                               r"return\s+Adafruit_GFX::write", body),
-                  "в write() нет вызова writeUtf8GfxByte или есть прямое возвращение "
-                  "Adafruit_GFX::write(c) — русский текст пропадёт целиком")
+        ctx.check(
+            "%s: UTF-8 переводится в CP866 при шрифте" % what,
+            "writeUtf8GfxByte" in body
+            and not re.search(
+                r"gfxFont[^;{}]*\)\s*"
+                r"return\s+Adafruit_GFX::write",
+                body,
+            ),
+            "в write() нет вызова writeUtf8GfxByte или есть прямое возвращение "
+            "Adafruit_GFX::write(c) — русский текст пропадёт целиком",
+        )
         # Встроенный шрифт 6x8 обязан остаться на своём пути: там кириллица есть, и
         # сломанный путь откатился бы, а отрисовка 6x8 — нет.
-        ctx.check("%s: встроенный шрифт 6x8 не тронут" % what,
-                  "utf8cp866::processByte" in body,
-                  "в write() нет utf8cp866::processByte: встроенный 6x8 с кириллицей "
-                  "перестал бы рисоваться")
+        ctx.check(
+            "%s: встроенный шрифт 6x8 не тронут" % what,
+            "utf8cp866::processByte" in body,
+            "в write() нет utf8cp866::processByte: встроенный 6x8 с кириллицей перестал бы рисоваться",
+        )
 
     # Мера ширины обязана идти по CP866-байтам. getTextBounds() считает сырые байты UTF-8,
     # то есть две буквы русской строки превращает в две буквы плюс хвост: подпись уезжает
@@ -289,9 +335,12 @@ def _wiring_test(ctx):
         return
     txt = theme.read_text(encoding="utf-8")
     body = _func_body(txt, "static inline int textWF(")
-    ctx.check("textWF меряет по CP866-байтам", bool(body) and "measureGfxFontText" in body,
-              "textWF не зовёт measureGfxFontText: ширина русской подписи считается по сырым "
-              "байтам UTF-8, то есть почти вдвое больше настоящей, и текст уезжает из центра")
+    ctx.check(
+        "textWF меряет по CP866-байтам",
+        bool(body) and "measureGfxFontText" in body,
+        "textWF не зовёт measureGfxFontText: ширина русской подписи считается по сырым "
+        "байтам UTF-8, то есть почти вдвое больше настоящей, и текст уезжает из центра",
+    )
 
 
 def _func_body(txt, signature):
@@ -306,7 +355,7 @@ def _func_body(txt, signature):
         elif txt[i] == "}":
             depth -= 1
             if depth == 0:
-                return txt[start:i + 1]
+                return txt[start : i + 1]
     return ""
 
 
@@ -322,7 +371,7 @@ def _write_body(txt):
         elif txt[i] == "}":
             depth -= 1
             if depth == 0:
-                return txt[m.start():i + 1]
+                return txt[m.start() : i + 1]
     return ""
 
 
@@ -385,8 +434,10 @@ def _host_numbers_test(ctx):
     """
     gfx = _gfx_dir(ctx)
     if gfx is None:
-        ctx.note("     Adafruit GFX Library нет — численная проверка шрифта пропущена "
-                 "(её делает шаг сборки предпросмотра в CI, после сборки прошивки)")
+        ctx.note(
+            "     Adafruit GFX Library нет — численная проверка шрифта пропущена "
+            "(её делает шаг сборки предпросмотра в CI, после сборки прошивки)",
+        )
         return
     if not shutil.which("g++"):
         ctx.note("SKIP g++ не найден — численная проверка шрифта пропущена")
@@ -398,40 +449,63 @@ def _host_numbers_test(ctx):
     hr = ctx.root / "host_render"
     probe_dir = pathlib.Path(tempfile.mkdtemp(prefix="fontprobe-"))
     probe = probe_dir / "probe.cpp"
-    probe.write_text("".join([
-        "// Служебная сборка: тот же предпросмотр, но вместо PNG печатаются числа.\n",
-        "// Файл создаётся проверкой и в репозиторий не входит.\n",
-        '#include <stdio.h>\n#include <string.h>\n',
-        '#include "HostPanel.h"\n#include "tdeck_canvas.h"\n',
-        '#include "tdeck_theme.h"\n#include "tdeck_palette.h"\n\n',
-        "#define W 320\n#define H 240\n",
-        "class CountingPanel : public HostPanel {\npublic:\n",
-        "    CountingPanel() : HostPanel(W, H) { setTextColor(COL_TEXT); }\n",
-        "    void drawPixel(int16_t x, int16_t y, uint16_t c) override {\n",
-        "        if (x >= 0 && x < _width && y >= 0 && y < _height) _lit++;\n",
-        "        HostPanel::drawPixel(x, y, c);\n    }\n",
-        "    void reset() { _lit = 0; }\n    long lit() const { return _lit; }\n",
-        "private:\n    long _lit = 0;\n};\n\n",
-        PROBE_MAIN,
-    ]), encoding="utf-8")
+    probe.write_text(
+        "".join(
+            [
+                "// Служебная сборка: тот же предпросмотр, но вместо PNG печатаются числа.\n",
+                "// Файл создаётся проверкой и в репозиторий не входит.\n",
+                "#include <stdio.h>\n#include <string.h>\n",
+                '#include "HostPanel.h"\n#include "tdeck_canvas.h"\n',
+                '#include "tdeck_theme.h"\n#include "tdeck_palette.h"\n\n',
+                "#define W 320\n#define H 240\n",
+                "class CountingPanel : public HostPanel {\npublic:\n",
+                "    CountingPanel() : HostPanel(W, H) { setTextColor(COL_TEXT); }\n",
+                "    void drawPixel(int16_t x, int16_t y, uint16_t c) override {\n",
+                "        if (x >= 0 && x < _width && y >= 0 && y < _height) _lit++;\n",
+                "        HostPanel::drawPixel(x, y, c);\n    }\n",
+                "    void reset() { _lit = 0; }\n    long lit() const { return _lit; }\n",
+                "private:\n    long _lit = 0;\n};\n\n",
+                PROBE_MAIN,
+            ],
+        ),
+        encoding="utf-8",
+    )
 
     fonts_cpp = ctx.root / "src" / "tdeck_fonts.cpp"
     with tempfile.TemporaryDirectory(prefix="fontprobe-") as tmp:
         exe = pathlib.Path(tmp) / "probe"
-        cmd = ["g++", "-std=c++17", "-O1", "-DARDUINO=10819",
-               "-I", str(hr / "shim"), "-I", str(hr / "display"), "-I", str(ctx.root / "include"),
-               "-I", str(ctx.root / "apps" / "calendar"), "-I", str(gfx),
-               "-idirafter", str(ctx.root / "lib" / "meshcore" / "include"),
-               str(probe), str(fonts_cpp), str(gfx / "Adafruit_GFX.cpp"),
-               "-o", str(exe), "-lz", "-lm"]
+        cmd = [
+            "g++",
+            "-std=c++17",
+            "-O1",
+            "-DARDUINO=10819",
+            "-I",
+            str(hr / "shim"),
+            "-I",
+            str(hr / "display"),
+            "-I",
+            str(ctx.root / "include"),
+            "-I",
+            str(ctx.root / "apps" / "calendar"),
+            "-I",
+            str(gfx),
+            "-idirafter",
+            str(ctx.root / "lib" / "meshcore" / "include"),
+            str(probe),
+            str(fonts_cpp),
+            str(gfx / "Adafruit_GFX.cpp"),
+            "-o",
+            str(exe),
+            "-lz",
+            "-lm",
+        ]
         build = subprocess.run(cmd, capture_output=True, text=True)
         if build.returncode != 0:
             ctx.check("сборка пробы кириллицы", False, build.stderr.strip()[-400:])
             return
         run = subprocess.run([str(exe)], capture_output=True, text=True)
         if run.returncode != 0:
-            ctx.check("прогон пробы кириллицы", False,
-                      (run.stdout + run.stderr).strip()[-400:])
+            ctx.check("прогон пробы кириллицы", False, (run.stdout + run.stderr).strip()[-400:])
             return
     rows = {}
     for line in run.stdout.splitlines():
@@ -462,35 +536,43 @@ def _host_numbers_test(ctx):
         # попадает). На откате получается 295 пикселей против 514 — больше половины, так
         # что «зажглось хоть что-то» пропустило бы сломанный код. Настоящая строка
         # рисует 90+% латинской, и порог стоит выше.
-        ctx.check("%s: русская строка рисуется целиком (%d против %d пикселей у латинской)"
-                  % (name, lit_cyr, lit_lat), lit_cyr * 10 >= lit_lat * 8,
-                  "зажглось %d пикселей против %d: русская строка рисуется частично, "
-                  "значит байты UTF-8 не переводятся в CP866" % (lit_cyr, lit_lat))
+        ctx.check(
+            "%s: русская строка рисуется целиком (%d против %d пикселей у латинской)" % (name, lit_cyr, lit_lat),
+            lit_cyr * 10 >= lit_lat * 8,
+            "зажглось %d пикселей против %d: русская строка рисуется частично, "
+            "значит байты UTF-8 не переводятся в CP866" % (lit_cyr, lit_lat),
+        )
 
         # Курсор прошёл мимо кириллицы. Проверено на откате: без перевода курсор встаёт
         # после третьего знака («12/40» — это последние пять символов строки), то есть
         # заметно раньше конца. Порог — две трети латинской строки: у настоящей кириллицы
         # ширина примерно та же, у сломанной — меньше половины.
-        ctx.check("%s: курсор прошёл по всей русской строке" % name,
-                  adv_cyr * 3 >= adv_lat * 2,
-                  "курсор +%d против +%d у латинской строки: кириллические байты не "
-                  "адресовались, нарисован только хвост" % (adv_cyr, adv_lat))
+        ctx.check(
+            "%s: курсор прошёл по всей русской строке" % name,
+            adv_cyr * 3 >= adv_lat * 2,
+            "курсор +%d против +%d у латинской строки: кириллические байты не "
+            "адресовались, нарисован только хвост" % (adv_cyr, adv_lat),
+        )
 
         # Мера ширины совпадает с библиотечной на латинице. Иначе английские подписи,
         # центрируемые этой мерой, поедут — то есть правка кириллицы испортила бы то,
         # ради чего её делали.
-        ctx.check("%s: мера ширины на латинице не поехала" % name, mine_lat == gfx_lat,
-                  "textWF вернул %d, getTextBounds %d" % (mine_lat, gfx_lat))
+        ctx.check(
+            "%s: мера ширины на латинице не поехала" % name,
+            mine_lat == gfx_lat,
+            "textWF вернул %d, getTextBounds %d" % (mine_lat, gfx_lat),
+        )
 
         # Мера на кириллице больше, чем насчитано по сырым UTF-8 байтам: сырые байты —
         # это не буквы, и библиотечная мера по ним заведомо меньше. Расхождение означало
         # бы, что наша мера кириллицу не считает.
         _, _, mine_s_lat, _ = rows[(name, short_lat)]
         _, _, mine_s_cyr, _ = rows[(name, short_cyr)]
-        ctx.check("%s: мера ширины считает кириллицу" % name,
-                  mine_s_cyr > 0 and mine_s_cyr > mine_s_lat / 2,
-                  "textWF для «Настройки» вернул %d, а для «Settings» %d: кириллица не "
-                  "меряется" % (mine_s_cyr, mine_s_lat))
+        ctx.check(
+            "%s: мера ширины считает кириллицу" % name,
+            mine_s_cyr > 0 and mine_s_cyr > mine_s_lat / 2,
+            "textWF для «Настройки» вернул %d, а для «Settings» %d: кириллица не меряется" % (mine_s_cyr, mine_s_lat),
+        )
 
 
 def cyrillic_font_test(ctx):

@@ -5,11 +5,139 @@
 копии успели разойтись. Здесь она одна, а форки отличаются только тем, какие наборы проверок
 запускаются и с какими путями: см. mcselftest/targets.py.
 """
+
 import atexit
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
+
+
+def _sig_re(signature):
+    r"""Регексп по фрагменту исходника, устойчивый к расстановке пробелов.
+
+    clang-format пишет «char *x», а сигнатуры в проверках исторически писались «char* x»:
+    разница только в пробелах вокруг «*», и проверка не должна от неё зависеть. «*»
+    окружается необязательными пробелами, а пробег пробельных символов (в том числе
+    переводы строк) считается взаимозаменяемым: clang-format переносит длинные списки
+    иначе, чем редактор человека.
+
+    Между двумя словесными символами пробел всё же обязателен. Если ставить там «\s*»,
+    шаблон «int\s*meshTxQueuedCount» совпадёт и с «printmeshTxQueuedCountX» — проверка
+    «нашла» бы сигнатуру там, где её нет. Рядом с пунктуацией пробел необязателен.
+    """
+    # Внешние пробелы фрагмента в шаблон не попадают. Иначе ведущий «\s*» съедал бы
+    # перевод строки ПЕРЕД фрагментом, и подстановка (src_replace) приклеивалась к
+    # предыдущей строке — а если та была комментарием «//», первая строка замены молча
+    # уходила в комментарий. Литеральный поиск в src_search идёт по полному фрагменту,
+    # так что точные совпадения от этого не меняются.
+    pat = re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", signature.strip())
+    pat = pat.replace(r"\*", r"\s*\*\s*")
+
+    def _space(m):
+        left = pat[m.start() - 1 : m.start()]
+        right = pat[m.end() : m.end() + 1]
+        word = str.isalnum
+        if left and right and (word(left) or left == "_") and (word(right) or right == "_"):
+            return r"\s+"
+        return r"\s*"
+
+    return re.sub(r"\s+", _space, pat)
+
+
+def src_search(text, fragment, pos=0):
+    r"""Границы фрагмента исходника: (начало, конец) либо None.
+
+    Сначала литеральный поиск, и только при промахе — нечувствительный к пробелам.
+    Порядок важен: литерал сохраняет прежнее поведение везде, где текст не менялся,
+    и позиционные маркеры вроде "\n}\n" продолжают значить ровно то, что значили
+    (фаззи-шаблон для них — это «\s*\}\s*», то есть первая же закрывающая скобка:
+    срез обрывался на ней, и проверки искали код в куске, который до него не доходил).
+    Фаззи-поиск остаётся запасным путём для фрагментов, которые разъехались по строкам
+    после прогона clang-format.
+    """
+    i = text.find(fragment, pos)
+    if i >= 0:
+        return i, i + len(fragment)
+    m = re.search(_sig_re(fragment), text[pos:])
+    if m is None:
+        return None
+    return pos + m.start(), pos + m.end()
+
+
+def src_index(text, fragment, pos=0):
+    """Позиция фрагмента исходника. Бросает ValueError, если его нет вовсе."""
+    found = src_search(text, fragment, pos)
+    if found is None:
+        raise ValueError("фрагмент исходника не найден: %s" % fragment)
+    return found[0]
+
+
+def src_replace(text, fragment, replacement):
+    """Заменяет фрагмент исходника, не глядя на расстановку пробелов.
+
+    Нужна проверкам, которые подменяют кусок настоящего кода своей заглушкой перед
+    сборкой на хосте: литеральный replace() после переноса строк форматтером молча
+    не срабатывал, и проверка превращалась в фиктивную.
+    """
+    found = src_search(text, fragment)
+    if found is None:
+        return text
+    a, b = found
+    return text[:a] + replacement + text[b:]
+
+
+_C_EXT = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+# «char *x» → «char* x»: приводим указатели к виду, к которому писались проверки.
+_PTR_RIGHT = re.compile(r"([A-Za-z0-9_>])\s+\*([A-Za-z_])")
+# «__attribute__((weak)) void f()» → атрибут отдельной строкой. clang-format приклеивает
+# атрибут к объявлению, а разбор заглушек (`_hook_defs`) ждёт тип в начале строки.
+_ATTR = re.compile(r"(__attribute__\s*\(\([^\n]*?\)\))\s+(?=[A-Za-z_])")
+
+
+def normalize_source(text):
+    """Приводит исходник к «человеческому» виду, к которому писались проверки.
+
+    Проверки сравнивают вырезанные из исходников фрагменты как обычный текст, поэтому
+    расстановка пробелов форматтером не должна их ломать. clang-format пишет указатели
+    как «char *x», а исторически в дереве было «char* x» — возвращаем прежний вид.
+    Атрибуты (`__attribute__((weak))`) clang-format приклеивает к объявлению; возвращаем
+    их на отдельную строку — так их видят разборщики заглушек. Переводы строк не
+    схлопываем: на них держатся якоря (?m)^ в шаблонах.
+    """
+    text = _PTR_RIGHT.sub(r"\1* \2", text)
+    return _ATTR.sub(r"\1\n", text)
+
+
+_orig_read_text = pathlib.Path.read_text
+
+
+def _read_text(self, *args, **kwargs):
+    text = _orig_read_text(self, *args, **kwargs)
+    if self.suffix.lower() in _C_EXT:
+        return normalize_source(text)
+    return text
+
+
+def install_source_normalization():
+    """Делает чтение исходников C/C++ нечувствительным к стилю форматтера.
+
+    Подмена глобальная и потому нарочно узкая: трогаем только файлы с расширением C/C++
+    и только на время прогона — selftest.py снимает её через try/finally
+    (`uninstall_source_normalization`). Проверки читают файлы как
+    `(ctx.core / "src/x.cpp").read_text()`, поэтому подменять приходится сам метод
+    чтения, а не каждый вызов; чище было бы править сигнатуры в самих проверках, но их
+    там сотни.
+
+    Повторный вызов безвреден: исходный метод запомнен один раз, на импорте модуля.
+    """
+    pathlib.Path.read_text = _read_text
+
+
+def uninstall_source_normalization():
+    """Возвращает pathlib.Path.read_text на место. Парная к install_*."""
+    pathlib.Path.read_text = _orig_read_text
 
 
 class Ctx:
@@ -45,8 +173,7 @@ class Ctx:
     # ===== Результат =====
 
     def check(self, name, ok, detail=""):
-        print(("OK   " if ok else "FAIL ") + name +
-              ((" — " + detail) if detail and not ok else ""))
+        print(("OK   " if ok else "FAIL ") + name + ((" — " + detail) if detail and not ok else ""))
         if not ok:
             self.failures.append(name)
         return ok
@@ -68,17 +195,16 @@ class Ctx:
         # ровном месте. Не нашлось по подсказке (в том числе если файла вовсе нет) — ищем
         # сигнатуру по всем исходникам прошивки и ядра.
         path = hint if isinstance(hint, pathlib.Path) else self.root / hint
-        if not (path.is_file() and signature in path.read_text(encoding="utf-8")):
+        if not (path.is_file() and src_search(path.read_text(encoding="utf-8"), signature)):
             dirs = (self.root / "lib/meshcore/src", self.root / "src", self.core / "src")
             for cand in sorted(p for d in dirs if d.is_dir() for p in d.glob("*.cpp")):
-                if signature in cand.read_text(encoding="utf-8"):
+                if src_search(cand.read_text(encoding="utf-8"), signature):
                     path = cand
                     break
             else:
-                raise RuntimeError("не найдена функция %s (прошивка: %s, ядро: %s)"
-                                   % (signature, self.root, self.core))
+                raise RuntimeError("не найдена функция %s (прошивка: %s, ядро: %s)" % (signature, self.root, self.core))
         src = path.read_text(encoding="utf-8")
-        start = src.index(signature)
+        start = src_index(src, signature)
         depth = 0
         for i in range(src.index("{", start), len(src)):
             if src[i] == "{":
@@ -86,7 +212,7 @@ class Ctx:
             elif src[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    return src[start:i + 1]
+                    return src[start : i + 1]
         raise RuntimeError("не найден конец функции " + signature)
 
     def span(self, hint, start_marker, end_marker):
@@ -98,9 +224,11 @@ class Ctx:
         """
         path = hint if isinstance(hint, pathlib.Path) else self.root / hint
         src = path.read_text(encoding="utf-8")
-        a = src.index(start_marker)
-        b = src.index(end_marker, a)
-        return src[a:b + len(end_marker)]
+        a = src_index(src, start_marker)
+        end = src_search(src, end_marker, a)
+        if end is None:
+            raise RuntimeError("не найден конечный маркер %r (файл: %s)" % (end_marker, path))
+        return src[a : end[1]]
 
     # ===== Сборка на хосте =====
 
@@ -116,9 +244,10 @@ class Ctx:
         exe = pathlib.Path(tmp) / "a.out"
         src.write_text(code, encoding="utf-8")
         build = subprocess.run(
-            ["g++", "-std=c++17", "-fsanitize=address,undefined", "-g",
-             str(src), "-o", str(exe)],
-            capture_output=True, text=True)
+            ["g++", "-std=c++17", "-fsanitize=address,undefined", "-g", str(src), "-o", str(exe)],
+            capture_output=True,
+            text=True,
+        )
         if build.returncode != 0:
             return None, build.stderr
         return exe, ""

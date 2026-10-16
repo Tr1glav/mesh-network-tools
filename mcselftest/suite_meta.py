@@ -10,6 +10,7 @@
 Поэтому здесь проверяется не прошивка, а связность: каждая написанная проверка обязана быть
 кем-то вызвана, и каждая цель обязана быть запускаемой.
 """
+
 import ast
 import contextlib
 import io
@@ -24,8 +25,7 @@ from . import harness, suite_core
 def _defined_tests(path):
     """Имена функций-проверок, определённых в модуле: всё, что кончается на _test."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    return {n.name for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name.endswith("_test")}
+    return {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name.endswith("_test")}
 
 
 def _called_names(path):
@@ -58,12 +58,10 @@ def _snapshot_ref(repo):
     такие проверки пропускаются с записью в журнал. На ветке — в рабочем дереве и в своём
     CI репозитория — проверяется всё.
     """
-    r = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=str(repo),
-                       capture_output=True, text=True)
+    r = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=str(repo), capture_output=True, text=True)
     if r.returncode == 0:
-        return None                 # голова на ветке — это живая копия, а не снимок
-    d = subprocess.run(["git", "describe", "--tags", "--always"], cwd=str(repo),
-                       capture_output=True, text=True)
+        return None  # голова на ветке — это живая копия, а не снимок
+    d = subprocess.run(["git", "describe", "--tags", "--always"], cwd=str(repo), capture_output=True, text=True)
     return (d.stdout or "").strip() or "отсоединённая голова"
 
 
@@ -101,10 +99,10 @@ def ci_present_test(ctx, tree):
     Проверка намеренно смотрит на все четыре репозитория: заводить CI по одному легко, а
     забыть про четвёртый — ещё легче."""
     want = {
-        "mesh-network-core":  "проверки ядра: суть репозитория — протокол, крипто, кадры",
+        "mesh-network-core": "проверки ядра: суть репозитория — протокол, крипто, кадры",
         "mesh-network-tools": "проверки самих проверок: сломанный набор роняет чужие сборки",
-        "meshcore-fork":      "сборка прошивок Heltec и релиз",
-        "tdeck":              "сборка прошивки T-Deck и релиз",
+        "meshcore-fork": "сборка прошивок Heltec и релиз",
+        "tdeck": "сборка прошивки T-Deck и релиз",
     }
     seen = 0
     for sub, why in want.items():
@@ -114,18 +112,18 @@ def ci_present_test(ctx, tree):
         seen += 1
         snap = _snapshot_ref(repo)
         if snap:
-            ctx.note("SKIP %s: выложен по пину (%s), а не рабочей копией — свой CI "
-                     "проверяется по ветке" % (sub, snap))
+            ctx.note("SKIP %s: выложен по пину (%s), а не рабочей копией — свой CI проверяется по ветке" % (sub, snap))
             continue
         wf = repo / ".github" / "workflows"
         files = sorted(wf.glob("*.yml")) + sorted(wf.glob("*.yaml")) if wf.is_dir() else []
-        ctx.check("у %s есть workflow" % sub, bool(files),
-                  "нет ни одного файла в .github/workflows — %s" % why)
+        ctx.check("у %s есть workflow" % sub, bool(files), "нет ни одного файла в .github/workflows — %s" % why)
         for f in files:
             txt = f.read_text(encoding="utf-8")
-            ctx.check("%s/%s запускается на push" % (sub, f.name),
-                      re.search(r"^\s*push\s*:", txt, re.M) is not None,
-                      "workflow есть, но на push не запускается — значит не запускается никогда")
+            ctx.check(
+                "%s/%s запускается на push" % (sub, f.name),
+                re.search(r"^\s*push\s*:", txt, re.M) is not None,
+                "workflow есть, но на push не запускается — значит не запускается никогда",
+            )
     if not seen:
         ctx.note("SKIP ci_present_test: репозиториев рядом нет")
 
@@ -144,16 +142,20 @@ def no_secrets_test(ctx, tree):
     # Маркеры собираются из частей намеренно: написанные целиком, они сделали бы ЭТОТ файл
     # «похожим на секрет», и проверка падала бы на себе самой — так и случилось при первом
     # прогоне. Склейка решает это без списка исключений, который пришлось бы поддерживать.
-    marks = tuple("github_" + "pat_" for _ in (0,)) + ("gh" + "p_", "gh" + "o_", "gh" + "s_",
-                  "BEGIN OPENSSH PRIVATE " + "KEY", "BEGIN RSA PRIVATE " + "KEY")
+    marks = tuple("github_" + "pat_" for _ in (0,)) + (
+        "gh" + "p_",
+        "gh" + "o_",
+        "gh" + "s_",
+        "BEGIN OPENSSH PRIVATE " + "KEY",
+        "BEGIN RSA PRIVATE " + "KEY",
+    )
     seen = 0
     for sub in ("mesh-network-core", "mesh-network-tools", "meshcore-fork", "tdeck"):
         repo = pathlib.Path(tree) / sub
         if not (repo / ".git").exists():
             continue
         seen += 1
-        r = subprocess.run(["git", "ls-files", "-z"], cwd=str(repo),
-                           capture_output=True, text=True)
+        r = subprocess.run(["git", "ls-files", "-z"], cwd=str(repo), capture_output=True, text=True)
         files = [f for f in r.stdout.split("\0") if f]
         bad = []
         for rel in files:
@@ -168,26 +170,24 @@ def no_secrets_test(ctx, tree):
                 if m in txt:
                     bad.append("%s (%s)" % (rel, m))
                     break
-        ctx.check("%s не держит секретов в отслеживаемых файлах" % sub, not bad,
-                  "похоже на секрет: " + "; ".join(bad))
+        ctx.check("%s не держит секретов в отслеживаемых файлах" % sub, not bad, "похоже на секрет: " + "; ".join(bad))
         # Правило в .gitignore — про то, как репозиторий поддерживается СЕЙЧАС, а снимок по
         # пину этого не знает: см. _snapshot_ref. Сам поиск секретов выше остаётся — он про
         # найденное, а найденное в старом теге тоже надо увидеть.
         snap = _snapshot_ref(repo)
         if snap:
-            ctx.note("SKIP %s игнорирует .env: выложен по пину (%s) — правило проверяется "
-                     "по ветке" % (sub, snap))
+            ctx.note("SKIP %s игнорирует .env: выложен по пину (%s) — правило проверяется по ветке" % (sub, snap))
             continue
         # Нужна именно СТРОКА-правило, а не упоминание: слово «.env» стоит и в комментарии
         # рядом с ним, и проверка «есть ли .env в тексте» проходила после удаления правила —
         # откат это показал.
-        gi = (repo / ".gitignore")
-        lines = [ln.strip() for ln in gi.read_text(encoding="utf-8").splitlines()] \
-            if gi.is_file() else []
-        ctx.check("%s игнорирует .env" % sub,
-                  any(ln in (".env", "/.env", ".env*", "*.env") for ln in lines),
-                  "в .gitignore нет правила на .env: случайная копия файла с токеном уедет "
-                  "в коммит")
+        gi = repo / ".gitignore"
+        lines = [ln.strip() for ln in gi.read_text(encoding="utf-8").splitlines()] if gi.is_file() else []
+        ctx.check(
+            "%s игнорирует .env" % sub,
+            any(ln in (".env", "/.env", ".env*", "*.env") for ln in lines),
+            "в .gitignore нет правила на .env: случайная копия файла с токеном уедет в коммит",
+        )
     if not seen:
         ctx.note("SKIP no_secrets_test: репозиториев рядом нет")
 
@@ -220,52 +220,69 @@ def pipeline_test(ctx, tree):
             continue
         seen += 1
         txt = rel.read_text(encoding="utf-8")
-        ctx.check("release.py %s умеет сверять core.ref с локальным ядром" % name,
-                  "def core_pin_covers_local" in txt,
-                  "нет сверки: прошивка уедет собранной с ядром, которого нет в пине")
+        ctx.check(
+            "release.py %s умеет сверять core.ref с локальным ядром" % name,
+            "def core_pin_covers_local" in txt,
+            "нет сверки: прошивка уедет собранной с ядром, которого нет в пине",
+        )
         # Отказ должен стоять ДО push, иначе он ничего не отменяет. Ищется ВЫЗОВ, а не
         # определение: строка «def core_pin_covers_local():» тоже содержит имя со скобками,
         # и по ней проверка находила начало файла — то есть проходила всегда, даже когда
         # сверку переносили за push. Откат это и показал.
         guard = txt.find("= core_pin_covers_local()")
         push = txt.find('git_try("push"')
-        ctx.check("отказ стоит до отправки у %s" % name,
-                  guard != -1 and push != -1 and guard < push,
-                  "сверка есть, но после push — отправка уже случилась")
-        ctx.check("при расхождении %s не отправляет" % name,
-                  "отправка ОТМЕНЕНА" in txt,
-                  "сверка не приводит к отказу от отправки")
+        ctx.check(
+            "отказ стоит до отправки у %s" % name,
+            guard != -1 and push != -1 and guard < push,
+            "сверка есть, но после push — отправка уже случилась",
+        )
+        ctx.check(
+            "при расхождении %s не отправляет" % name,
+            "отправка ОТМЕНЕНА" in txt,
+            "сверка не приводит к отказу от отправки",
+        )
 
     # --- конец второй: ядро собирает потребителей ---
     core = pathlib.Path(tree) / "mesh-network-core"
     wf = core / ".github" / "workflows" / "checks.yml"
     snap = _snapshot_ref(core) if (core / ".git").exists() else None
     if snap:
-        ctx.note("SKIP задание на потребителей: ядро выложено по пину (%s) — задание "
-                 "проверяется по ветке" % snap)
+        ctx.note("SKIP задание на потребителей: ядро выложено по пину (%s) — задание проверяется по ветке" % snap)
     elif wf.is_file():
         job = _job_block(wf.read_text(encoding="utf-8"), "consumers")
-        ctx.check("в CI ядра есть задание на потребителей", job is not None,
-                  "ядро проверяется в одиночку — выпуск сломает прошивку незаметно")
+        ctx.check(
+            "в CI ядра есть задание на потребителей",
+            job is not None,
+            "ядро проверяется в одиночку — выпуск сломает прошивку незаметно",
+        )
         if job:
             for repo in ("meshcore-fork", "tdeck"):
-                ctx.check("потребитель %s есть в матрице задания" % repo,
-                          ("repo: " + repo) in job,
-                          "задание проверяет не всех потребителей, а ядро у них одно")
-            ctx.check("потребитель собирается в задании", "pio run" in job,
-                      "задание есть, но прошивку не собирает")
-            ctx.check("сборка потребителя не коммитит", "NOGIT" in job,
-                      "без NOGIT пост-действие сборки закоммитит и отправит из CI — петля")
+                ctx.check(
+                    "потребитель %s есть в матрице задания" % repo,
+                    ("repo: " + repo) in job,
+                    "задание проверяет не всех потребителей, а ядро у них одно",
+                )
+            ctx.check("потребитель собирается в задании", "pio run" in job, "задание есть, но прошивку не собирает")
+            ctx.check(
+                "сборка потребителя не коммитит",
+                "NOGIT" in job,
+                "без NOGIT пост-действие сборки закоммитит и отправит из CI — петля",
+            )
             # Пин потребителя здесь соблюдать нельзя: смысл задания в сборке с ЭТИМ ядром.
-            ctx.check("задание не подменяет ядро пином потребителя", "core.ref" not in job,
-                      "задание читает core.ref — тогда оно проверяет не это ядро, а старое")
+            ctx.check(
+                "задание не подменяет ядро пином потребителя",
+                "core.ref" not in job,
+                "задание читает core.ref — тогда оно проверяет не это ядро, а старое",
+            )
             # Приватный tdeck выкачивается deploy key'ем, а не токеном учётной записи. Ядро —
             # репозиторий ПУБЛИЧНЫЙ: личный токен со scope repo в его секретах открыл бы все
             # репозитории владельца, тогда как ключ привязан к одному и только на чтение.
-            ctx.check("приватный потребитель выкачивается ключом, а не личным токеном",
-                      "ssh-key:" in job and "CONSUMERS_TOKEN" not in job,
-                      "в задании личный токен: в секретах публичного репозитория он даёт "
-                      "доступ ко всем репозиториям владельца, а нужен один и на чтение")
+            ctx.check(
+                "приватный потребитель выкачивается ключом, а не личным токеном",
+                "ssh-key:" in job and "CONSUMERS_TOKEN" not in job,
+                "в задании личный токен: в секретах публичного репозитория он даёт "
+                "доступ ко всем репозиториям владельца, а нужен один и на чтение",
+            )
     if not seen:
         ctx.note("SKIP pipeline_test: прошивок рядом нет")
 
@@ -274,8 +291,7 @@ def wiring_test(ctx, pkg=None):
     """Ни одна написанная проверка не потерялась по дороге к запуску."""
     pkg = pathlib.Path(pkg) if pkg else pathlib.Path(__file__).resolve().parent
     suites = sorted(pkg.glob("suite_*.py"))
-    ctx.check("наборы проверок на месте", len(suites) >= 3,
-              "найдено файлов suite_*.py: %d" % len(suites))
+    ctx.check("наборы проверок на месте", len(suites) >= 3, "найдено файлов suite_*.py: %d" % len(suites))
 
     targets_py = pkg / "targets.py"
     ctx.check("описание целей на месте", targets_py.is_file(), str(targets_py))
@@ -299,11 +315,11 @@ def wiring_test(ctx, pkg=None):
         for name in sorted(_defined_tests(s)):
             if name not in called:
                 orphans.append("%s.%s" % (s.stem, name))
-    ctx.check("каждая написанная проверка кем-то вызывается", not orphans,
-              "никто не зовёт: " + ", ".join(orphans))
+    ctx.check("каждая написанная проверка кем-то вызывается", not orphans, "никто не зовёт: " + ", ".join(orphans))
 
     # Обратная сторона: цель объявлена, а запускать нечего.
     from . import targets
+
     bad = [n for n, (_, fn, _) in targets.TARGETS.items() if not callable(fn)]
     ctx.check("у каждой цели есть что запускать", not bad, ", ".join(bad))
 
@@ -321,12 +337,16 @@ def shims_test(ctx, tree):
         if not shim.is_dir() and not shim.is_file():
             continue
         txt = shim.read_text(encoding="utf-8")
-        ctx.check("обёртка %s зовёт общий запускатель" % sub,
-                  "mesh-network-tools" in txt and "selftest.py" in txt,
-                  "%s не ссылается на репозиторий проверок" % shim)
-        ctx.check("обёртка %s запускает цель %s" % (sub, target),
-                  '"--target", "%s"' % target in txt,
-                  "в %s не найдена цель %s" % (shim, target))
+        ctx.check(
+            "обёртка %s зовёт общий запускатель" % sub,
+            "mesh-network-tools" in txt and "selftest.py" in txt,
+            "%s не ссылается на репозиторий проверок" % shim,
+        )
+        ctx.check(
+            "обёртка %s запускает цель %s" % (sub, target),
+            '"--target", "%s"' % target in txt,
+            "в %s не найдена цель %s" % (shim, target),
+        )
 
 
 def solo_tree_test(ctx, tree):
@@ -355,8 +375,7 @@ def solo_tree_test(ctx, tree):
             (root / sub).symlink_to(src, target_is_directory=True)
             # Ядро кладём рядом ССЫЛКОЙ: корень дерева указывает на каталог ядра (как в
             # selftest.py), а копия в 40 МБ ради проверки ни к чему.
-            (root / "mesh-network-core").symlink_to(tree / "mesh-network-core",
-                                                     target_is_directory=True)
+            (root / "mesh-network-core").symlink_to(tree / "mesh-network-core", target_is_directory=True)
             solo = harness.Ctx(root / sub, tree / "mesh-network-core", "fork", tree=root)
             # Тишина: прогон внутри проверки не должен выглядеть как ещё одна проверка.
             buf = io.StringIO()
@@ -366,12 +385,15 @@ def solo_tree_test(ctx, tree):
                     suite_core.ota_screen_progress_test(solo)
                     suite_core.any_session_test(solo)
             except Exception as e:  # noqa: BLE001 — падение здесь и есть ложь проверки
-                ctx.check("проверки ядра живут без второй прошивки (%s)" % sub, False,
-                          "%s: %s: %s" % (type(e).__name__, e,
-                                          (buf.getvalue() or "").strip()[-400:]))
+                ctx.check(
+                    "проверки ядра живут без второй прошивки (%s)" % sub,
+                    False,
+                    "%s: %s: %s" % (type(e).__name__, e, (buf.getvalue() or "").strip()[-400:]),
+                )
                 continue
-            ctx.check("проверки ядра живут без второй прошивки (%s)" % sub,
-                      not solo.failures,
-                      "упали без второй прошивки на диске: %s — по правилу из targets.py "
-                      "молчание честнее выдуманного «OK»"
-                      % ", ".join(solo.failures[:6]))
+            ctx.check(
+                "проверки ядра живут без второй прошивки (%s)" % sub,
+                not solo.failures,
+                "упали без второй прошивки на диске: %s — по правилу из targets.py "
+                "молчание честнее выдуманного «OK»" % ", ".join(solo.failures[:6]),
+            )

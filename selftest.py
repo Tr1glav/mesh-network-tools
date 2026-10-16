@@ -26,6 +26,7 @@
 Нужен g++; node — по желанию (без него проверка синтаксиса JS пропускается).
 Выход: 0 — всё прошло, 1 — есть провалы.
 """
+
 import argparse
 import os
 import pathlib
@@ -34,7 +35,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from mcselftest import harness, suite_meta, targets   # noqa: E402  (после sys.path)
+from mcselftest import harness, suite_meta, targets  # noqa: E402  (после sys.path)
 
 # Рабочее дерево: каталог, в котором лежат и этот репозиторий, и проверяемые. Ядро
 # подключено к прошивкам как symlink://../mesh-network-core, поэтому «рядом» — это не
@@ -43,13 +44,11 @@ TREE = HERE.parent
 
 
 def resolve(name, args):
-    core = pathlib.Path(args.core or os.environ.get("MESHCORE_CORE")
-                        or (TREE / "mesh-network-core"))
+    core = pathlib.Path(args.core or os.environ.get("MESHCORE_CORE") or (TREE / "mesh-network-core"))
     if name == "core":
         root = core
     else:
-        root = pathlib.Path(args.root or os.environ.get("MESHCORE_ROOT")
-                            or targets.default_root(name, TREE))
+        root = pathlib.Path(args.root or os.environ.get("MESHCORE_ROOT") or targets.default_root(name, TREE))
     return root, core
 
 
@@ -61,14 +60,18 @@ def run_target(name, args):
     # «пропускаются», а валят запуск. Тихо урезанный selftest — это ровно то, из-за чего
     # сборка в CI оставалась красной, ни на что не жалуясь.
     ok = (core / "src" / "crypto.cpp").is_file()
-    ctx.check("ядро протокола найдено (%s)" % core, ok,
-              "нет исходников ядра — задайте путь ключом --core или MESHCORE_CORE")
+    ctx.check(
+        "ядро протокола найдено (%s)" % core, ok, "нет исходников ядра — задайте путь ключом --core или MESHCORE_CORE"
+    )
     if not ok:
         return ctx.failures
 
     if name != "core" and not root.is_dir():
-        ctx.check("прошивка найдена (%s)" % root, False,
-                  "нет каталога прошивки — задайте путь ключом --root или MESHCORE_ROOT")
+        ctx.check(
+            "прошивка найдена (%s)" % root,
+            False,
+            "нет каталога прошивки — задайте путь ключом --root или MESHCORE_ROOT",
+        )
         return ctx.failures
 
     targets.TARGETS[name][1](ctx)
@@ -80,19 +83,18 @@ def main():
     ap = argparse.ArgumentParser(
         description="Проверки прошивок meshcore на ПК",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="цели:\n" + "\n".join(
-            "  %-7s %s" % (n, targets.TARGETS[n][2]) for n in names) +
-        "\n  all     все цели подряд")
-    ap.add_argument("--target", "-t", default="fork", choices=names + ["all"],
-                    help="что проверять (по умолчанию fork)")
+        epilog="цели:\n"
+        + "\n".join("  %-7s %s" % (n, targets.TARGETS[n][2]) for n in names)
+        + "\n  all     все цели подряд",
+    )
+    ap.add_argument("--target", "-t", default="fork", choices=names + ["all"], help="что проверять (по умолчанию fork)")
     ap.add_argument("--root", help="каталог проверяемой прошивки")
     ap.add_argument("--core", help="каталог ядра mesh-network-core")
     args = ap.parse_args()
 
-    if args.target == "all" and (args.root or args.core):
+    if args.target == "all" and args.root:
         # --root для нескольких целей не имеет смысла: у каждой он свой.
-        if args.root:
-            ap.error("--root нельзя задавать вместе с --target all: у каждой цели свой каталог")
+        ap.error("--root нельзя задавать вместе с --target all: у каждой цели свой каталог")
 
     todo = names if args.target == "all" else [args.target]
     failures = []
@@ -124,4 +126,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Нормализация исходников — глобальная подмена pathlib.Path.read_text, поэтому она
+    # живёт ровно столько, сколько прогон: снимаем её даже если проверки упали.
+    harness.install_source_normalization()
+    try:
+        main()
+    finally:
+        harness.uninstall_source_normalization()

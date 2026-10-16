@@ -4,16 +4,14 @@
 скрипта в web/app.js против маршрутов сервера и полей /info), совместимость кнопок в MQTT,
 границы команд телефонного приложения. Проверки ядра — в suite_core.
 """
-import os
+
 import pathlib
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 
 from .cshims import STRING_PRELUDE
-
 
 BUTTON_MAIN = r"""
 static int fails = 0;
@@ -83,22 +81,29 @@ def button_compat_test(ctx):
         if not m:
             ctx.check("совместимость кнопок: %s определён" % n, False)
             return
-        defs.append("#define %s \"%s\"" % (n, m.group(1)))
-    code = (STRING_PRELUDE + "\n".join(defs) + "\n"
-            + ctx.grab("lib/meshcore/src/mqtt.cpp", "static bool bareButton(") + "\n"
-            + BUTTON_MAIN)
+        defs.append('#define %s "%s"' % (n, m.group(1)))
+    code = (
+        STRING_PRELUDE
+        + "\n".join(defs)
+        + "\n"
+        + ctx.grab("lib/meshcore/src/mqtt.cpp", "static bool bareButton(")
+        + "\n"
+        + BUTTON_MAIN
+    )
     exe, build = ctx.host_build(code, "b.cpp")
     if exe is None:
         ctx.check("сборка теста совместимости кнопок", False, build[:400])
         return
     run = subprocess.run([str(exe)], capture_output=True, text=True)
-    ctx.check("кнопки в MQTT: номер отправки срезается, чужие сообщения не трогаются",
-          run.returncode == 0, (run.stdout + run.stderr).strip()[:600])
+    ctx.check(
+        "кнопки в MQTT: номер отправки срезается, чужие сообщения не трогаются",
+        run.returncode == 0,
+        (run.stdout + run.stderr).strip()[:600],
+    )
     # Отдельно: в MQTT наружу уходит именно оголённое значение, а при неудаче — исходное.
     # Это одна строка, и ошибка в ней тихо ломает все автоматизации разом.
     mq = (ctx.root / "lib/meshcore/src/mqtt.cpp").read_text(encoding="utf-8")
-    ctx.check("в MQTT наружу уходит оголённое значение кнопки",
-          "isBtn ? btnMsg.c_str() : lastMessage.c_str()" in mq)
+    ctx.check("в MQTT наружу уходит оголённое значение кнопки", "isBtn ? btnMsg.c_str() : lastMessage.c_str()" in mq)
 
 
 def page_js_test(ctx):
@@ -128,19 +133,24 @@ def page_ids_test(ctx, js):
     js_ids = set(re.findall(r"\$\(\s*['\"]([A-Za-z][\w-]*)['\"]\s*\)", js))
     js_ids -= set(re.findall(r"\.id\s*=\s*['\"]([A-Za-z][\w-]*)['\"]", js))
     missing = sorted(js_ids - html_ids)
-    ctx.check("все элементы страницы, которые ищет скрипт, есть в разметке",
-          not missing, "нет в разметке: " + ", ".join(missing))
+    ctx.check(
+        "все элементы страницы, которые ищет скрипт, есть в разметке",
+        not missing,
+        "нет в разметке: " + ", ".join(missing),
+    )
     # Обратная сторона: id в разметке, к которому скрипт не обращается, — опечатка или
     # осиротевший кусок после переделки страницы. Панели вкладок открываются по data-tab,
     # а не по id, поэтому их имена из проверки убираем.
     unused = sorted(i for i in html_ids - js_ids if not i.startswith("p-"))
-    ctx.check("в разметке нет неиспользуемых элементов", not unused,
-          "скрипт не обращается: " + ", ".join(unused))
+    ctx.check("в разметке нет неиспользуемых элементов", not unused, "скрипт не обращается: " + ", ".join(unused))
     # Вкладки: у каждой кнопки data-tab должна быть панель с таким же id, и наоборот.
     tabs = set(re.findall(r"data-tab='([\w-]+)'", web_cpp))
     panels = set(re.findall(r"class='panel[^']*' id='p-([\w-]+)'", web_cpp))
-    ctx.check("у каждой вкладки есть панель и наоборот", tabs == panels,
-          "вкладки: %s, панели: %s" % (sorted(tabs), sorted(panels)))
+    ctx.check(
+        "у каждой вкладки есть панель и наоборот",
+        tabs == panels,
+        "вкладки: %s, панели: %s" % (sorted(tabs), sorted(panels)),
+    )
     # Имя панели собирается в скрипте как 'p-'+имя вкладки, а не выписывается по списку.
     ctx.check("скрипт открывает панели по data-tab", "'p-'+b.dataset.tab" in js)
     # Разметка лежит строкой в C++, и браузер чинит её молча: незакрытый div не ломает
@@ -158,8 +168,11 @@ def page_ids_test(ctx, js):
         for tag in ("meta", "link", "input"):
             closed = len(re.findall(r"<%s\b[^<>]*>" % tag, html))
             total = len(re.findall(r"<%s\b" % tag, html))
-            ctx.check("одиночные теги <%s> не разъехались (%d)" % (tag, closed), closed == total,
-                  "потеряна скобка: %d из %d" % (closed, total))
+            ctx.check(
+                "одиночные теги <%s> не разъехались (%d)" % (tag, closed),
+                closed == total,
+                "потеряна скобка: %d из %d" % (closed, total),
+            )
     endpoints_test(ctx, js, web_cpp, html or "")
     info_fields_test(ctx, js, web_cpp)
 
@@ -177,8 +190,7 @@ def endpoints_test(ctx, js, web_cpp, html):
     Скрипт и сервер лежат в разных файлах, и разъехавшаяся пара на устройстве выглядит
     так: страница загрузилась, кнопка нажата, ответа нет, в консоли 404. Ловим на сборке."""
     served = set(re.findall(r"otaServer\.on\(\s*\"([^\"?]+)\"", web_cpp))
-    ctx.check("маршруты сервера найдены", bool(served),
-          "в web.cpp нет ни одного otaServer.on(...)")
+    ctx.check("маршруты сервера найдены", bool(served), "в web.cpp нет ни одного otaServer.on(...)")
     called = set()
     for url in re.findall(r"fetch\(\s*'([^']+)'", js):
         called.add(url.split("?")[0].split("#")[0])
@@ -186,8 +198,7 @@ def endpoints_test(ctx, js, web_cpp, html):
     for href in re.findall(r"(?:href|src)='(/[^'?]*)", html):
         called.add(href)
     missing = sorted(u for u in called if u and u not in served)
-    ctx.check("все адреса страницы обслуживает сервер", not missing,
-          "нет маршрута: " + ", ".join(missing))
+    ctx.check("все адреса страницы обслуживает сервер", not missing, "нет маршрута: " + ", ".join(missing))
     # Страница, стилевые файлы и скрипт должны отдаваться корнем: без них не грузится
     # ничего, а проверка выше этого не отлавливает — адреса в разметке есть.
     for need in ("/", "/style.css", "/app.js"):
@@ -196,8 +207,9 @@ def endpoints_test(ctx, js, web_cpp, html):
     # зовёт то, что сервер забыл (список выше это уже ловит) — проверяем, что скрипт не
     # остался с адресом, который сервер когда-то отдавал вручную мимо otaServer.on.
     manual = set(re.findall(r"(?:server|otaServer)\.onNotFound", web_cpp))
-    ctx.check("у сервера нет адресов вне otaServer.on", not manual,
-          "есть onNotFound: такие адреса проверка выше не видит")
+    ctx.check(
+        "у сервера нет адресов вне otaServer.on", not manual, "есть onNotFound: такие адреса проверка выше не видит"
+    )
 
 
 def info_fields_test(ctx, js, web_cpp):
@@ -222,8 +234,7 @@ def info_fields_test(ctx, js, web_cpp):
         return re.search(r'\\?"' + re.escape(name) + r'\\?"', body) is not None
 
     missing = sorted(f for f in used if not field(f))
-    ctx.check("все поля, которые читает страница, есть в /info", not missing,
-          "нет в ответе: " + ", ".join(missing))
+    ctx.check("все поля, которые читает страница, есть в /info", not missing, "нет в ответе: " + ", ".join(missing))
     # Обратная сторона: счётчики потерь обязаны попадать и в /info, и в страницу —
     # иначе диагностика собрана, но никто её не видит.
     for name in ("cadg", "rlq", "rdr", "rdf", "dmn"):
@@ -232,8 +243,7 @@ def info_fields_test(ctx, js, web_cpp):
 
 
 COMPANION_PRELUDE = (
-    "#include <cstdint>\n#include <cstdio>\n#include <cstring>\n#include <cstddef>\n"
-    "#define MAX_FRAME_SIZE 240\n"
+    "#include <cstdint>\n#include <cstdio>\n#include <cstring>\n#include <cstddef>\n#define MAX_FRAME_SIZE 240\n"
 )
 
 
@@ -317,25 +327,37 @@ def advert_path_prefix_test(ctx):
         return
     ptxt, ctxt, htxt = (f.read_text(encoding="utf-8") for f in (proto, comp, hdr))
 
-    ctx.check("поиск по префиксу ключа существует", "int contactFindPrefix(" in ctxt,
-              "нет contactFindPrefix: искать узел по началу ключа нечем")
-    ctx.check("минимальная длина префикса объявлена", "CONTACT_KEY_PREFIX_MIN" in htxt,
-              "нет предела снизу: короткий префикс совпадёт с чужим узлом")
+    ctx.check(
+        "поиск по префиксу ключа существует",
+        "int contactFindPrefix(" in ctxt,
+        "нет contactFindPrefix: искать узел по началу ключа нечем",
+    )
+    ctx.check(
+        "минимальная длина префикса объявлена",
+        "CONTACT_KEY_PREFIX_MIN" in htxt,
+        "нет предела снизу: короткий префикс совпадёт с чужим узлом",
+    )
 
     # Оба запроса обязаны ходить через один поиск: расхождение между ними и было причиной.
-    body = ptxt[ptxt.find("case CMD_GET_ADVERT_PATH"):]
-    body = body[:body.find("case CMD_SET_CHANNEL")] if "case CMD_SET_CHANNEL" in body else body
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in body.splitlines())
-    ctx.check("запрос пути ищет по префиксу", "contactFindPrefix(" in code,
-              "обработчик команды 42 снова требует полный ключ — приложение останется без "
-              "маршрута для каждого хопа")
-    ctx.check("запрос пути не требует все 32 байта", "len >= 2 + 32" not in code,
-              "в обработчике остался порог на полный ключ: запрос с префиксом будет отвергнут")
-    ctx.check("запрос контакта ищет тем же поиском",
-              code.count("contactFindPrefix(") >= 2,
-              "запрос контакта по ключу ищет своим способом — расхождение между двумя "
-              "соседними запросами и было причиной поломки")
+    body = ptxt[ptxt.find("case CMD_GET_ADVERT_PATH") :]
+    body = body[: body.find("case CMD_SET_CHANNEL")] if "case CMD_SET_CHANNEL" in body else body
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in body.splitlines())
+    ctx.check(
+        "запрос пути ищет по префиксу",
+        "contactFindPrefix(" in code,
+        "обработчик команды 42 снова требует полный ключ — приложение останется без маршрута для каждого хопа",
+    )
+    ctx.check(
+        "запрос пути не требует все 32 байта",
+        "len >= 2 + 32" not in code,
+        "в обработчике остался порог на полный ключ: запрос с префиксом будет отвергнут",
+    )
+    ctx.check(
+        "запрос контакта ищет тем же поиском",
+        code.count("contactFindPrefix(") >= 2,
+        "запрос контакта по ключу ищет своим способом — расхождение между двумя "
+        "соседними запросами и было причиной поломки",
+    )
 
     # Предел снизу обязан пропускать то, что приложение РЕАЛЬНО присылает. Сколько именно —
     # видно в обработчике личного сообщения: там адрес берётся фиксированным числом байтов.
@@ -345,21 +367,25 @@ def advert_path_prefix_test(ctx):
     # с числом из чужого кода, а с числом из нашего же обработчика.
     m = re.search(r"#define\s+CONTACT_KEY_PREFIX_MIN\s+(\d+)", htxt)
     # Обработчик личного сообщения лежит ниже разобранного куска, поэтому смотрим весь файл.
-    full = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in ptxt.splitlines())
+    full = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in ptxt.splitlines())
     used = re.search(r"contactFindPrefix\(&f\[7\],\s*(\d+)\)", full)
-    ctx.check("порог префикса пропускает то, что присылает приложение",
-              m is not None and used is not None and int(m.group(1)) <= int(used.group(1)),
-              "порог %s, а личное сообщение адресуется %s байтами: такой запрос получит "
-              "«не найдено»" % (m.group(1) if m else "нет", used.group(1) if used else "?"))
-    ctx.check("порог префикса не вырожден (>= 4 байт)",
-              m is not None and int(m.group(1)) >= 4,
-              "CONTACT_KEY_PREFIX_MIN = %s: по такому началу ключа ответ уйдёт про чужой узел"
-              % (m.group(1) if m else "нет"))
-    ctx.check("личное сообщение ищет контакт тем же поиском",
-              "contactFindPrefix(&f[7]" in full,
-              "обработчик личного сообщения ищет контакт своим способом — именно расхождение "
-              "соседних мест дважды за день и приводило к поломке")
+    ctx.check(
+        "порог префикса пропускает то, что присылает приложение",
+        m is not None and used is not None and int(m.group(1)) <= int(used.group(1)),
+        "порог %s, а личное сообщение адресуется %s байтами: такой запрос получит "
+        "«не найдено»" % (m.group(1) if m else "нет", used.group(1) if used else "?"),
+    )
+    ctx.check(
+        "порог префикса не вырожден (>= 4 байт)",
+        m is not None and int(m.group(1)) >= 4,
+        "CONTACT_KEY_PREFIX_MIN = %s: по такому началу ключа ответ уйдёт про чужой узел" % (m.group(1) if m else "нет"),
+    )
+    ctx.check(
+        "личное сообщение ищет контакт тем же поиском",
+        "contactFindPrefix(&f[7]" in full,
+        "обработчик личного сообщения ищет контакт своим способом — именно расхождение "
+        "соседних мест дважды за день и приводило к поломке",
+    )
 
 
 def _handler_body(text, handler):
@@ -441,70 +467,92 @@ def ble_responsiveness_test(ctx):
 
     # --- 1. реклама в двух режимах ---
     fast_min, slow_min = const("BLE_ADV_FAST_MIN"), const("BLE_ADV_SLOW_MIN")
-    ctx.check("у рекламы два интервала", fast_min is not None and slow_min is not None,
-              "нет пары BLE_ADV_FAST_MIN/BLE_ADV_SLOW_MIN: один интервал означает либо "
-              "долгое подключение, либо расход впустую")
+    ctx.check(
+        "у рекламы два интервала",
+        fast_min is not None and slow_min is not None,
+        "нет пары BLE_ADV_FAST_MIN/BLE_ADV_SLOW_MIN: один интервал означает либо "
+        "долгое подключение, либо расход впустую",
+    )
     if fast_min and slow_min:
         # Единицы по 0.625 мс. Частый обязан быть заметно частым: 160 единиц = 100 мс.
-        ctx.check("частый интервал рекламы действительно частый (<= 100 мс)",
-                  fast_min <= 160,
-                  "BLE_ADV_FAST_MIN = %d (%.0f мс): телефон будет ловить объявление так же "
-                  "долго, как и раньше" % (fast_min, fast_min * 0.625))
-        ctx.check("редкий интервал экономнее частого", slow_min > fast_min,
-                  "редкий интервал не реже частого — второй режим не экономит ничего")
-    ctx.check("частая реклама включается после отключения",
-              # Окно по телу обработчика, а не по символам: в нём есть пояснение, и счёт
-              # символов пришлось бы подгонять под длину комментария.
-              _in_handler(ctxt, "onDisconnect", "bleAdvFast(true)"),
-              "после отключения реклама остаётся редкой: повторное подключение снова будет "
-              "ждать секунды, а именно оно и происходит чаще всего")
+        ctx.check(
+            "частый интервал рекламы действительно частый (<= 100 мс)",
+            fast_min <= 160,
+            "BLE_ADV_FAST_MIN = %d (%.0f мс): телефон будет ловить объявление так же "
+            "долго, как и раньше" % (fast_min, fast_min * 0.625),
+        )
+        ctx.check(
+            "редкий интервал экономнее частого",
+            slow_min > fast_min,
+            "редкий интервал не реже частого — второй режим не экономит ничего",
+        )
+    ctx.check(
+        "частая реклама включается после отключения",
+        # Окно по телу обработчика, а не по символам: в нём есть пояснение, и счёт
+        # символов пришлось бы подгонять под длину комментария.
+        _in_handler(ctxt, "onDisconnect", "bleAdvFast(true)"),
+        "после отключения реклама остаётся редкой: повторное подключение снова будет "
+        "ждать секунды, а именно оно и происходит чаще всего",
+    )
     # Проверка была мёртвой: «A and B or True» из-за приоритета операторов — это
     # «(A and B) or True», то есть всегда истина. Ни выключение частого режима, ни срок
     # ему она не проверяла, и регрессия прошла бы зелёной. Вторая половина условия тоже
     # была бессмыслицей: она требовала, чтобы константы срока НЕ БЫЛО.
-    ctx.check("у частой рекламы есть срок",
-              re.search(r"#define\s+BLE_ADV_FAST_MS\b", htxt) is not None,
-              "BLE_ADV_FAST_MS не найден: частому режиму нечем кончиться, и узел будет "
-              "объявляться каждые 30 мс сутками")
-    ctx.check("срок ставится при включении частого режима",
-              re.search(r"bleAdvFastUntil\s*=\s*fast\s*\?", ctxt) is not None,
-              "включение частого режима не ставит срок: выключать его будет нечему")
-    ctx.check("частая реклама сама переходит в редкую",
-              re.search(r"bleAdvFast\(\s*false\s*\)", ptxt) is not None,
-              "частый режим никто не выключает: объявляться каждые 30 мс сутками незачем")
-    ctx.check("переход в редкую рекламу живёт в тике, а не в колбэке",
-              "bleAdvFastUntil" in ptxt and "bleAdvFast(false)" in ptxt,
-              "смену режима никто не выполняет: в колбэках BLE таймера нет, значит это дело "
-              "тика")
+    ctx.check(
+        "у частой рекламы есть срок",
+        re.search(r"#define\s+BLE_ADV_FAST_MS\b", htxt) is not None,
+        "BLE_ADV_FAST_MS не найден: частому режиму нечем кончиться, и узел будет объявляться каждые 30 мс сутками",
+    )
+    ctx.check(
+        "срок ставится при включении частого режима",
+        re.search(r"bleAdvFastUntil\s*=\s*fast\s*\?", ctxt) is not None,
+        "включение частого режима не ставит срок: выключать его будет нечему",
+    )
+    ctx.check(
+        "частая реклама сама переходит в редкую",
+        re.search(r"bleAdvFast\(\s*false\s*\)", ptxt) is not None,
+        "частый режим никто не выключает: объявляться каждые 30 мс сутками незачем",
+    )
+    ctx.check(
+        "переход в редкую рекламу живёт в тике, а не в колбэке",
+        "bleAdvFastUntil" in ptxt and "bleAdvFast(false)" in ptxt,
+        "смену режима никто не выполняет: в колбэках BLE таймера нет, значит это дело тика",
+    )
 
     # --- 2. несколько команд и порция контактов за проход ---
-    tick = ptxt[ptxt.find("void companionTick()"):]
-    ctx.check("за проход обрабатывается несколько команд",
-              "COMPANION_TICK_BUDGET_MS" in tick,
-              "команды обрабатываются по одной за проход: проход занимает до двух секунд, а "
-              "приложение шлёт их десятками")
-    ctx.check("предел задан временем, а не числом команд",
-              re.search(r"millis\(\)\s*-\s*started\s*\)?\s*>=\s*COMPANION_TICK_BUDGET_MS",
-                        tick) is not None,
-              "предел задан числом команд: они разной цены, и радио может остаться без "
-              "управления надолго")
-    ctx.check("контакты отдаются порцией, а не по одной записи",
-              re.search(r"while\s*\([^)]*contactIterIdx[\s\S]{0,200}contactsIterStep\(\)",
-                        tick) is not None,
-              "список контактов уезжает по записи за проход: под сотню контактов — под сотню "
-              "проходов, и приложение ждёт их секундами")
+    tick = ptxt[ptxt.find("void companionTick()") :]
+    ctx.check(
+        "за проход обрабатывается несколько команд",
+        "COMPANION_TICK_BUDGET_MS" in tick,
+        "команды обрабатываются по одной за проход: проход занимает до двух секунд, а приложение шлёт их десятками",
+    )
+    ctx.check(
+        "предел задан временем, а не числом команд",
+        re.search(r"millis\(\)\s*-\s*started\s*\)?\s*>=\s*COMPANION_TICK_BUDGET_MS", tick) is not None,
+        "предел задан числом команд: они разной цены, и радио может остаться без управления надолго",
+    )
+    ctx.check(
+        "контакты отдаются порцией, а не по одной записи",
+        re.search(r"while\s*\([^)]*contactIterIdx[\s\S]{0,200}contactsIterStep\(\)", tick) is not None,
+        "список контактов уезжает по записи за проход: под сотню контактов — под сотню "
+        "проходов, и приложение ждёт их секундами",
+    )
     budget = const("COMPANION_TICK_BUDGET_MS")
-    ctx.check("бюджет обработки не съедает эфир (<= 50 мс)",
-              budget is not None and budget <= 50,
-              "бюджет %s мс: отзывчивость приложения куплена задержкой передачи" % budget)
+    ctx.check(
+        "бюджет обработки не съедает эфир (<= 50 мс)",
+        budget is not None and budget <= 50,
+        "бюджет %s мс: отзывчивость приложения куплена задержкой передачи" % budget,
+    )
 
     # --- 3. то, чего не видно без журнала ---
     # Именно ПЕРЕОПРЕДЕЛЕНИЕ, а не вхождение имени: переименованный onMtuChangedUnused
     # содержит ту же подстроку, и проверка оставалась зелёной на выключенном обработчике.
-    ctx.check("размер пакета BLE попадает в журнал",
-              re.search(r"void\s+onMtuChanged\s*\([^)]*\)\s*override", ctxt) is not None,
-              "договорённый MTU нигде не видно: кадр 176 Б при MTU 23 уедет девятью пакетами, "
-              "и выяснять это придётся догадками")
+    ctx.check(
+        "размер пакета BLE попадает в журнал",
+        re.search(r"void\s+onMtuChanged\s*\([^)]*\)\s*override", ctxt) is not None,
+        "договорённый MTU нигде не видно: кадр 176 Б при MTU 23 уедет девятью пакетами, "
+        "и выяснять это придётся догадками",
+    )
 
 
 def ack_confirm_test(ctx):
@@ -526,36 +574,44 @@ def ack_confirm_test(ctx):
         return
     ctxt, ptxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, proto, hdr))
 
-    ctx.check("компаньон переопределяет хук подтверждения",
-              re.search(r"(?m)^void\s+mcOnAckRecv\s*\(", ctxt) is not None,
-              "mcOnAckRecv не переопределён: сработает заглушка ядра, и подтверждение "
-              "приложению не дойдёт")
-    ctx.check("приложению уходит код «доставлено»",
-              "PUSH_CODE_SEND_CONFIRMED" in htxt and "PUSH_CODE_SEND_CONFIRMED" in ctxt,
-              "нет пуша о доставке: ядро приняло подтверждение, а приложение о нём не узнает")
-    ctx.check("в пуше есть время в пути",
-              re.search(r"trip", ctxt) is not None,
-              "приложению отдаётся только факт: оригинал присылает ещё и время в пути, и "
-              "приложение его показывает")
+    ctx.check(
+        "компаньон переопределяет хук подтверждения",
+        re.search(r"(?m)^void\s+mcOnAckRecv\s*\(", ctxt) is not None,
+        "mcOnAckRecv не переопределён: сработает заглушка ядра, и подтверждение приложению не дойдёт",
+    )
+    ctx.check(
+        "приложению уходит код «доставлено»",
+        "PUSH_CODE_SEND_CONFIRMED" in htxt and "PUSH_CODE_SEND_CONFIRMED" in ctxt,
+        "нет пуша о доставке: ядро приняло подтверждение, а приложение о нём не узнает",
+    )
+    ctx.check(
+        "в пуше есть время в пути",
+        re.search(r"trip", ctxt) is not None,
+        "приложению отдаётся только факт: оригинал присылает ещё и время в пути, и приложение его показывает",
+    )
 
     # Хэш обязан приходить ИЗ ЯДРА вместе с кадром, а не считаться здесь заново.
-    ctx.check("ожидаемый хэш берётся у сборщика кадра",
-              re.search(r"buildPrivateTextFrame\([^;]*expAck\s*,", ptxt) is not None
-              and "ackExpect(" in ptxt,
-              "компаньон не запоминает ожидаемый хэш при отправке: сверять пришедшее "
-              "подтверждение будет не с чем")
-    ctx.check("хэш не пересчитывается в компаньоне",
-              "sha256Trunc(" not in ctxt and "sha256Trunc(" not in ptxt,
-              "компаньон считает хэш сам: он выводится из открытого текста, который собирает "
-              "ядро, и две копии расчёта разъедутся молча")
+    ctx.check(
+        "ожидаемый хэш берётся у сборщика кадра",
+        re.search(r"buildPrivateTextFrame\([^;]*expAck\s*,", ptxt) is not None and "ackExpect(" in ptxt,
+        "компаньон не запоминает ожидаемый хэш при отправке: сверять пришедшее подтверждение будет не с чем",
+    )
+    ctx.check(
+        "хэш не пересчитывается в компаньоне",
+        "sha256Trunc(" not in ctxt and "sha256Trunc(" not in ptxt,
+        "компаньон считает хэш сам: он выводится из открытого текста, который собирает "
+        "ядро, и две копии расчёта разъедутся молча",
+    )
 
     # Повторное подтверждение не должно давать второй пуш: копии флуда приходят по нескольку.
-    ack_fn = ctxt[ctxt.find("void mcOnAckRecv("):]
-    ack_fn = ack_fn[:ack_fn.find("\n}\n") + 3] if "\n}\n" in ack_fn else ack_fn
-    ctx.check("слот освобождается на первом совпадении",
-              re.search(r"used\s*=\s*false", ack_fn) is not None,
-              "подтверждение приходит копиями, и без освобождения слота приложение получит "
-              "несколько пушей об одном сообщении")
+    ack_fn = ctxt[ctxt.find("void mcOnAckRecv(") :]
+    ack_fn = ack_fn[: ack_fn.find("\n}\n") + 3] if "\n}\n" in ack_fn else ack_fn
+    ctx.check(
+        "слот освобождается на первом совпадении",
+        re.search(r"used\s*=\s*false", ack_fn) is not None,
+        "подтверждение приходит копиями, и без освобождения слота приложение получит "
+        "несколько пушей об одном сообщении",
+    )
 
 
 def dm_send_meta_test(ctx):
@@ -575,34 +631,39 @@ def dm_send_meta_test(ctx):
         ctx.note("     SKIP dm_send_meta_test: кода компаньона рядом нет")
         return
     txt = proto.read_text(encoding="utf-8")
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in txt.splitlines())
-    hdr = (ctx.root / "lib" / "meshcore" / "include" / "companion_internal.h").read_text(
-        encoding="utf-8")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in txt.splitlines())
+    hdr = (ctx.root / "lib" / "meshcore" / "include" / "companion_internal.h").read_text(encoding="utf-8")
 
     # Метка времени и попытка из команды доходят до сборщика кадра: иначе кадр собран с
     # часами узла/нулём, и хэш подтверждения не сопоставится с приложением.
-    ctx.check("метка и попытка из команды идут в сборщик кадра",
-              "msgTs" in code and "attempt" in code
-              and re.search(r"buildPrivateTextFrame\([^;]*expAck\s*,[^;]*msgTs", code)
-              is not None,
-              "сборщику кадра не передаются метка/попытка приложения: хэш подтверждения "
-              "считается по чужим значениям, и галочки не будет никогда")
-    ctx.check("метка читается из команды приложения",
-              re.search(r"&f\[3\]", code) is not None,
-              "метка времени не разбирается из кадра приложения: приложение показывает "
-              "сообщение по метке, а в эфир ушла своя")
+    ctx.check(
+        "метка и попытка из команды идут в сборщик кадра",
+        "msgTs" in code
+        and "attempt" in code
+        and re.search(r"buildPrivateTextFrame\([^;]*expAck\s*,[^;]*msgTs", code) is not None,
+        "сборщику кадра не передаются метка/попытка приложения: хэш подтверждения "
+        "считается по чужим значениям, и галочки не будет никогда",
+    )
+    ctx.check(
+        "метка читается из команды приложения",
+        re.search(r"&f\[3\]", code) is not None,
+        "метка времени не разбирается из кадра приложения: приложение показывает "
+        "сообщение по метке, а в эфир ушла своя",
+    )
 
     # Ответ несёт НАСТОЯЩИЙ хэш, а не ноль: приложение ждёт подтверждение по этой метке.
-    ctx.check("в ответе — настоящий ожидаемый хэш",
-              re.search(r"memcpy\(\s*&out\[i\]\s*,\s*expAck\s*,\s*4\s*\)", code) is not None,
-              "в ответе команды 2 метка подтверждения нулевая/чужая: приложение ждёт по "
-              "ней подтверждение и не дождётся никогда")
-    ctx.check("оценка времени до ACK считается, а не константа",
-              "RESP_CODE_SENT" in hdr
-              and re.search(r"est\s*=", code) is not None and "radioAirtimeMs" in code,
-              "оценка времени фиксированная: приложение перестанет ждать раньше, чем "
-              "придёт подтверждение, либо будет ждать вечно")
+    ctx.check(
+        "в ответе — настоящий ожидаемый хэш",
+        re.search(r"memcpy\(\s*&out\[i\]\s*,\s*expAck\s*,\s*4\s*\)", code) is not None,
+        "в ответе команды 2 метка подтверждения нулевая/чужая: приложение ждёт по "
+        "ней подтверждение и не дождётся никогда",
+    )
+    ctx.check(
+        "оценка времени до ACK считается, а не константа",
+        "RESP_CODE_SENT" in hdr and re.search(r"est\s*=", code) is not None and "radioAirtimeMs" in code,
+        "оценка времени фиксированная: приложение перестанет ждать раньше, чем "
+        "придёт подтверждение, либо будет ждать вечно",
+    )
 
 
 def companion_send_latency_test(ctx):
@@ -626,22 +687,28 @@ def companion_send_latency_test(ctx):
         ctx.note("     SKIP companion_send_latency_test: кода компаньона рядом нет")
         return
     txt = proto.read_text(encoding="utf-8")
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in txt.splitlines())
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in txt.splitlines())
     # Блокирующая отправка в обработчике команды — это и есть задержка ответа.
     blocking = re.findall(r"(?<!Queued)\bfloodSend\s*\(", code)
-    ctx.check("обработчики приложения не выходят в эфир до ответа", not blocking,
-              "в companion_proto.cpp осталось %d вызов(а) floodSend: ответ приложению "
-              "задержится на ожидание канала и время кадра" % len(blocking))
-    ctx.check("отправка из приложения идёт через очередь",
-              "floodSendQueued(" in code,
-              "ни одной отправки через floodSendQueued: сообщение уходит в эфир из "
-              "обработчика команды, и подтверждение опаздывает")
+    ctx.check(
+        "обработчики приложения не выходят в эфир до ответа",
+        not blocking,
+        "в companion_proto.cpp осталось %d вызов(а) floodSend: ответ приложению "
+        "задержится на ожидание канала и время кадра" % len(blocking),
+    )
+    ctx.check(
+        "отправка из приложения идёт через очередь",
+        "floodSendQueued(" in code,
+        "ни одной отправки через floodSendQueued: сообщение уходит в эфир из "
+        "обработчика команды, и подтверждение опаздывает",
+    )
     # И сама очередь обязана существовать в ядре, иначе «queued» ничего не значит.
     core_tx = (ctx.core / "src" / "mesh_tx.cpp").read_text(encoding="utf-8")
-    ctx.check("ядро умеет отправку без выхода в эфир",
-              "void floodSendQueued(" in core_tx,
-              "в ядре нет floodSendQueued — очереди для первой копии не существует")
+    ctx.check(
+        "ядро умеет отправку без выхода в эфир",
+        "void floodSendQueued(" in core_tx,
+        "в ядре нет floodSendQueued — очереди для первой копии не существует",
+    )
 
 
 def dm_contact_frame_test(ctx):
@@ -659,38 +726,46 @@ def dm_contact_frame_test(ctx):
         ctx.note("     SKIP dm_contact_frame_test: кода компаньона рядом нет")
         return
     ctxt, ptxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, proto, hdr))
-    pcode = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                       for ln in ptxt.splitlines())
+    pcode = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in ptxt.splitlines())
 
-    ctx.check("прошивка закрывает хук лички",
-              re.search(r"(?m)^void\s+companionOnDirectText\s*\(", ctxt) is not None,
-              "companionOnDirectText не реализован: ядро зовёт его на каждое личное "
-              "сообщение, и прошивка не соберётся")
-    ctx.check("у кадра лички свой код",
-              "RESP_CODE_CONTACT_MSG_RECV" in htxt
-              and "RESP_CODE_CONTACT_MSG_RECV" in pcode,
-              "личка отдаётся кодом группового сообщения: приложение положит её в общий "
-              "канал, а не в переписку, и маршрут показывать будет не для кого")
-    ctx.check("старое приложение получает свой код кадра",
-              "RESP_CODE_CONTACT_MSG_RECV_V3" in pcode
-              and re.search(r"RESP_CODE_CONTACT_MSG_RECV\b(?!_V3)", pcode) is not None,
-              "для приложений до версии 3 кода лички нет: они не понимают полей качества "
-              "связи и разберут кадр со сдвигом")
-    ctx.check("в кадре лички шесть байт ключа собеседника",
-              re.search(r"memcpy\(&out\[i\],\s*m\.pub6,\s*6\)", pcode) is not None,
-              "в кадре нет начала ключа: приложение не поймёт, от кого сообщение")
-    ctx.check("номер канала в личку не попадает",
-              re.search(r"if\s*\(dm\)[^;]*pub6[^}]*\}\s*else", pcode) is not None,
-              "номер канала и ключ пишутся в кадр одинаково: у лички и группового здесь "
-              "разные поля, и приложение разберёт кадр со сдвигом")
-    ctx.check("тип текста уходит из сообщения, а не нулём",
-              re.search(r"out\[i\+\+\]\s*=\s*m\.txtType", pcode) is not None,
-              "тип текста прибит нулём: ответ командной строки приедет в приложение обычным "
-              "сообщением")
-    ctx.check("вид сообщения хранится в очереди",
-              "MSG_KIND_CONTACT" in htxt and "MSG_KIND_CONTACT" in ctxt,
-              "очередь не помнит, личка это или канал: обе команды синхронизации отдадут "
-              "один и тот же кадр")
+    ctx.check(
+        "прошивка закрывает хук лички",
+        re.search(r"(?m)^void\s+companionOnDirectText\s*\(", ctxt) is not None,
+        "companionOnDirectText не реализован: ядро зовёт его на каждое личное сообщение, и прошивка не соберётся",
+    )
+    ctx.check(
+        "у кадра лички свой код",
+        "RESP_CODE_CONTACT_MSG_RECV" in htxt and "RESP_CODE_CONTACT_MSG_RECV" in pcode,
+        "личка отдаётся кодом группового сообщения: приложение положит её в общий "
+        "канал, а не в переписку, и маршрут показывать будет не для кого",
+    )
+    ctx.check(
+        "старое приложение получает свой код кадра",
+        "RESP_CODE_CONTACT_MSG_RECV_V3" in pcode
+        and re.search(r"RESP_CODE_CONTACT_MSG_RECV\b(?!_V3)", pcode) is not None,
+        "для приложений до версии 3 кода лички нет: они не понимают полей качества связи и разберут кадр со сдвигом",
+    )
+    ctx.check(
+        "в кадре лички шесть байт ключа собеседника",
+        re.search(r"memcpy\(&out\[i\],\s*m\.pub6,\s*6\)", pcode) is not None,
+        "в кадре нет начала ключа: приложение не поймёт, от кого сообщение",
+    )
+    ctx.check(
+        "номер канала в личку не попадает",
+        re.search(r"if\s*\(dm\)[^;]*pub6[^}]*\}\s*else", pcode) is not None,
+        "номер канала и ключ пишутся в кадр одинаково: у лички и группового здесь "
+        "разные поля, и приложение разберёт кадр со сдвигом",
+    )
+    ctx.check(
+        "тип текста уходит из сообщения, а не нулём",
+        re.search(r"out\[i\+\+\]\s*=\s*m\.txtType", pcode) is not None,
+        "тип текста прибит нулём: ответ командной строки приедет в приложение обычным сообщением",
+    )
+    ctx.check(
+        "вид сообщения хранится в очереди",
+        "MSG_KIND_CONTACT" in htxt and "MSG_KIND_CONTACT" in ctxt,
+        "очередь не помнит, личка это или канал: обе команды синхронизации отдадут один и тот же кадр",
+    )
 
 
 def raw_rx_push_test(ctx):
@@ -705,22 +780,28 @@ def raw_rx_push_test(ctx):
         ctx.note("     SKIP raw_rx_push_test: кода компаньона рядом нет")
         return
     ctxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, hdr))
-    ctx.check("прошивка закрывает хук сырого приёма",
-              re.search(r"(?m)^void\s+mcOnRawRx\s*\(", ctxt) is not None,
-              "mcOnRawRx не переопределён: сработает заглушка ядра, и приложение не узнает "
-              "о переизданных ретранслятором пакетах")
-    ctx.check("у сырого журнала код оригинала",
-              "PUSH_CODE_LOG_RX_DATA" in htxt and "PUSH_CODE_LOG_RX_DATA" in ctxt,
-              "кадр журнала уходит чужим кодом — приложение его не разберёт")
+    ctx.check(
+        "прошивка закрывает хук сырого приёма",
+        re.search(r"(?m)^void\s+mcOnRawRx\s*\(", ctxt) is not None,
+        "mcOnRawRx не переопределён: сработает заглушка ядра, и приложение не узнает "
+        "о переизданных ретранслятором пакетах",
+    )
+    ctx.check(
+        "у сырого журнала код оригинала",
+        "PUSH_CODE_LOG_RX_DATA" in htxt and "PUSH_CODE_LOG_RX_DATA" in ctxt,
+        "кадр журнала уходит чужим кодом — приложение его не разберёт",
+    )
     body = _handler_body(ctxt, "void mcOnRawRx(")
-    ctx.check("длинный кадр в приложение не лезет",
-              re.search(r"len\s*\+\s*3\s*>\s*MAX_FRAME_SIZE", body) is not None,
-              "длина не проверяется: эфирный кадр длиннее кадра приложения, и копия вылезет "
-              "за буфер")
-    ctx.check("без подключения журнал молчит",
-              "bleConnected" in body,
-              "журнал собирается и шлётся без подключённого приложения: это работа на "
-              "каждый принятый кадр впустую")
+    ctx.check(
+        "длинный кадр в приложение не лезет",
+        re.search(r"len\s*\+\s*3\s*>\s*MAX_FRAME_SIZE", body) is not None,
+        "длина не проверяется: эфирный кадр длиннее кадра приложения, и копия вылезет за буфер",
+    )
+    ctx.check(
+        "без подключения журнал молчит",
+        "bleConnected" in body,
+        "журнал собирается и шлётся без подключённого приложения: это работа на каждый принятый кадр впустую",
+    )
 
 
 def path_recv_lastmod_test(ctx):
@@ -739,18 +820,23 @@ def path_recv_lastmod_test(ctx):
         return
     ctxt = comp.read_text(encoding="utf-8")
     body = _handler_body(ctxt, "void mcOnPathRecv(")
-    ctx.check("путь кладётся в outPath контакта",
-              "c.outPath" in body,
-              "mcOnPathRecv не сохраняет маршрут: приложению нечего показывать даже после синка")
-    ctx.check("изменённый путь поднимает lastmod",
-              re.search(r"if\s*\(changed\)\s*c\.lastmod\s*=", body) is not None,
-              "lastmod при изменении пути не поднимается: фильтр контактного синка "
-              "(c.lastmod <= contactIterSince) продолжит выбрасывать контакт, и новый путь "
-              "до приложения не доедет до следующего адверта")
-    ctx.check("lastmod растёт по часам узла, как у адверта",
-              "time(NULL)" in body,
-              "lastmod считается не по часам узла: синк приложения сверяет его со своей "
-              "шкалой времени")
+    ctx.check(
+        "путь кладётся в outPath контакта",
+        "c.outPath" in body,
+        "mcOnPathRecv не сохраняет маршрут: приложению нечего показывать даже после синка",
+    )
+    ctx.check(
+        "изменённый путь поднимает lastmod",
+        re.search(r"if\s*\(changed\)\s*c\.lastmod\s*=", body) is not None,
+        "lastmod при изменении пути не поднимается: фильтр контактного синка "
+        "(c.lastmod <= contactIterSince) продолжит выбрасывать контакт, и новый путь "
+        "до приложения не доедет до следующего адверта",
+    )
+    ctx.check(
+        "lastmod растёт по часам узла, как у адверта",
+        "time(NULL)" in body,
+        "lastmod считается не по часам узла: синк приложения сверяет его со своей шкалой времени",
+    )
 
 
 def raw_rx_diag_test(ctx):
@@ -775,24 +861,33 @@ def raw_rx_diag_test(ctx):
     ctxt, ptxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, proto, hdr))
 
     # Счётчики объявлены один раз и доступны обоим файлам.
-    ctx.check("счётчики 0x88 объявлены в компаньоне",
-              re.search(r"uint32_t\s+diagLogRxRecv\s*=", ctxt) is not None
-              and "diagLogRxPushed" in ctxt and "diagLogRxLost" in ctxt and "diagEchoOwn" in ctxt,
-              "нет счётчиков diagLogRx*: поток 0x88 нельзя измерить по концам")
-    ctx.check("заголовок объявляет счётчики для разбора кадров",
-              "extern uint32_t diagLogRxRecv" in htxt
-              and re.search(r"extern uint32_t\s+diagLogRxRecv[^;]*diagEchoOwn", htxt) is not None,
-              "счётчики не вынесены в companion_internal.h: сводка в companionTick их не увидит")
+    ctx.check(
+        "счётчики 0x88 объявлены в компаньоне",
+        re.search(r"uint32_t\s+diagLogRxRecv\s*=", ctxt) is not None
+        and "diagLogRxPushed" in ctxt
+        and "diagLogRxLost" in ctxt
+        and "diagEchoOwn" in ctxt,
+        "нет счётчиков diagLogRx*: поток 0x88 нельзя измерить по концам",
+    )
+    ctx.check(
+        "заголовок объявляет счётчики для разбора кадров",
+        "extern uint32_t diagLogRxRecv" in htxt
+        and re.search(r"extern uint32_t\s+diagLogRxRecv[^;]*diagEchoOwn", htxt) is not None,
+        "счётчики не вынесены в companion_internal.h: сводка в companionTick их не увидит",
+    )
 
     # Отправка: каждый ушедший приложению 0x88 считается и печатается короткой строкой.
     frame_body = _handler_body(ctxt, "void sendFrameToApp(")
-    ctx.check("ушедший 0x88 считается в sendFrameToApp",
-              "diagLogRxPushed" in frame_body,
-              "счётчик «ушло в BLE» не растёт при отправке: по чему тогда понимать, что поток "
-              "жив?")
-    ctx.check("0x88 печатается коротким счётчиком",
-              re.search(r"0x88[\s\S]{0,60}diagLogRxPushed", frame_body) is not None,
-              "короткая строка для 0x88 пропала: без неё ушедший кадр не отличить от [RX]")
+    ctx.check(
+        "ушедший 0x88 считается в sendFrameToApp",
+        "diagLogRxPushed" in frame_body,
+        "счётчик «ушло в BLE» не растёт при отправке: по чему тогда понимать, что поток жив?",
+    )
+    ctx.check(
+        "0x88 печатается коротким счётчиком",
+        re.search(r"0x88[\s\S]{0,60}diagLogRxPushed", frame_body) is not None,
+        "короткая строка для 0x88 пропала: без неё ушедший кадр не отличить от [RX]",
+    )
 
     # Приём: эхо своего пакета и счётчик потерь живут в mcOnRawRx.
     body = _handler_body(ctxt, "void mcOnRawRx(")
@@ -800,34 +895,42 @@ def raw_rx_diag_test(ctx):
     # только для кадра с ПУСТЫМ путём, то есть для нашей же передачи, которой мы не
     # слышим (на передаче приёмник глух). У переизданного кадра путь уже не пуст — ровно
     # этот случай детектор и обязан ловить.
-    ctx.check("эхо своего кадра опознаётся по src за путём",
-              re.search(r"raw\[off\s*\+\s*1\]\s*==\s*ownShortHash", body) is not None
-              and re.search(r"off\s*=\s*2\s*\+\s*\(int\)hops\s*\*\s*hsize", body)
-              is not None,
-              "хэш источника читается с постоянного смещения: у переизданного кадра путь "
-              "не пуст, источник уехал вправо, и эхо не опознается никогда")
-    ctx.check("смещение источника не читается за концом кадра",
-              re.search(r"len\s*>=\s*off\s*\+\s*2", body) is not None,
-              "смещение не сверяется с длиной: кадр с длинным путём уведёт чтение за "
-              "границу принятого")
-    ctx.check("эхо ищется среди лички и возврата маршрута",
-              "PAYLOAD_TYPE_TXT_MSG" in body and "PAYLOAD_TYPE_PATH" in body,
-              "эхо ищется не там: src в конверте есть у лички и возврата маршрута, у "
-              "канального кадра хэша источника нет вовсе")
-    ctx.check("счётчик эха растёт на каждом совпадении",
-              "diagEchoOwn++" in body,
-              "счётчик эха не растёт: сколько раз ретранслятор переиздал наш пакет, видно "
-              "не будет")
-    ctx.check("потери потока без BLE считаются",
-              "diagLogRxLost" in body,
-              "нет счётчика потерь: обрыв потока неотличим от тишины радио")
+    ctx.check(
+        "эхо своего кадра опознаётся по src за путём",
+        re.search(r"raw\[off\s*\+\s*1\]\s*==\s*ownShortHash", body) is not None
+        and re.search(r"off\s*=\s*2\s*\+\s*\(int\)hops\s*\*\s*hsize", body) is not None,
+        "хэш источника читается с постоянного смещения: у переизданного кадра путь "
+        "не пуст, источник уехал вправо, и эхо не опознается никогда",
+    )
+    ctx.check(
+        "смещение источника не читается за концом кадра",
+        re.search(r"len\s*>=\s*off\s*\+\s*2", body) is not None,
+        "смещение не сверяется с длиной: кадр с длинным путём уведёт чтение за границу принятого",
+    )
+    ctx.check(
+        "эхо ищется среди лички и возврата маршрута",
+        "PAYLOAD_TYPE_TXT_MSG" in body and "PAYLOAD_TYPE_PATH" in body,
+        "эхо ищется не там: src в конверте есть у лички и возврата маршрута, у "
+        "канального кадра хэша источника нет вовсе",
+    )
+    ctx.check(
+        "счётчик эха растёт на каждом совпадении",
+        "diagEchoOwn++" in body,
+        "счётчик эха не растёт: сколько раз ретранслятор переиздал наш пакет, видно не будет",
+    )
+    ctx.check(
+        "потери потока без BLE считаются",
+        "diagLogRxLost" in body,
+        "нет счётчика потерь: обрыв потока неотличим от тишины радио",
+    )
 
     # Сводка раз в 30 с живёт в такте.
-    tick = ptxt[ptxt.find("void companionTick()"):]
-    ctx.check("сводка 0x88 печатается из такта",
-              "diagLogRxRecv" in tick and "diagEchoOwn" in tick,
-              "сводки счётчиков в companionTick нет: итоговые числа приходится собирать по "
-              "строкам вручную")
+    tick = ptxt[ptxt.find("void companionTick()") :]
+    ctx.check(
+        "сводка 0x88 печатается из такта",
+        "diagLogRxRecv" in tick and "diagEchoOwn" in tick,
+        "сводки счётчиков в companionTick нет: итоговые числа приходится собирать по строкам вручную",
+    )
 
 
 def channel_push_ts_test(ctx):
@@ -853,42 +956,51 @@ def channel_push_ts_test(ctx):
     plat = core_hdr.read_text(encoding="utf-8")
 
     # Сигнатура: ядро и форк обязаны договориться о шестом параметре хука.
-    ctx.check("хук канала принимает метку отправителя в ядре",
-              re.search(r"companionOnChannelText\([^;]*uint32_t\s+senderTs", plat) is not None,
-              "mc_platform.h не объявил senderTs у хука канала: время приёма (time(NULL)) "
-              "снова уедет в очередь, и у чужих часов маршрут не найдётся")
-    ctx.check("сигнатура форка повторяет контракт ядра",
-              re.search(r"companionOnChannelText\([^;]*uint32_t\s+senderTs", htxt) is not None,
-              "companion.h не объявил senderTs: объявление и определение разъехались, и "
-              "компилятор молча оборвёт вызов")
+    ctx.check(
+        "хук канала принимает метку отправителя в ядре",
+        re.search(r"companionOnChannelText\([^;]*uint32_t\s+senderTs", plat) is not None,
+        "mc_platform.h не объявил senderTs у хука канала: время приёма (time(NULL)) "
+        "снова уедет в очередь, и у чужих часов маршрут не найдётся",
+    )
+    ctx.check(
+        "сигнатура форка повторяет контракт ядра",
+        re.search(r"companionOnChannelText\([^;]*uint32_t\s+senderTs", htxt) is not None,
+        "companion.h не объявил senderTs: объявление и определение разъехались, и компилятор молча оборвёт вызов",
+    )
 
     # Исходящая половина: метка из команды приложения обязана дойти до сборщика кадра.
     proto = ctx.root / "lib" / "meshcore" / "src" / "companion_proto.cpp"
     if proto.is_file():
-        pc = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                        for ln in proto.read_text(encoding="utf-8").splitlines())
-        ctx.check("метка приложения уходит в кадр канала",
-                  re.search(r"buildGroupFrameFlood\([^;]*chMsgTs", pc) is not None
-                  and re.search(r"memcpy\(&chMsgTs,\s*&f\[3\],\s*4\)", pc) is not None,
-                  "команда отправки в канал не отдаёт метку приложения сборщику кадра: "
-                  "приложение ищет собственное сообщение в журнале 0x88 по своей метке, а в "
-                  "эфир уйдёт метка узла — маршрут у своих исходящих не покажется")
+        pc = "\n".join(
+            (ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in proto.read_text(encoding="utf-8").splitlines()
+        )
+        ctx.check(
+            "метка приложения уходит в кадр канала",
+            re.search(r"buildGroupFrameFlood\([^;]*chMsgTs", pc) is not None
+            and re.search(r"memcpy\(&chMsgTs,\s*&f\[3\],\s*4\)", pc) is not None,
+            "команда отправки в канал не отдаёт метку приложения сборщику кадра: "
+            "приложение ищет собственное сообщение в журнале 0x88 по своей метке, а в "
+            "эфир уйдёт метка узла — маршрут у своих исходящих не покажется",
+        )
 
     body = _handler_body(ctxt, "void companionOnChannelText(")
     # Метку, которую увидит приложение, обязательно видно и в журнале узла: когда в
     # переписке стоит не то время, по строке сразу понятно, чьи часы врут.
-    ctx.check("метка сообщения печатается при постановке в очередь",
-              "logMsgTs(" in ctxt
-              and re.search(r'logMsgTs\(\s*"личка"', ctxt) is not None
-              and re.search(r'logMsgTs\(\s*"канал"', ctxt) is not None,
-              "метка времени не печатается: расхождение часов отправителя и узла видно "
-              "только в приложении, а по журналу узла не разобрать")
+    ctx.check(
+        "метка сообщения печатается при постановке в очередь",
+        "logMsgTs(" in ctxt
+        and re.search(r'logMsgTs\(\s*"личка"', ctxt) is not None
+        and re.search(r'logMsgTs\(\s*"канал"', ctxt) is not None,
+        "метка времени не печатается: расхождение часов отправителя и узла видно "
+        "только в приложении, а по журналу узла не разобрать",
+    )
 
-    ctx.check("метка отправителя идёт в очередь, а не время приёма",
-              re.search(r"m\.ts\s*=\s*senderTs", body) is not None
-              and "time(NULL)" not in body,
-              "в V3 уходит время приёма (time(NULL)): приложение сопоставляет сообщение с "
-              "журналом 0x88 по метке ОТПРАВИТЕЛЯ, и у узла с другими часами маршрут пропадёт")
+    ctx.check(
+        "метка отправителя идёт в очередь, а не время приёма",
+        re.search(r"m\.ts\s*=\s*senderTs", body) is not None and "time(NULL)" not in body,
+        "в V3 уходит время приёма (time(NULL)): приложение сопоставляет сообщение с "
+        "журналом 0x88 по метке ОТПРАВИТЕЛЯ, и у узла с другими часами маршрут пропадёт",
+    )
 
 
 def repeater_control_test(ctx):
@@ -910,122 +1022,159 @@ def repeater_control_test(ctx):
         ctx.note("     SKIP repeater_control_test: кода компаньона рядом нет")
         return
     ctxt, ptxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, proto, hdr))
-    pcode = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                       for ln in ptxt.splitlines())
+    pcode = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in ptxt.splitlines())
 
     # --- команды приложения на месте ---
-    for name, num in (("CMD_SEND_LOGIN", 26), ("CMD_SEND_STATUS_REQ", 27),
-                      ("CMD_HAS_CONNECTION", 28), ("CMD_LOGOUT", 29),
-                      ("CMD_SEND_TELEMETRY_REQ", 39), ("CMD_SEND_BINARY_REQ", 50),
-                      ("CMD_GET_STATS", 56)):
-        ctx.check("команда %s (%d) разбирается" % (name, num),
-                  re.search(r"#define\s+%s\s+%d\b" % (name, num), htxt) is not None
-                  and re.search(r"case\s+%s\s*:" % name, pcode) is not None,
-                  "команда %s не разобрана или её номер не тот: приложение шлёт именно "
-                  "этот номер, и ответом на незнакомую команду будет отказ" % name)
+    for name, num in (
+        ("CMD_SEND_LOGIN", 26),
+        ("CMD_SEND_STATUS_REQ", 27),
+        ("CMD_HAS_CONNECTION", 28),
+        ("CMD_LOGOUT", 29),
+        ("CMD_SEND_TELEMETRY_REQ", 39),
+        ("CMD_SEND_BINARY_REQ", 50),
+        ("CMD_GET_STATS", 56),
+    ):
+        ctx.check(
+            "команда %s (%d) разбирается" % (name, num),
+            re.search(r"#define\s+%s\s+%d\b" % (name, num), htxt) is not None
+            and re.search(r"case\s+%s\s*:" % name, pcode) is not None,
+            "команда %s не разобрана или её номер не тот: приложение шлёт именно "
+            "этот номер, и ответом на незнакомую команду будет отказ" % name,
+        )
 
     # --- вход ---
-    ctx.check("вход собирается сборщиком ядра",
-              "buildLoginFrame(" in pcode,
-              "вход собирается не ядром: конверт ANON_REQ отличается от лички, и собрать "
-              "его мимо ядра значит завести вторую раскладку кадра")
-    ctx.check("вход уходит через очередь передачи",
-              re.search(r"buildLoginFrame\([^;]*;[\s\S]{0,400}?floodSendQueued", pcode)
-              is not None,
-              "вход выходит в эфир прямо из обработчика: ответ приложению задержится на "
-              "ожидание канала и время кадра")
-    ctx.check("приложению отвечают меткой и оценкой ожидания",
-              re.search(r"static void sendReqSent", pcode) is not None
-              and "RESP_CODE_SENT" in pcode and "radioAirtimeMs" in pcode,
-              "ответ на команду запроса без метки или с постоянной оценкой: приложение не "
-              "сопоставит ответ либо перестанет его ждать раньше времени")
+    ctx.check(
+        "вход собирается сборщиком ядра",
+        "buildLoginFrame(" in pcode,
+        "вход собирается не ядром: конверт ANON_REQ отличается от лички, и собрать "
+        "его мимо ядра значит завести вторую раскладку кадра",
+    )
+    ctx.check(
+        "вход уходит через очередь передачи",
+        re.search(r"buildLoginFrame\([^;]*;[\s\S]{0,400}?floodSendQueued", pcode) is not None,
+        "вход выходит в эфир прямо из обработчика: ответ приложению задержится на ожидание канала и время кадра",
+    )
+    ctx.check(
+        "приложению отвечают меткой и оценкой ожидания",
+        re.search(r"static void sendReqSent", pcode) is not None
+        and "RESP_CODE_SENT" in pcode
+        and "radioAirtimeMs" in pcode,
+        "ответ на команду запроса без метки или с постоянной оценкой: приложение не "
+        "сопоставит ответ либо перестанет его ждать раньше времени",
+    )
 
     # --- ожидания и ответы ---
-    ctx.check("прошивка закрывает хук ответа",
-              re.search(r"(?m)^void\s+mcOnResponseRecv\s*\(", ctxt) is not None,
-              "mcOnResponseRecv не переопределён: ответы ретранслятора дойдут до ядра и "
-              "растворятся в заглушке")
+    ctx.check(
+        "прошивка закрывает хук ответа",
+        re.search(r"(?m)^void\s+mcOnResponseRecv\s*\(", ctxt) is not None,
+        "mcOnResponseRecv не переопределён: ответы ретранслятора дойдут до ядра и растворятся в заглушке",
+    )
     # Сброс обязан стоять в КАЖДОЙ команде запроса, а не в одной: ответ приходит секундами
     # позже, и ожидание от прошлого запроса подставится под новый ответ. Поэтому сверяем
     # число сбросов с числом заведённых ожиданий, а не наличие слова.
     pend = len(re.findall(r"reqPending(?:Login|Status|Telemetry|Binary)\(", pcode))
     clears = len(re.findall(r"reqPendingClear\(\)", pcode))
-    ctx.check("каждый запрос сбрасывает прежние ожидания", pend > 0 and clears == pend,
-              "ожиданий заведено %d, а сбросов %d: ответ на отменённый запрос подставится "
-              "под новый, и приложение получит чужие метрики" % (pend, clears))
+    ctx.check(
+        "каждый запрос сбрасывает прежние ожидания",
+        pend > 0 and clears == pend,
+        "ожиданий заведено %d, а сбросов %d: ответ на отменённый запрос подставится "
+        "под новый, и приложение получит чужие метрики" % (pend, clears),
+    )
     body = _handler_body(ctxt, "void mcOnResponseRecv(")
-    ctx.check("вход и состояние сопоставляются по началу ключа",
-              re.search(r"memcmp\(pendingLoginPub,\s*srcPub,\s*4\)", body) is not None
-              and re.search(r"memcmp\(pendingStatusPub,\s*srcPub,\s*4\)", body) is not None,
-              "вход и состояние сопоставляются не по ключу узла: так делает оригинал, и "
-              "иначе ответ чужой прошивки не опознается")
-    ctx.check("телеметрия и произвольный запрос сопоставляются по метке",
-              re.search(r"tag\s*==\s*pendingTelemetryTag", body) is not None
-              and re.search(r"tag\s*==\s*pendingBinaryTag", body) is not None,
-              "телеметрия и произвольный запрос сопоставляются не по метке запроса — "
-              "ответы перепутаются между собой")
-    for code in ("PUSH_CODE_LOGIN_SUCCESS", "PUSH_CODE_LOGIN_FAIL",
-                 "PUSH_CODE_STATUS_RESPONSE", "PUSH_CODE_TELEMETRY_RESPONSE",
-                 "PUSH_CODE_BINARY_RESPONSE"):
-        ctx.check("приложению уходит %s" % code,
-                  code in htxt and code in body,
-                  "кода %s нет: приложение не узнает об ответе ретранслятора" % code)
-    ctx.check("старый ответ на вход понимается тоже",
-              re.search(r'memcmp\(body,\s*"OK",\s*2\)', body) is not None,
-              "ответ «OK» старых ретрансляторов не понимается: в сети стоят узлы обеих "
-              "прошивок, и вход на старые будет выглядеть отказом")
+    ctx.check(
+        "вход и состояние сопоставляются по началу ключа",
+        re.search(r"memcmp\(pendingLoginPub,\s*srcPub,\s*4\)", body) is not None
+        and re.search(r"memcmp\(pendingStatusPub,\s*srcPub,\s*4\)", body) is not None,
+        "вход и состояние сопоставляются не по ключу узла: так делает оригинал, и "
+        "иначе ответ чужой прошивки не опознается",
+    )
+    ctx.check(
+        "телеметрия и произвольный запрос сопоставляются по метке",
+        re.search(r"tag\s*==\s*pendingTelemetryTag", body) is not None
+        and re.search(r"tag\s*==\s*pendingBinaryTag", body) is not None,
+        "телеметрия и произвольный запрос сопоставляются не по метке запроса — ответы перепутаются между собой",
+    )
+    for code in (
+        "PUSH_CODE_LOGIN_SUCCESS",
+        "PUSH_CODE_LOGIN_FAIL",
+        "PUSH_CODE_STATUS_RESPONSE",
+        "PUSH_CODE_TELEMETRY_RESPONSE",
+        "PUSH_CODE_BINARY_RESPONSE",
+    ):
+        ctx.check(
+            "приложению уходит %s" % code,
+            code in htxt and code in body,
+            "кода %s нет: приложение не узнает об ответе ретранслятора" % code,
+        )
+    ctx.check(
+        "старый ответ на вход понимается тоже",
+        re.search(r'memcmp\(body,\s*"OK",\s*2\)', body) is not None,
+        "ответ «OK» старых ретрансляторов не понимается: в сети стоят узлы обеих "
+        "прошивок, и вход на старые будет выглядеть отказом",
+    )
 
     # --- сессия входа ---
-    ctx.check("сессия входа удерживается продлением",
-              "sessionsTick()" in ptxt and "REQ_TYPE_KEEP_ALIVE" in ctxt,
-              "сессия не продлевается: ретранслятор забудет нас по тишине, и следующая "
-              "команда уйдёт в никуда, а приложение будет считать вход живым")
-    ctx.check("продление идёт раньше названного срока",
-              "KEEP_ALIVE_EARLY_PCT" in htxt
-              and "KEEP_ALIVE_EARLY_PCT" in ctxt,
-              "продление уходит ровно в срок: кадр летит по эфиру секунды, и прийти он "
-              "должен ДО того, как узел нас забудет")
+    ctx.check(
+        "сессия входа удерживается продлением",
+        "sessionsTick()" in ptxt and "REQ_TYPE_KEEP_ALIVE" in ctxt,
+        "сессия не продлевается: ретранслятор забудет нас по тишине, и следующая "
+        "команда уйдёт в никуда, а приложение будет считать вход живым",
+    )
+    ctx.check(
+        "продление идёт раньше названного срока",
+        "KEEP_ALIVE_EARLY_PCT" in htxt and "KEEP_ALIVE_EARLY_PCT" in ctxt,
+        "продление уходит ровно в срок: кадр летит по эфиру секунды, и прийти он должен ДО того, как узел нас забудет",
+    )
 
     # --- командная строка ---
-    ctx.check("командная строка доходит до ретранслятора",
-              re.search(r"cli\s*=\s*\(txtType\s*==\s*1\)", pcode) is not None
-              and re.search(r"txtType\s*==\s*0\s*\|\|\s*cli", pcode) is not None,
-              "компаньон отвергает всё, кроме обычного текста: командой ретранслятором не "
-              "управить")
-    ctx.check("команда уходит с часами узла, а не телефона",
-              re.search(r"cli\s*\?\s*0\s*:\s*msgTs", pcode) is not None,
-              "команда собирается с меткой телефона: ретранслятор отбивает повторы по "
-              "метке, и команда с чужими часами может выглядеть повтором")
-    ctx.check("подтверждения на команду не ждут",
-              re.search(r"if\s*\(fl\s*>\s*0\s*&&\s*!cli\)\s*ackExpect", pcode) is not None,
-              "на командную строку ждут подтверждение: его не будет (ответом служит сам "
-              "ответ командной строки), и слот ожидания займётся впустую")
+    ctx.check(
+        "командная строка доходит до ретранслятора",
+        re.search(r"cli\s*=\s*\(txtType\s*==\s*1\)", pcode) is not None
+        and re.search(r"txtType\s*==\s*0\s*\|\|\s*cli", pcode) is not None,
+        "компаньон отвергает всё, кроме обычного текста: командой ретранслятором не управить",
+    )
+    ctx.check(
+        "команда уходит с часами узла, а не телефона",
+        re.search(r"cli\s*\?\s*0\s*:\s*msgTs", pcode) is not None,
+        "команда собирается с меткой телефона: ретранслятор отбивает повторы по "
+        "метке, и команда с чужими часами может выглядеть повтором",
+    )
+    ctx.check(
+        "подтверждения на команду не ждут",
+        re.search(r"if\s*\(fl\s*>\s*0\s*&&\s*!cli\)\s*ackExpect", pcode) is not None,
+        "на командную строку ждут подтверждение: его не будет (ответом служит сам "
+        "ответ командной строки), и слот ожидания займётся впустую",
+    )
 
     # --- метрики своего узла ---
-    stats = pcode[pcode.find("case CMD_GET_STATS"):]
-    stats = stats[:stats.find("case CMD_SEND_SELF_ADVERT")] if "case CMD_SEND_SELF_ADVERT" in stats else stats
-    ctx.check("метрики своего узла отдаются тремя видами",
-              all(t in stats for t in ("STATS_TYPE_CORE", "STATS_TYPE_RADIO",
-                                       "STATS_TYPE_PACKETS")),
-              "не все виды метрик своего узла отдаются: приложение показывает их тремя "
-              "разными экранами")
-    ctx.check("метрики берутся из счётчиков ядра",
-              all(n in stats for n in ("txAirtimeMs", "rxAirtimeMs", "recvFloodCount",
-                                       "rxErrorCount", "meshTxQueuedCount")),
-              "метрики считаются в прошивке заново или прибиты нулями: складывать их может "
-              "только ядро, где и происходит эфир")
+    stats = pcode[pcode.find("case CMD_GET_STATS") :]
+    stats = stats[: stats.find("case CMD_SEND_SELF_ADVERT")] if "case CMD_SEND_SELF_ADVERT" in stats else stats
+    ctx.check(
+        "метрики своего узла отдаются тремя видами",
+        all(t in stats for t in ("STATS_TYPE_CORE", "STATS_TYPE_RADIO", "STATS_TYPE_PACKETS")),
+        "не все виды метрик своего узла отдаются: приложение показывает их тремя разными экранами",
+    )
+    ctx.check(
+        "метрики берутся из счётчиков ядра",
+        all(n in stats for n in ("txAirtimeMs", "rxAirtimeMs", "recvFloodCount", "rxErrorCount", "meshTxQueuedCount")),
+        "метрики считаются в прошивке заново или прибиты нулями: складывать их может "
+        "только ядро, где и происходит эфир",
+    )
     # Именно ветка else, а не любое упоминание отказа в этой команде: отказ по короткому
     # кадру стоит в её начале, и по нему проверка проходила даже без разбора вида метрик.
-    ctx.check("неизвестный вид метрик отвергается",
-              re.search(r"\}\s*else\s*\{\s*sendErr\(ERR_CODE_ILLEGAL_ARG\);\s*break;",
-                        stats) is not None,
-              "на незнакомый вид метрик уйдёт пустой кадр вместо отказа, и приложение "
-              "разберёт его как настоящий")
-    ctx.check("своя телеметрия кодируется как у оригинала",
-              "TELEM_CHANNEL_SELF" in pcode and "TELEM_TYPE_VOLTAGE" in pcode
-              and re.search(r"v100\s*>>\s*8", pcode) is not None,
-              "своя телеметрия закодирована не по CayenneLPP (канал, тип, значение старшим "
-              "байтом вперёд) — приложение прочитает мусор")
+    ctx.check(
+        "неизвестный вид метрик отвергается",
+        re.search(r"\}\s*else\s*\{\s*sendErr\(ERR_CODE_ILLEGAL_ARG\);\s*break;", stats) is not None,
+        "на незнакомый вид метрик уйдёт пустой кадр вместо отказа, и приложение разберёт его как настоящий",
+    )
+    ctx.check(
+        "своя телеметрия кодируется как у оригинала",
+        "TELEM_CHANNEL_SELF" in pcode
+        and "TELEM_TYPE_VOLTAGE" in pcode
+        and re.search(r"v100\s*>>\s*8", pcode) is not None,
+        "своя телеметрия закодирована не по CayenneLPP (канал, тип, значение старшим "
+        "байтом вперёд) — приложение прочитает мусор",
+    )
 
 
 def contacts_rotation_test(ctx):
@@ -1046,24 +1195,28 @@ def contacts_rotation_test(ctx):
         return
     ctxt, htxt = (f.read_text(encoding="utf-8") for f in (comp, hdr))
     body = _handler_body(ctxt, "void companionOnAdvert(")
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in body.splitlines())
-    ctx.check("место под новый контакт освобождается самым давним",
-              re.search(r"lastmod\s*<\s*oldest", code) is not None,
-              "при полной памяти новый узел не запоминается вовсе: сеть растёт, а узел "
-              "перестаёт видеть новых соседей")
-    ctx.check("избранные не вытесняются",
-              re.search(r"flags\s*&\s*0x01", code) is not None,
-              "под ротацию попадает отмеченный владельцем контакт: случайный прохожий "
-              "вытеснит из памяти нужный узел")
-    ctx.check("приложению говорят о вытесненном контакте",
-              "PUSH_CODE_CONTACT_DELETED" in code and "PUSH_CODE_CONTACT_DELETED" in htxt,
-              "вытеснение молчит: приложение продолжит показывать контакт, которого на узле "
-              "уже нет, и писать ему в пустоту")
-    ctx.check("приложению говорят о переполнении",
-              "PUSH_CODE_CONTACTS_FULL" in code and "PUSH_CODE_CONTACTS_FULL" in htxt,
-              "когда все контакты избранные, новые перестают запоминаться беззвучно — "
-              "владелец узнает об этом только по пропавшим узлам")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in body.splitlines())
+    ctx.check(
+        "место под новый контакт освобождается самым давним",
+        re.search(r"lastmod\s*<\s*oldest", code) is not None,
+        "при полной памяти новый узел не запоминается вовсе: сеть растёт, а узел перестаёт видеть новых соседей",
+    )
+    ctx.check(
+        "избранные не вытесняются",
+        re.search(r"flags\s*&\s*0x01", code) is not None,
+        "под ротацию попадает отмеченный владельцем контакт: случайный прохожий вытеснит из памяти нужный узел",
+    )
+    ctx.check(
+        "приложению говорят о вытесненном контакте",
+        "PUSH_CODE_CONTACT_DELETED" in code and "PUSH_CODE_CONTACT_DELETED" in htxt,
+        "вытеснение молчит: приложение продолжит показывать контакт, которого на узле уже нет, и писать ему в пустоту",
+    )
+    ctx.check(
+        "приложению говорят о переполнении",
+        "PUSH_CODE_CONTACTS_FULL" in code and "PUSH_CODE_CONTACTS_FULL" in htxt,
+        "когда все контакты избранные, новые перестают запоминаться беззвучно — "
+        "владелец узнает об этом только по пропавшим узлам",
+    )
 
 
 def companion_bounds_test(ctx):
@@ -1072,8 +1225,10 @@ def companion_bounds_test(ctx):
         return
     code = (
         COMPANION_PRELUDE
-        + ctx.grab("lib/meshcore/src/companion_proto.cpp", "static uint16_t advertPathBytes(") + "\n"
-        + ctx.grab("lib/meshcore/src/companion_proto.cpp", "static size_t putTextBounded(") + "\n"
+        + ctx.grab("lib/meshcore/src/companion_proto.cpp", "static uint16_t advertPathBytes(")
+        + "\n"
+        + ctx.grab("lib/meshcore/src/companion_proto.cpp", "static size_t putTextBounded(")
+        + "\n"
         + COMPANION_MAIN
     )
     with tempfile.TemporaryDirectory() as tmp:
@@ -1082,13 +1237,18 @@ def companion_bounds_test(ctx):
         src.write_text(code, encoding="utf-8")
         build = subprocess.run(
             ["g++", "-std=c++17", "-fsanitize=address,undefined", "-g", str(src), "-o", str(exe)],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         if build.returncode != 0:
             ctx.check("сборка теста границ команд приложения", False, build.stderr.strip()[:400])
             return
         run = subprocess.run([str(exe)], capture_output=True, text=True)
-        ctx.check("границы команд приложения (путь рекламы, текст в кадре)",
-              run.returncode == 0, (run.stdout + run.stderr).strip()[:600])
+        ctx.check(
+            "границы команд приложения (путь рекламы, текст в кадре)",
+            run.returncode == 0,
+            (run.stdout + run.stderr).strip()[:600],
+        )
 
 
 # ===== Добавка к общей проверке чистых функций =====
@@ -1135,7 +1295,7 @@ PURE_LABEL = "числа, версии, диапазоны настроек и s
 PURE_EXTRA_PRELUDE = (
     "struct String {\n"
     "  std::string s;\n"
-    "  String(const char* p = \"\") : s(p) {}\n"
+    '  String(const char* p = "") : s(p) {}\n'
     "  const char* c_str() const { return s.c_str(); }\n"
     "  int indexOf(char c, int from) const {\n"
     "    size_t p = s.find(c, (size_t)from);\n"

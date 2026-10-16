@@ -5,8 +5,8 @@
 шрифтам вообще, а не к загрузчику).
 Проверки ядра — в suite_core.
 """
+
 import io
-import os
 import pathlib
 import re
 import shutil
@@ -23,16 +23,19 @@ import zlib
 # об этом лучше здесь, чем на карте.
 def tapp_test(ctx):
     import tarfile as tf
+
     app = ctx.root / "apps" / "calendar"
     if not (app / "setting.json").exists():
         print("SKIP apps/calendar нет — проверка пакета пропущена")
         return
     with tempfile.TemporaryDirectory() as tmp:
-        r = subprocess.run([sys.executable, str(ctx.root / "scripts" / "mkapp.py"), str(app),
-                            "-o", tmp], capture_output=True, text=True)
+        r = subprocess.run(
+            [sys.executable, str(ctx.root / "scripts" / "mkapp.py"), str(app), "-o", tmp],
+            capture_output=True,
+            text=True,
+        )
         out = pathlib.Path(tmp) / "calendar.tapp"
-        ctx.check("mkapp собирает пакет", r.returncode == 0 and out.exists(),
-              (r.stdout + r.stderr).strip()[:300])
+        ctx.check("mkapp собирает пакет", r.returncode == 0 and out.exists(), (r.stdout + r.stderr).strip()[:300])
         if not out.exists():
             return
         blob = out.read_bytes()
@@ -43,17 +46,14 @@ def tapp_test(ctx):
         except zlib.error as e:
             ctx.check("пакет: поток распаковывается", False, str(e))
             return
-        ctx.check("пакет: объявленная длина", len(raw) == size,
-              "в заголовке %d, распаковалось %d" % (size, len(raw)))
+        ctx.check("пакет: объявленная длина", len(raw) == size, "в заголовке %d, распаковалось %d" % (size, len(raw)))
         ctx.check("пакет: CRC32 содержимого", (zlib.crc32(raw) & 0xFFFFFFFF) == crc)
-        names = tf.open(fileobj=io.BytesIO(raw)).getnames()
+        with tf.open(fileobj=io.BytesIO(raw)) as f:
+            names = f.getnames()
         tops = {n.split("/")[0] for n in names}
-        ctx.check("пакет: одна папка верхнего уровня", len(tops) == 1,
-              "нашлось: " + ", ".join(sorted(tops)))
-        ctx.check("пакет: внутри есть описание",
-              any(n.endswith("/setting.json") for n in names), ", ".join(names))
-        ctx.check("пакет: без путей наружу",
-              all(not n.startswith("/") and ".." not in n for n in names))
+        ctx.check("пакет: одна папка верхнего уровня", len(tops) == 1, "нашлось: " + ", ".join(sorted(tops)))
+        ctx.check("пакет: внутри есть описание", any(n.endswith("/setting.json") for n in names), ", ".join(names))
+        ctx.check("пакет: без путей наружу", all(not n.startswith("/") and ".." not in n for n in names))
 
 
 # ===== Загрузчик приложений: проверка шапки ELF =====
@@ -106,30 +106,44 @@ def elf_sections_test(ctx):
     собрать (она тянет флеш, PSRAM и таблицу символов прошивки). Но оба утверждения видны в
     исходнике однозначно."""
     src = (ctx.root / "src" / "tdeck_elf.cpp").read_text(encoding="utf-8")
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                     for ln in src.splitlines())
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in src.splitlines())
 
-    ctx.check("имя секции берётся через strAt",
-              re.search(r"strAt\s*\(\s*shNames\s*,", code) is not None,
-              "имя секции читается как shNames + sh_name: без нуля внутри .shstrtab strcmp "
-              "уйдёт за границу секции")
-    ctx.check("сломанное имя секции — отказ",
-              re.search(r"if\s*\(\s*!\s*nm\s*\)\s*return\s+setError", code) is not None,
-              "результат strAt для имени секции не проверяется на 0")
-    ctx.check("strAt проверяет нуль внутри секции",
-              "memchr" in ctx.grab("src/tdeck_elf.cpp", "static const char* strAt("),
-              "strAt больше не ищет завершающий нуль — проверка выше стала бессмысленной")
+    ctx.check(
+        "имя секции берётся через strAt",
+        re.search(r"strAt\s*\(\s*shNames\s*,", code) is not None,
+        "имя секции читается как shNames + sh_name: без нуля внутри .shstrtab strcmp уйдёт за границу секции",
+    )
+    ctx.check(
+        "сломанное имя секции — отказ",
+        re.search(r"if\s*\(\s*!\s*nm\s*\)\s*return\s+setError", code) is not None,
+        "результат strAt для имени секции не проверяется на 0",
+    )
+    ctx.check(
+        "strAt проверяет нуль внутри секции",
+        "memchr" in ctx.grab("src/tdeck_elf.cpp", "static const char* strAt("),
+        "strAt больше не ищет завершающий нуль — проверка выше стала бессмысленной",
+    )
 
-    ctx.check(".rel.dyn отвергается явно",
-              re.search(r'strcmp\s*\(\s*nm\s*,\s*"\.rel\.dyn"\s*\)[^;]*?\n?[^;]*?'
-                        r'sh_size\s*\)\s*return\s+setError', code) is not None,
-              ".rel.dyn не отвергается: он разберётся структурой RELA в 12 байт вместо 8")
-    ctx.check("таблица релокаций одна (.rela.dyn)",
-              re.search(r"int16_t\s+rela\s*=\s*-1", code) is not None,
-              "rela снова массив из двух: значит .rel.dyn опять идёт в разбор RELA")
-    ctx.check("размер таблицы релокаций делится на размер записи",
-              re.search(r"sh_size\s*%\s*sizeof\s*\(\s*ElfRela\s*\)", code) is not None,
-              "хвост таблицы читается за границей секции, а записей считается на одну больше")
+    ctx.check(
+        ".rel.dyn отвергается явно",
+        re.search(
+            r'strcmp\s*\(\s*nm\s*,\s*"\.rel\.dyn"\s*\)[^;]*?\n?[^;]*?'
+            r"sh_size\s*\)\s*return\s+setError",
+            code,
+        )
+        is not None,
+        ".rel.dyn не отвергается: он разберётся структурой RELA в 12 байт вместо 8",
+    )
+    ctx.check(
+        "таблица релокаций одна (.rela.dyn)",
+        re.search(r"int16_t\s+rela\s*=\s*-1", code) is not None,
+        "rela снова массив из двух: значит .rel.dyn опять идёт в разбор RELA",
+    )
+    ctx.check(
+        "размер таблицы релокаций делится на размер записи",
+        re.search(r"sh_size\s*%\s*sizeof\s*\(\s*ElfRela\s*\)", code) is not None,
+        "хвост таблицы читается за границей секции, а записей считается на одну больше",
+    )
 
 
 def elf_headers_test(ctx):
@@ -146,24 +160,55 @@ def elf_headers_test(ctx):
     code = (
         "#include <cstdint>\n#include <cstring>\n#include <cstddef>\n"
         "#define PT_LOAD 1\n#define EM_XTENSA 94\n"
-        "#define TDECK_ELF_IMAGE_MAX (%s)\n" % m.group(1)
-        + ctx.grab("src/tdeck_elf.cpp", "struct ElfEhdr {") + ";\n"
-        + ctx.grab("src/tdeck_elf.cpp", "struct ElfPhdr {") + ";\n"
-        + ctx.grab("src/tdeck_elf.cpp", "struct ElfShdr {") + ";\n"
-        + ctx.grab("src/tdeck_elf.cpp", "static const char* elfCheckHeaders(") + "\n"
+        "#define TDECK_ELF_IMAGE_MAX (%s)\n"
+        % m.group(1)
+        + ctx.grab("src/tdeck_elf.cpp", "struct ElfEhdr {")
+        + ";\n"
+        + ctx.grab("src/tdeck_elf.cpp", "struct ElfPhdr {")
+        + ";\n"
+        + ctx.grab("src/tdeck_elf.cpp", "struct ElfShdr {")
+        + ";\n"
+        + ctx.grab("src/tdeck_elf.cpp", "static const char* elfCheckHeaders(")
+        + "\n"
         + ELF_MAIN
     )
 
     import struct as _s
 
     def ehdr(**kw):
-        f = dict(magic=b"\x7fELF", cls=1, data=1, e_type=2, e_machine=94,
-                 phoff=52, phentsize=32, phnum=1, shoff=84, shentsize=40, shnum=1, shstrndx=0)
+        f = {
+            "magic": b"\x7fELF",
+            "cls": 1,
+            "data": 1,
+            "e_type": 2,
+            "e_machine": 94,
+            "phoff": 52,
+            "phentsize": 32,
+            "phnum": 1,
+            "shoff": 84,
+            "shentsize": 40,
+            "shnum": 1,
+            "shstrndx": 0,
+        }
         f.update(kw)
         ident = f["magic"] + bytes([f["cls"], f["data"], 1, 0]) + b"\0" * 8
-        return _s.pack("<16sHHIIIIIHHHHHH", ident, f["e_type"], f["e_machine"], 1, 0,
-                       f["phoff"], f["shoff"], 0, 52, f["phentsize"], f["phnum"],
-                       f["shentsize"], f["shnum"], f["shstrndx"])
+        return _s.pack(
+            "<16sHHIIIIIHHHHHH",
+            ident,
+            f["e_type"],
+            f["e_machine"],
+            1,
+            0,
+            f["phoff"],
+            f["shoff"],
+            0,
+            52,
+            f["phentsize"],
+            f["phnum"],
+            f["shentsize"],
+            f["shnum"],
+            f["shstrndx"],
+        )
 
     def phdr(p_type=1, off=0, vaddr=0x3C800000, filesz=0x20, memsz=0x40):
         return _s.pack("<8I", p_type, off, vaddr, vaddr, filesz, memsz, 0, 4)
@@ -172,25 +217,25 @@ def elf_headers_test(ctx):
         return _s.pack("<10I", 0, 3, 0, 0, off, size, 0, 0, 1, 0)
 
     def elf(eh=None, ph=None, sh=None):
-        return (eh if eh is not None else ehdr()) + \
-               (ph if ph is not None else phdr()) + \
-               (sh if sh is not None else shdr())
+        return (
+            (eh if eh is not None else ehdr()) + (ph if ph is not None else phdr()) + (sh if sh is not None else shdr())
+        )
 
     cases = [
-        ("годный файл",                 elf(),                                        "OK"),
-        ("обрезанный файл",             elf()[:20],                                   "ERR too small"),
-        ("не ELF",                      elf(eh=ehdr(magic=b"NOPE")),                  "ERR not ELF"),
-        ("64 бита",                     elf(eh=ehdr(cls=2)),                          "ERR not ELF32-LE"),
-        ("чужая платформа",             elf(eh=ehdr(e_machine=40)),                   "ERR not Xtensa"),
-        ("слишком много заголовков",    elf(eh=ehdr(phnum=17)),                       "ERR too many hdrs"),
-        ("таблица программ за концом",  elf(eh=ehdr(phoff=9000)),                     "ERR ph out"),
-        ("сегмент за концом файла",     elf(ph=phdr(off=9000)),                       "ERR load out"),
+        ("годный файл", elf(), "OK"),
+        ("обрезанный файл", elf()[:20], "ERR too small"),
+        ("не ELF", elf(eh=ehdr(magic=b"NOPE")), "ERR not ELF"),
+        ("64 бита", elf(eh=ehdr(cls=2)), "ERR not ELF32-LE"),
+        ("чужая платформа", elf(eh=ehdr(e_machine=40)), "ERR not Xtensa"),
+        ("слишком много заголовков", elf(eh=ehdr(phnum=17)), "ERR too many hdrs"),
+        ("таблица программ за концом", elf(eh=ehdr(phoff=9000)), "ERR ph out"),
+        ("сегмент за концом файла", elf(ph=phdr(off=9000)), "ERR load out"),
         # Размеры подобраны так, чтобы сработала именно эта проверка: filesz должен влезать
         # в файл, иначе раньше сработает «load out».
-        ("filesz больше memsz",         elf(ph=phdr(filesz=0x40, memsz=0x20)),        "ERR filesz > memsz"),
-        ("образ короче слова",          elf(ph=phdr(filesz=2, memsz=2)),              "ERR image too small"),
-        ("образ больше предела",        elf(ph=phdr(filesz=0, memsz=image_max + 16)), "ERR image too big"),
-        ("нет ни одного PT_LOAD",       elf(ph=phdr(p_type=0)),                       "ERR empty image"),
+        ("filesz больше memsz", elf(ph=phdr(filesz=0x40, memsz=0x20)), "ERR filesz > memsz"),
+        ("образ короче слова", elf(ph=phdr(filesz=2, memsz=2)), "ERR image too small"),
+        ("образ больше предела", elf(ph=phdr(filesz=0, memsz=image_max + 16)), "ERR image too big"),
+        ("нет ни одного PT_LOAD", elf(ph=phdr(p_type=0)), "ERR empty image"),
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -199,7 +244,9 @@ def elf_headers_test(ctx):
         src.write_text(code, encoding="utf-8")
         build = subprocess.run(
             ["g++", "-std=c++17", "-fsanitize=address,undefined", "-g", str(src), "-o", str(exe)],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         if build.returncode != 0:
             ctx.check("сборка теста шапки ELF", False, build.stderr.strip()[:400])
             return
@@ -209,12 +256,14 @@ def elf_headers_test(ctx):
             f.write_bytes(data)
             run = subprocess.run([str(exe), str(f)], capture_output=True, text=True)
             got = run.stdout.strip()
-            ok = (got.startswith("OK") if want == "OK" else got == want)
+            ok = got.startswith("OK") if want == "OK" else got == want
             if run.returncode != 0 or not ok:
-                bad.append("%s: ожидалось «%s», получено «%s»%s"
-                           % (name, want, got, " (санитайзер)" if run.returncode else ""))
-        ctx.check("шапка ELF: %d подделок отвергнуты, годный файл принят" % (len(cases) - 1),
-              not bad, "; ".join(bad)[:400])
+                bad.append(
+                    "%s: ожидалось «%s», получено «%s»%s" % (name, want, got, " (санитайзер)" if run.returncode else "")
+                )
+        ctx.check(
+            "шапка ELF: %d подделок отвергнуты, годный файл принят" % (len(cases) - 1), not bad, "; ".join(bad)[:400]
+        )
 
 
 # ===== Добавка к общей проверке границ буферов =====
@@ -288,38 +337,46 @@ def app_frame_ms_test(ctx):
     if not (api.is_file() and apps_h.is_file() and elf.is_file() and ui.is_file()):
         ctx.note("     SKIP app_frame_ms_test: исходников T-Deck рядом нет")
         return
-    api_t, apps_t, elf_t, ui_t = (f.read_text(encoding="utf-8")
-                                  for f in (api, apps_h, elf, ui))
+    api_t, apps_t, elf_t, ui_t = (f.read_text(encoding="utf-8") for f in (api, apps_h, elf, ui))
 
-    ctx.check("точка входа шага кадра объявлена в АБИ",
-              re.search(r"(?m)^uint16_t\s+appFrameMs\s*\(\s*\)\s*;", api_t) is not None,
-              "appFrameMs нет в tdeck_api.h — приложению нечем попросить кадр, и ни одна "
-              "анимация в приложении невозможна")
-    ctx.check("реестр хранит шаг кадра приложения",
-              "frameMs" in apps_t,
-              "в структурах реестра нет поля шага кадра: оболочке неоткуда его взять")
-    ctx.check("загрузчик считает шаг кадра необязательным",
-              re.search(r'\{\s*"appFrameMs"[^}]*true\s*\}', elf_t) is not None
-              and re.search(r"optional", elf_t) is not None,
-              "appFrameMs требуется наравне с остальными: уже собранные приложения "
-              "(календарь, заметки) перестанут грузиться")
-    ctx.check("обязательные точки входа остались обязательными",
-              re.search(r'\{\s*"appDraw"[^}]*false\s*\}', elf_t) is not None,
-              "appDraw помечен необязательным — приложение без рисования загрузится и "
-              "упадёт при первом кадре")
-    ctx.check("оболочка спрашивает шаг у ОТКРЫТОГО приложения",
-              re.search(r"tdeckAppFrameMs\(\s*curApp\s*\)", ui_t) is not None,
-              "шаг кадра берётся не у открытого приложения: частый кадр нужен тому, что "
-              "сейчас на экране, а шина у платы одна")
-    ctx.check("шаг кадра ограничен снизу",
-              re.search(r"want\s*<\s*\(uint16_t\)TDECK_ANIM_FRAME_MS", ui_t) is not None,
-              "предела нет: приложение сможет попросить кадр каждую миллисекунду и займёт "
-              "шину SPI, общую с радио")
+    ctx.check(
+        "точка входа шага кадра объявлена в АБИ",
+        re.search(r"(?m)^uint16_t\s+appFrameMs\s*\(\s*\)\s*;", api_t) is not None,
+        "appFrameMs нет в tdeck_api.h — приложению нечем попросить кадр, и ни одна анимация в приложении невозможна",
+    )
+    ctx.check(
+        "реестр хранит шаг кадра приложения",
+        "frameMs" in apps_t,
+        "в структурах реестра нет поля шага кадра: оболочке неоткуда его взять",
+    )
+    ctx.check(
+        "загрузчик считает шаг кадра необязательным",
+        re.search(r'\{\s*"appFrameMs"[^}]*true\s*\}', elf_t) is not None and re.search(r"optional", elf_t) is not None,
+        "appFrameMs требуется наравне с остальными: уже собранные приложения (календарь, заметки) перестанут грузиться",
+    )
+    ctx.check(
+        "обязательные точки входа остались обязательными",
+        re.search(r'\{\s*"appDraw"[^}]*false\s*\}', elf_t) is not None,
+        "appDraw помечен необязательным — приложение без рисования загрузится и упадёт при первом кадре",
+    )
+    ctx.check(
+        "оболочка спрашивает шаг у ОТКРЫТОГО приложения",
+        re.search(r"tdeckAppFrameMs\(\s*curApp\s*\)", ui_t) is not None,
+        "шаг кадра берётся не у открытого приложения: частый кадр нужен тому, что "
+        "сейчас на экране, а шина у платы одна",
+    )
+    ctx.check(
+        "шаг кадра ограничен снизу",
+        re.search(r"want\s*<\s*\(uint16_t\)TDECK_ANIM_FRAME_MS", ui_t) is not None,
+        "предела нет: приложение сможет попросить кадр каждую миллисекунду и займёт шину SPI, общую с радио",
+    )
     sym = (ctx.root / "src" / "tdeck_symtab.cpp").read_text(encoding="utf-8")
-    ctx.check("приложению доступны часы",
-              re.search(r'S\("millis"', sym) is not None,
-              "millis не экспортирован: движение приложению придётся считать по кадрам, а "
-              "кадр может задержаться или прийти дважды")
+    ctx.check(
+        "приложению доступны часы",
+        re.search(r'S\("millis"', sym) is not None,
+        "millis не экспортирован: движение приложению придётся считать по кадрам, а "
+        "кадр может задержаться или прийти дважды",
+    )
 
 
 # ===== Правила самой игры =====
@@ -449,8 +506,11 @@ def snake_rules_test(ctx):
 """
     for name in ("COLS", "ROWS", "BODY_MAX", "STEP_MS_START", "STEP_MS_MIN", "STEP_MS_DEC"):
         m = re.search(r"(?m)^#define\s+%s\s+(\d+)" % name, src)
-        ctx.check("в приложении задано %s" % name, m is not None,
-                  "константа %s не найдена — проверять правила не на чем" % name)
+        ctx.check(
+            "в приложении задано %s" % name,
+            m is not None,
+            "константа %s не найдена — проверять правила не на чем" % name,
+        )
         if m is None:
             return
         prelude += "#define %s %s\n" % (name, m.group(1))
@@ -464,11 +524,18 @@ static uint32_t stepMs = STEP_MS_START;
 static uint32_t steps = 0;
 static void foodPlace() { food = (uint16_t)((food + 7u) % (COLS * ROWS)); }
 """
-    for sig in ("static inline uint16_t cellOf(", "static inline int cellX(",
-                "static inline int cellY(", "static bool stepOnce("):
+    for sig in (
+        "static inline uint16_t cellOf(",
+        "static inline int cellX(",
+        "static inline int cellY(",
+        "static bool stepOnce(",
+    ):
         code = ctx.grab(app, sig)
-        ctx.check("вырезан %s" % sig.split()[-1].rstrip("("), bool(code),
-                  "не нашлась функция %s — правила проверить нечем" % sig)
+        ctx.check(
+            "вырезан %s" % sig.split()[-1].rstrip("("),
+            bool(code),
+            "не нашлась функция %s — правила проверить нечем" % sig,
+        )
         prelude += code + "\n"
 
     ok, out = ctx.host_run(prelude + SNAKE_MAIN, "snake.cpp", "правила змейки")
@@ -677,19 +744,35 @@ def menu_carousel_test(ctx):
     prelude = """#include <stdint.h>
 #include <stdio.h>
 """
-    for name in ("TILE", "TILE_S1", "TILE_S2", "STEP1", "STEP2", "MENU_TOP", "MENU_CAP_DY",
-                 "MENU_CAP_EDGE", "MENU_CAP_GAP", "MENU_CAP_MIN"):
+    for name in (
+        "TILE",
+        "TILE_S1",
+        "TILE_S2",
+        "STEP1",
+        "STEP2",
+        "MENU_TOP",
+        "MENU_CAP_DY",
+        "MENU_CAP_EDGE",
+        "MENU_CAP_GAP",
+        "MENU_CAP_MIN",
+    ):
         m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, src)
-        ctx.check("в раскладке задан %s" % name, m is not None,
-                  "константа %s не найдена — проверять карусель не на чем" % name)
+        ctx.check(
+            "в раскладке задан %s" % name,
+            m is not None,
+            "константа %s не найдена — проверять карусель не на чем" % name,
+        )
         if m is None:
             return
         prelude += "#define %s%s\n" % (name, m.group(1))
     ui_h = ctx.root / "include" / "tdeck_ui.h"
     mt = ui_h.read_text(encoding="utf-8") if ui_h.is_file() else ""
     m = re.search(r"(?m)^#define\s+TDECK_BAR_H\b(.*)$", mt)
-    ctx.check("высота строки состояния задана", m is not None,
-              "TDECK_BAR_H не найден — вертикальную геометрию не на чем считать")
+    ctx.check(
+        "высота строки состояния задана",
+        m is not None,
+        "TDECK_BAR_H не найден — вертикальную геометрию не на чем считать",
+    )
     if m is None:
         return
     prelude += "#define TDECK_BAR_H%s\n" % m.group(1)
@@ -697,16 +780,16 @@ def menu_carousel_test(ctx):
     # констант проворот ни посчитать, ни проверить. TDECK_ANIM_FRAME_MS лежит в шапке
     # рядом с TDECK_BAR_H, TDECK_SCROLL_MS — в обвязке, которая проворот заводит.
     m = re.search(r"(?m)^#define\s+TDECK_ANIM_FRAME_MS\b(.*)$", mt)
-    ctx.check("шаг кадра анимации задан", m is not None,
-              "TDECK_ANIM_FRAME_MS не найден — фазу проворота не на чем считать")
+    ctx.check(
+        "шаг кадра анимации задан", m is not None, "TDECK_ANIM_FRAME_MS не найден — фазу проворота не на чем считать"
+    )
     if m is None:
         return
     prelude += "#define TDECK_ANIM_FRAME_MS%s\n" % m.group(1)
     cpp = ctx.root / "src" / "tdeck_ui.cpp"
     ct = cpp.read_text(encoding="utf-8") if cpp.is_file() else ""
     m = re.search(r"(?m)^#define\s+TDECK_SCROLL_MS\b(.*)$", ct)
-    ctx.check("длительность проворота задана", m is not None,
-              "TDECK_SCROLL_MS не найден — проворота ленты нет?")
+    ctx.check("длительность проворота задана", m is not None, "TDECK_SCROLL_MS не найден — проворота ленты нет?")
     if m is None:
         return
     prelude += "#define TDECK_SCROLL_MS%s\n" % m.group(1)
@@ -720,14 +803,13 @@ def menu_carousel_test(ctx):
     # полный круг; без него промежуточный кадр и путь заворота не проверить. millis на
     # хосте нет — стаб, он нужен menuScrollStart.
     try:
-        prelude += ctx.span(cpp, "static uint8_t curSel = 0;",
-                            "static uint8_t curSel = 0;") + "\n"
+        prelude += ctx.span(cpp, "static uint8_t curSel = 0;", "static uint8_t curSel = 0;") + "\n"
         prelude += "static unsigned long millis() { return 0; }\n"
-        prelude += ctx.span(cpp, "static bool menuScrollActive = false;",
-                            "    menuScrollActive = (next != from);\n}") + "\n"
+        prelude += (
+            ctx.span(cpp, "static bool menuScrollActive = false;", "    menuScrollActive = (next != from);\n}") + "\n"
+        )
     except (RuntimeError, ValueError):
-        ctx.check("вырезана обвязка проворота", False,
-                  "функции нет — проворота ленты нет?")
+        ctx.check("вырезана обвязка проворота", False, "функции нет — проворота ленты нет?")
         return
 
     # Порядок важен: каждый хелпер зовёт предыдущие, и g++ бы не дал собрать тест, где
@@ -736,27 +818,32 @@ def menu_carousel_test(ctx):
     # MenuCap — тип, а не функция: объявление берём как есть, иначе menuCapLayout не
     # соберётся. Он объявлен рядом с самой раскладкой подписей.
     prelude += "struct MenuCap { int x; int w; };\n"
-    for sig in ("static int tileSizeAt(int d)",
-                "static int tileOffsetAt(int d)",
-                "static float tileSizeF(float d)",
-                "static float tileOffsetF(float d)",
-                "static float tileDistF(int i, float selF)",
-                "static float tileCenterF(int screenW, float d)",
-                "static float tileXf(int screenW, float selF, int i)",
-                "static int tileX(int screenW, int sel, int i)",
-                "static bool tileVisible(int screenW, int sel, int i)",
-                "static int tileY(int screenH)",
-                "static int tileTop(int screenH, int size)",
-                "int tdeckMenuPages(int screenW, int screenH)",
-                "int tdeckMenuPageOf(int screenW, int screenH, int index)",
-                "int tdeckMenuHit(int screenW, int screenH, int sel, int x, int y)",
-                "int tdeckMenuStep(int screenW, int screenH, int cur, int dcol, int drow)",
-                "static void menuCapLayout("):
+    for sig in (
+        "static int tileSizeAt(int d)",
+        "static int tileOffsetAt(int d)",
+        "static float tileSizeF(float d)",
+        "static float tileOffsetF(float d)",
+        "static float tileDistF(int i, float selF)",
+        "static float tileCenterF(int screenW, float d)",
+        "static float tileXf(int screenW, float selF, int i)",
+        "static int tileX(int screenW, int sel, int i)",
+        "static bool tileVisible(int screenW, int sel, int i)",
+        "static int tileY(int screenH)",
+        "static int tileTop(int screenH, int size)",
+        "int tdeckMenuPages(int screenW, int screenH)",
+        "int tdeckMenuPageOf(int screenW, int screenH, int index)",
+        "int tdeckMenuHit(int screenW, int screenH, int sel, int x, int y)",
+        "int tdeckMenuStep(int screenW, int screenH, int cur, int dcol, int drow)",
+        "static void menuCapLayout(",
+    ):
         try:
             code = ctx.grab(draw, sig)
         except RuntimeError:
-            ctx.check("вырезана %s" % sig.split("(")[0].split()[-1], False,
-                      "функция не нашлась — раскладка вернулась к сетке?")
+            ctx.check(
+                "вырезана %s" % sig.split("(")[0].split()[-1],
+                False,
+                "функция не нашлась — раскладка вернулась к сетке?",
+            )
             return
         prelude += code + "\n"
 
@@ -930,11 +1017,20 @@ def chat_nodes_test(ctx):
 #include <string.h>
 #include <stddef.h>
 """
-    for name in ("TDECK_CHAT_CHAN_MAX", "TDECK_CHAT_NODE_MAX", "TDECK_CHAT_MAX",
-                 "TDECK_CHAT_MSG_MAX", "TDECK_CHAT_RINGS", "TDECK_CHAT_TEXT_MAX"):
+    for name in (
+        "TDECK_CHAT_CHAN_MAX",
+        "TDECK_CHAT_NODE_MAX",
+        "TDECK_CHAT_MAX",
+        "TDECK_CHAT_MSG_MAX",
+        "TDECK_CHAT_RINGS",
+        "TDECK_CHAT_TEXT_MAX",
+    ):
         m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, ht)
-        ctx.check("в переписке задан %s" % name, m is not None,
-                  "константа %s не найдена — список бесед проверять не на чем" % name)
+        ctx.check(
+            "в переписке задан %s" % name,
+            m is not None,
+            "константа %s не найдена — список бесед проверять не на чем" % name,
+        )
         if m is None:
             return
         prelude += "#define %s%s\n" % (name, m.group(1))
@@ -948,33 +1044,32 @@ static long time(const void*) { return (long)g_unix; }
         prelude += ctx.span(hdr, "struct TdeckChatContact {", "};") + "\n"
         prelude += ctx.span(src, "struct ChatMsg {", "};") + "\n"
         prelude += ctx.span(src, "struct Chat {", "};") + "\n"
-        prelude += ctx.span(src, "static Chat chats[TDECK_CHAT_MAX];",
-                            "static uint32_t chatSeen = 0;") + "\n"
+        prelude += ctx.span(src, "static Chat chats[TDECK_CHAT_MAX];", "static uint32_t chatSeen = 0;") + "\n"
         prelude += """static int chatOpen = -1;
 static uint32_t chatGen = 0;
 static bool storeDirty = false;
 static void storeTouch() { storeDirty = true; }
 """
     except (RuntimeError, ValueError):
-        ctx.check("вырезан список бесед", False,
-                  "объявлений списка нет — переписка перестроена?")
+        ctx.check("вырезан список бесед", False, "объявлений списка нет — переписка перестроена?")
         return
-    for sig in ("static void chatSeenTouch(",
-                "static int chatIndexOf(",
-                "static ChatMsg* chatRing(",
-                "static ChatMsg* chatRingIf(",
-                "static Chat* chatFind(",
-                "int tdeckChatNodeCount(",
-                "bool tdeckChatNodeAt(",
-                "int tdeckChatContactsSave(",
-                "void tdeckChatContactsLoad(",
-                "void tdeckChatAddChannel(",
-                "void tdeckChatOnAdvert("):
+    for sig in (
+        "static void chatSeenTouch(",
+        "static int chatIndexOf(",
+        "static ChatMsg* chatRing(",
+        "static ChatMsg* chatRingIf(",
+        "static Chat* chatFind(",
+        "int tdeckChatNodeCount(",
+        "bool tdeckChatNodeAt(",
+        "int tdeckChatContactsSave(",
+        "void tdeckChatContactsLoad(",
+        "void tdeckChatAddChannel(",
+        "void tdeckChatOnAdvert(",
+    ):
         try:
             prelude += ctx.grab(src, sig) + "\n"
         except RuntimeError:
-            ctx.check("вырезана %s" % sig.rstrip("("), False,
-                      "функции нет — список услышанных узлов перестроен?")
+            ctx.check("вырезана %s" % sig.rstrip("("), False, "функции нет — список услышанных узлов перестроен?")
             return
 
     ok, out = ctx.host_run(prelude + CHAT_NODES_MAIN, "chatnodes.cpp", "узлы на карте")
@@ -1072,11 +1167,22 @@ def map_zoom_scale_test(ctx):
     prelude = """#include <stdint.h>
 #include <stdio.h>
 """
-    for name in ("MAP_X1", "MAP_Y0", "ZOOM_MIN", "ZOOM_MAX", "ZOOM_STEPS", "ZOOM_CELLS",
-                 "ZOOM_CS", "ZOOM_CGAP", "ZOOM_W", "ZOOM_X0"):
+    for name in (
+        "MAP_X1",
+        "MAP_Y0",
+        "ZOOM_MIN",
+        "ZOOM_MAX",
+        "ZOOM_STEPS",
+        "ZOOM_CELLS",
+        "ZOOM_CS",
+        "ZOOM_CGAP",
+        "ZOOM_W",
+        "ZOOM_X0",
+    ):
         m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, t)
-        ctx.check("в карте задан %s" % name, m is not None,
-                  "константа %s не найдена — шкалу зума проверять не на чем" % name)
+        ctx.check(
+            "в карте задан %s" % name, m is not None, "константа %s не найдена — шкалу зума проверять не на чем" % name
+        )
         if m is None:
             return
         prelude += "#define %s%s\n" % (name, m.group(1))
@@ -1084,8 +1190,9 @@ def map_zoom_scale_test(ctx):
         try:
             prelude += ctx.grab(src, sig) + "\n"
         except RuntimeError:
-            ctx.check("вырезана %s" % sig.rstrip("("), False,
-                      "функции нет — шкала зума снова считается внутри рисования?")
+            ctx.check(
+                "вырезана %s" % sig.rstrip("("), False, "функции нет — шкала зума снова считается внутри рисования?"
+            )
             return
     ok, out = ctx.host_run(prelude + ZOOM_MAIN, "zoom.cpp", "указатель зума")
     if ok is None:
@@ -1098,11 +1205,11 @@ def map_zoom_scale_test(ctx):
     if dl.is_file():
         zmin = re.search(r"(?m)^#define\s+MAPDL_ZMIN\s+(\d+)", dl.read_text(encoding="utf-8"))
         zlo = re.search(r"(?m)^#define\s+ZOOM_MIN\s+(\d+)", t)
-        ctx.check("предзагрузка доходит до самого дальнего зума карты",
-                  zmin is not None and zlo is not None
-                  and int(zmin.group(1)) <= int(zlo.group(1)),
-                  "MAPDL_ZMIN выше ZOOM_MIN: обзорные уровни карта показывает, но не "
-                  "запасает — они откроются пустыми")
+        ctx.check(
+            "предзагрузка доходит до самого дальнего зума карты",
+            zmin is not None and zlo is not None and int(zmin.group(1)) <= int(zlo.group(1)),
+            "MAPDL_ZMIN выше ZOOM_MIN: обзорные уровни карта показывает, но не запасает — они откроются пустыми",
+        )
 
 
 MAPAREA_MAIN = r"""
@@ -1207,14 +1314,11 @@ static bool tdeckMapDownloadAddTile(int, int x, int y) {
     return true;
 }
 """
-    for sig in ("static void mapAddArea(",
-                "void tdeckMapDownloadAddRect(",
-                "void tdeckMapDownloadAddCircle("):
+    for sig in ("static void mapAddArea(", "void tdeckMapDownloadAddRect(", "void tdeckMapDownloadAddCircle("):
         try:
             prelude += ctx.grab(src, sig) + "\n"
         except RuntimeError:
-            ctx.check("вырезана %s" % sig.rstrip("("), False,
-                      "функции нет — постановка области в очередь перестроена?")
+            ctx.check("вырезана %s" % sig.rstrip("("), False, "функции нет — постановка области в очередь перестроена?")
             return
     # Объявления заказанного идут ПОСЛЕ вырезанных функций: в main они определяются, а
     # extern выше даёт их видеть заглушкам.
@@ -1247,24 +1351,28 @@ def png_memory_test(ctx):
     except RuntimeError:
         ctx.check("декодер на месте", False, "tdeckPngDecode565 не нашлась")
         return
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in dec.splitlines())
-    ctx.check("строки и IDAT берутся не из внутренней памяти",
-              re.search(r"raw\s*=\s*\(uint8_t\*\)\s*pngBigAlloc", code) is not None
-              and re.search(r"idatBuf\s*=\s*\(uint8_t\*\)\s*pngBigAlloc", code) is not None,
-              "самые большие буферы декодера снова идут из внутреннего хипа: палитровый "
-              "тайл это 64 КБ, RGB — под двести")
-    ctx.check("крупное пробует PSRAM прежде внутренней памяти",
-              re.search(r"pngBigAlloc[\s\S]{0,400}MALLOC_CAP_SPIRAM", t) is not None,
-              "pngBigAlloc не спрашивает PSRAM — тогда он ничем не отличается от malloc")
-    ctx.check("размер картинки ограничен",
-              "PNG_RAW_MAX" in code,
-              "предела на размер нет: порченый заголовок попросит гигабайты, и отказ "
-              "придёт позже и глуше")
-    ctx.check("нехватка памяти попадает в журнал",
-              re.search(r"if\s*\(!d \|\| !raw[\s\S]{0,200}TDECK_DBG", code) is not None,
-              "отказ по памяти снова молчит: тайл не появится, а причины в журнале не "
-              "будет")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in dec.splitlines())
+    ctx.check(
+        "строки и IDAT берутся не из внутренней памяти",
+        re.search(r"raw\s*=\s*\(\s*uint8_t\s*\*\s*\)\s*pngBigAlloc", code) is not None
+        and re.search(r"idatBuf\s*=\s*\(\s*uint8_t\s*\*\s*\)\s*pngBigAlloc", code) is not None,
+        "самые большие буферы декодера снова идут из внутреннего хипа: палитровый тайл это 64 КБ, RGB — под двести",
+    )
+    ctx.check(
+        "крупное пробует PSRAM прежде внутренней памяти",
+        re.search(r"pngBigAlloc[\s\S]{0,400}MALLOC_CAP_SPIRAM", t) is not None,
+        "pngBigAlloc не спрашивает PSRAM — тогда он ничем не отличается от malloc",
+    )
+    ctx.check(
+        "размер картинки ограничен",
+        "PNG_RAW_MAX" in code,
+        "предела на размер нет: порченый заголовок попросит гигабайты, и отказ придёт позже и глуше",
+    )
+    ctx.check(
+        "нехватка памяти попадает в журнал",
+        re.search(r"if\s*\(!d \|\| !raw[\s\S]{0,200}TDECK_DBG", code) is not None,
+        "отказ по памяти снова молчит: тайл не появится, а причины в журнале не будет",
+    )
 
 
 TILEMISS_MAIN = r"""
@@ -1341,8 +1449,9 @@ def tile_miss_cache_test(ctx):
     prelude = "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
     for name in ("MISS_N", "MISS_TTL_MS"):
         m = re.search(r"(?m)^#define\s+%s\b(.*)$" % name, t)
-        ctx.check("в карте задан %s" % name, m is not None,
-                  "константа %s не найдена — памяти о пустых тайлах нет" % name)
+        ctx.check(
+            "в карте задан %s" % name, m is not None, "константа %s не найдена — памяти о пустых тайлах нет" % name
+        )
         if m is None:
             return
         prelude += "#define %s%s\n" % (name, m.group(1))
@@ -1351,16 +1460,14 @@ def tile_miss_cache_test(ctx):
     except (RuntimeError, ValueError):
         ctx.check("вырезана память о промахах", False, "объявлений нет")
         return
-    for sig in ("static bool tileMissKnown(", "static void tileMissRemember(",
-                "static void tileMissForget("):
+    for sig in ("static bool tileMissKnown(", "static void tileMissRemember(", "static void tileMissForget("):
         try:
             prelude += ctx.grab(src, sig) + "\n"
         except RuntimeError:
             ctx.check("вырезана %s" % sig.rstrip("("), False, "функции нет")
             return
     # millis объявлен в прологе теста, а не здесь: вырезанные функции его зовут.
-    prelude = prelude.replace("#include <string.h>\n",
-                              "#include <string.h>\nstatic unsigned long millis();\n")
+    prelude = prelude.replace("#include <string.h>\n", "#include <string.h>\nstatic unsigned long millis();\n")
     ok, out = ctx.host_run(prelude + TILEMISS_MAIN, "tilemiss.cpp", "память о пустых тайлах")
     if ok is None:
         return
@@ -1373,15 +1480,18 @@ def tile_miss_cache_test(ctx):
     except RuntimeError:
         ctx.check("подъём тайла на месте", False, "tileGet не нашлась")
         return
-    miss = get[get.find("if (sz < 0)"):get.find("if (sz < 33")] if "if (sz < 0)" in get else ""
-    ctx.check("отсутствие тайла не пишется в журнал",
-              "if (sz < 0)" in get and "APP_DBG" not in miss,
-              "про отсутствующий тайл снова пишется строка: на обзорном зуме это десятки "
-              "записей на карту в секунду, и цикл перестаёт отпускать процессор")
-    ctx.check("отсутствие тайла запоминается",
-              "tileMissRemember" in get and "tileMissKnown" in get,
-              "tileGet не пользуется памятью о промахах — каждый кадр снова пойдёт искать "
-              "имя в каталоге")
+    miss = get[get.find("if (sz < 0)") : get.find("if (sz < 33")] if "if (sz < 0)" in get else ""
+    ctx.check(
+        "отсутствие тайла не пишется в журнал",
+        "if (sz < 0)" in get and "APP_DBG" not in miss,
+        "про отсутствующий тайл снова пишется строка: на обзорном зуме это десятки "
+        "записей на карту в секунду, и цикл перестаёт отпускать процессор",
+    )
+    ctx.check(
+        "отсутствие тайла запоминается",
+        "tileMissRemember" in get and "tileMissKnown" in get,
+        "tileGet не пользуется памятью о промахах — каждый кадр снова пойдёт искать имя в каталоге",
+    )
 
 
 def log_rotation_test(ctx):
@@ -1398,40 +1508,52 @@ def log_rotation_test(ctx):
         return
     ht, st = hdr.read_text(encoding="utf-8"), src.read_text(encoding="utf-8")
     m = re.search(r"(?m)^#define\s+TDECK_LOG_KEEP\s+(\d+)", ht)
-    ctx.check("глубина журнала задана", m is not None,
-              "TDECK_LOG_KEEP не найден — прошлый файл снова один")
+    ctx.check("глубина журнала задана", m is not None, "TDECK_LOG_KEEP не найден — прошлый файл снова один")
     if m is None:
         return
-    ctx.check("прошлых файлов десятки", int(m.group(1)) >= 20,
-              "TDECK_LOG_KEEP = %s: при 256 КБ на файл это меньше часа истории, а причину "
-              "перезагрузки ищут позже" % m.group(1))
+    ctx.check(
+        "прошлых файлов десятки",
+        int(m.group(1)) >= 20,
+        "TDECK_LOG_KEEP = %s: при 256 КБ на файл это меньше часа истории, а причину "
+        "перезагрузки ищут позже" % m.group(1),
+    )
     try:
         rot = ctx.grab(src, "static void rotateIfNeeded(")
     except RuntimeError:
         ctx.check("ротация на месте", False, "rotateIfNeeded не нашлась")
         return
-    ctx.check("ротация сдвигает всю очередь", "TDECK_LOG_KEEP" in rot,
-              "ротация не знает про глубину: переименует только текущий, и прошлые файлы "
-              "будут копиться или теряться")
-    ctx.check("самый старый файл удаляется", "SD.remove" in rot,
-              "ротация ничего не удаляет — карта заполнится журналом")
+    ctx.check(
+        "ротация сдвигает всю очередь",
+        "TDECK_LOG_KEEP" in rot,
+        "ротация не знает про глубину: переименует только текущий, и прошлые файлы будут копиться или теряться",
+    )
+    ctx.check(
+        "самый старый файл удаляется", "SD.remove" in rot, "ротация ничего не удаляет — карта заполнится журналом"
+    )
     try:
         clr = ctx.grab(src, "bool tdeckLogClear(")
-        ctx.check("очистка убирает и прошлые файлы", "TDECK_LOG_KEEP" in clr,
-                  "«очистить» оставляет полсотни прошлых файлов — это не очистка")
+        ctx.check(
+            "очистка убирает и прошлые файлы",
+            "TDECK_LOG_KEEP" in clr,
+            "«очистить» оставляет полсотни прошлых файлов — это не очистка",
+        )
     except RuntimeError:
         pass
 
     # Причина перезагрузки — первой строкой загрузки, иначе её неоткуда взять.
-    ctx.check("причина прошлой перезагрузки попадает в журнал",
-              "esp_reset_reason" in st,
-              "esp_reset_reason нигде не спрашивается: сторож, паника и просадка питания "
-              "в журнале выглядят одинаково — никак")
+    ctx.check(
+        "причина прошлой перезагрузки попадает в журнал",
+        "esp_reset_reason" in st,
+        "esp_reset_reason нигде не спрашивается: сторож, паника и просадка питания "
+        "в журнале выглядят одинаково — никак",
+    )
     ui = ctx.root / "src" / "tdeck_ui.cpp"
     if ui.is_file():
-        ctx.check("причину спрашивают на старте",
-                  "tdeckLogResetReason()" in ui.read_text(encoding="utf-8"),
-                  "tdeckLogResetReason никто не зовёт — строки в журнале не появится")
+        ctx.check(
+            "причину спрашивают на старте",
+            "tdeckLogResetReason()" in ui.read_text(encoding="utf-8"),
+            "tdeckLogResetReason никто не зовёт — строки в журнале не появится",
+        )
 
 
 def trackball_step_debounce_test(ctx):
@@ -1446,25 +1568,38 @@ def trackball_step_debounce_test(ctx):
         return
     src = inp.read_text(encoding="utf-8")
     m = re.search(r"(?m)^#define\s+TRACKBALL_STEP_MS\s+(\d+)", src)
-    ctx.check("окно антидребезга трекбола задано", m is not None,
-              "TRACKBALL_STEP_MS не найден — щелчки трекбола не схлопываются")
+    ctx.check(
+        "окно антидребезга трекбола задано",
+        m is not None,
+        "TRACKBALL_STEP_MS не найден — щелчки трекбола не схлопываются",
+    )
     if m is None:
         return
-    ctx.check("окно не меньше полсекунды", int(m.group(1)) >= 500,
-              "окно %s мс: пачка щелчков всё ещё размазывается" % m.group(1))
+    ctx.check(
+        "окно не меньше полсекунды",
+        int(m.group(1)) >= 500,
+        "окно %s мс: пачка щелчков всё ещё размазывается" % m.group(1),
+    )
     try:
         code = ctx.grab(inp, "static TdeckEvent pollTrackball()")
     except RuntimeError:
         ctx.check("вырезан pollTrackball", False, "функция не нашлась")
         return
-    ctx.check("окно общее для всех осей", "lastStepMs" in code,
-              "нет общего времени последнего шага — оси дребезжат независимо")
-    ctx.check("внутри окна щелчок гасится",
-              "TRACKBALL_STEP_MS" in code and "return TDECK_EV_NONE" in code,
-              "нет ветки, которая глошит серию щелчков окном")
-    ctx.check("отданный шаг двигает окно", "lastStepMs = millis()" in code,
-              "время последнего шага не обновляется — все щелчки после первого потонут "
-              "в окне")
+    ctx.check(
+        "окно общее для всех осей",
+        "lastStepMs" in code,
+        "нет общего времени последнего шага — оси дребезжат независимо",
+    )
+    ctx.check(
+        "внутри окна щелчок гасится",
+        "TRACKBALL_STEP_MS" in code and "return TDECK_EV_NONE" in code,
+        "нет ветки, которая глошит серию щелчков окном",
+    )
+    ctx.check(
+        "отданный шаг двигает окно",
+        "lastStepMs = millis()" in code,
+        "время последнего шага не обновляется — все щелчки после первого потонут в окне",
+    )
 
 
 def board_power_guard_test(ctx):
@@ -1487,27 +1622,34 @@ def board_power_guard_test(ctx):
         return
     pio_t, main_t, cfg_t = (f.read_text(encoding="utf-8") for f in (pio, appmain, cfg))
 
-    ctx.check("плата объявлена питающейся через этот пин",
-              re.search(r"-DVEXT_IS_BOARD_POWER=1", pio_t) is not None,
-              "признак не выставлен: настройка vext=0 снова погасит плату целиком")
-    ctx.check("питание применяется одним входом на старте",
-              re.search(r"vextApply\(cfg\.vextOn\)", main_t) is not None,
-              "старт прошивки дёргает пин сам, мимо защиты — настройка vext=0 погасит узел "
-              "при первой же перезагрузке")
-    ctx.check("команда настройки идёт тем же входом",
-              re.search(r"vextApply\(cfg\.vextOn\)", cfg_t) is not None,
-              "«cfg vext» дёргает пин сам: защита останется только на старте")
-    guard = cfg_t[cfg_t.find("void vextApply("):]
-    guard = guard[:guard.find("\n}\n") + 3] if "\n}\n" in guard else guard
-    ctx.check("у платы с таким пином настройка не применяется",
-              re.search(r"#if\s+VEXT_IS_BOARD_POWER", guard) is not None
-              and re.search(r"digitalWrite\(VEXT_PIN,\s*VEXT_EN_ACTIVE\)", guard) is not None,
-              "защиты нет: ноль в настройке снимет питание со всей платы")
-    ctx.check("отказ применить настройку не молчит",
-              re.search(r"if\s*\(!vextOn\)", guard) is not None
-              and "Serial.printf" in guard,
-              "настройка молча игнорируется: «я же выключил, а оно горит» потом не "
-              "объяснить")
+    ctx.check(
+        "плата объявлена питающейся через этот пин",
+        re.search(r"-DVEXT_IS_BOARD_POWER=1", pio_t) is not None,
+        "признак не выставлен: настройка vext=0 снова погасит плату целиком",
+    )
+    ctx.check(
+        "питание применяется одним входом на старте",
+        re.search(r"vextApply\(cfg\.vextOn\)", main_t) is not None,
+        "старт прошивки дёргает пин сам, мимо защиты — настройка vext=0 погасит узел при первой же перезагрузке",
+    )
+    ctx.check(
+        "команда настройки идёт тем же входом",
+        re.search(r"vextApply\(cfg\.vextOn\)", cfg_t) is not None,
+        "«cfg vext» дёргает пин сам: защита останется только на старте",
+    )
+    guard = cfg_t[cfg_t.find("void vextApply(") :]
+    guard = guard[: guard.find("\n}\n") + 3] if "\n}\n" in guard else guard
+    ctx.check(
+        "у платы с таким пином настройка не применяется",
+        re.search(r"#if\s+VEXT_IS_BOARD_POWER", guard) is not None
+        and re.search(r"digitalWrite\(VEXT_PIN,\s*VEXT_EN_ACTIVE\)", guard) is not None,
+        "защиты нет: ноль в настройке снимет питание со всей платы",
+    )
+    ctx.check(
+        "отказ применить настройку не молчит",
+        re.search(r"if\s*\(!vextOn\)", guard) is not None and "Serial.printf" in guard,
+        "настройка молча игнорируется: «я же выключил, а оно горит» потом не объяснить",
+    )
 
 
 def panel_orientation_test(ctx):
@@ -1521,17 +1663,18 @@ def panel_orientation_test(ctx):
         ctx.note("     SKIP panel_orientation_test: драйвера панели рядом нет")
         return
     src = drv.read_text(encoding="utf-8")
-    body = src[src.find("uint8_t _madctlValue()"):]
-    body = body[:body.find("\n  }") + 4] if "\n  }" in body else body
-    ctx.check("ландшафт собран подтверждённым отражением",
-              re.search(r"#else\s*\n\s*return ST7789_MADCTL_MX \| ST7789_MADCTL_MV;", body)
-              is not None,
-              "по умолчанию панель разворачивается не тем отражением: на живой плате это "
-              "изображение вверх ногами")
-    ctx.check("разворот переключается флагом сборки",
-              "TDECK_SCREEN_FLIP" in body and "TDECK_SCREEN_FLIP" in src,
-              "флага разворота нет: у партии с иначе поставленной панелью придётся править "
-              "драйвер")
+    body = src[src.find("uint8_t _madctlValue()") :]
+    body = body[: body.find("\n  }") + 4] if "\n  }" in body else body
+    ctx.check(
+        "ландшафт собран подтверждённым отражением",
+        re.search(r"#else\s*\n\s*return ST7789_MADCTL_MX \| ST7789_MADCTL_MV;", body) is not None,
+        "по умолчанию панель разворачивается не тем отражением: на живой плате это изображение вверх ногами",
+    )
+    ctx.check(
+        "разворот переключается флагом сборки",
+        "TDECK_SCREEN_FLIP" in body and "TDECK_SCREEN_FLIP" in src,
+        "флага разворота нет: у партии с иначе поставленной панелью придётся править драйвер",
+    )
 
 
 def battery_pin_test(ctx):
@@ -1545,14 +1688,16 @@ def battery_pin_test(ctx):
         ctx.note("     SKIP battery_pin_test: platformio.ini рядом нет")
         return
     t = pio.read_text(encoding="utf-8")
-    ctx.check("пин батареи задан",
-              re.search(r"(?m)^\s*-DPIN_VBAT_READ=4\b", t) is not None,
-              "измерения батареи нет: экран покажет пустой корпус с прочерком, сколько бы "
-              "заряда в аккумуляторе ни было")
-    ctx.check("делитель батареи задан",
-              re.search(r"-DPIN_VBAT_DIVIDER=2\.0f", t) is not None,
-              "делитель не задан: ядро возьмёт значение Heltec (4.9), и напряжение выйдет "
-              "вдвое с лишним больше настоящего")
+    ctx.check(
+        "пин батареи задан",
+        re.search(r"(?m)^\s*-DPIN_VBAT_READ=4\b", t) is not None,
+        "измерения батареи нет: экран покажет пустой корпус с прочерком, сколько бы заряда в аккумуляторе ни было",
+    )
+    ctx.check(
+        "делитель батареи задан",
+        re.search(r"-DPIN_VBAT_DIVIDER=2\.0f", t) is not None,
+        "делитель не задан: ядро возьмёт значение Heltec (4.9), и напряжение выйдет вдвое с лишним больше настоящего",
+    )
 
 
 def keyboard_probe_read_only_test(ctx):
@@ -1570,40 +1715,51 @@ def keyboard_probe_read_only_test(ctx):
         ctx.note("     SKIP keyboard_probe_read_only_test: слоя ввода рядом нет")
         return
     t = inp.read_text(encoding="utf-8")
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in t.splitlines())
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in t.splitlines())
     # Писать в клавиатуру можно, но только ОСМЫСЛЕННУЮ команду её протокола (0x01 —
     # яркость, 0x02 — яркость для Alt+B). Пустая запись «есть ли кто по адресу» — это
     # посылка, которую чужая прошивка вольна понять как что угодно; именно после такой
     # у живой платы погасла подсветка клавиш. Поэтому проверяем не «не пишут вовсе», а
     # «каждая запись несёт байт команды».
     blind = []
-    for m in re.finditer(r"Wire\.beginTransmission\(\s*\(?u?int8?_?t?\)?\s*TDECK_KBD_ADDR[^;]*;",
-                         code):
-        tail = code[m.end():m.end() + 200]
+    for m in re.finditer(r"Wire\.beginTransmission\(\s*\(?u?int8?_?t?\)?\s*TDECK_KBD_ADDR[^;]*;", code):
+        tail = code[m.end() : m.end() + 200]
         if not re.search(r"Wire\.write\(\s*\(?uint8_t\)?\s*KBD_CMD_", tail):
             blind.append(m.group(0))
-    ctx.check("в клавиатуру пишут только командой протокола", not blind,
-              "есть запись в клавиатуру без байта команды: чужая прошивка вольна понять её "
-              "как что угодно — так уже погасла подсветка клавиш")
-    ctx.check("клавиатура ищется чтением",
-              len(re.findall(r"Wire\.requestFrom\(\(int\)TDECK_KBD_ADDR", code)) >= 2,
-              "чтения для поиска клавиатуры нет: либо её не найдут, либо найдут записью")
-    ctx.check("общий обход шины обходит клавиатуру стороной",
-              re.search(r"a\s*==\s*\(uint8_t\)TDECK_KBD_ADDR", code) is not None,
-              "обход шины пишет во все адреса подряд, включая клавиатуру")
-    ctx.check("подсветка клавиш включается прошивкой",
-              "KBD_CMD_BRIGHTNESS" in code and "tdeckKeyboardBacklight" in code,
-              "подсветку клавиш никто не зажигает: контроллер клавиатуры стартует с нулевой "
-              "яркостью, и клавиши в темноте не видно")
-    ctx.check("яркость для Alt+B задана прошивкой",
-              "KBD_CMD_ALT_B_DEFAULT" in code,
-              "контроллеру не сказано, какую яркость ставить по Alt+B: он вернёт свою "
-              "половинную, а не ту, что светит на плате")
-    ctx.check("клавиатуру ждут на старте и переспрашивают потом",
-              "KBD_BOOT_WAIT_MS" in code and "KBD_REPROBE_MS" in code,
-              "без ожидания контроллер клавиатуры (ESP32-C3 грузится около секунды) не "
-              "успевает отозваться, и плата остаётся без клавиатуры до перезагрузки")
+    ctx.check(
+        "в клавиатуру пишут только командой протокола",
+        not blind,
+        "есть запись в клавиатуру без байта команды: чужая прошивка вольна понять её "
+        "как что угодно — так уже погасла подсветка клавиш",
+    )
+    ctx.check(
+        "клавиатура ищется чтением",
+        len(re.findall(r"Wire\.requestFrom\(\(int\)TDECK_KBD_ADDR", code)) >= 2,
+        "чтения для поиска клавиатуры нет: либо её не найдут, либо найдут записью",
+    )
+    ctx.check(
+        "общий обход шины обходит клавиатуру стороной",
+        re.search(r"a\s*==\s*\(uint8_t\)TDECK_KBD_ADDR", code) is not None,
+        "обход шины пишет во все адреса подряд, включая клавиатуру",
+    )
+    ctx.check(
+        "подсветка клавиш включается прошивкой",
+        "KBD_CMD_BRIGHTNESS" in code and "tdeckKeyboardBacklight" in code,
+        "подсветку клавиш никто не зажигает: контроллер клавиатуры стартует с нулевой "
+        "яркостью, и клавиши в темноте не видно",
+    )
+    ctx.check(
+        "яркость для Alt+B задана прошивкой",
+        "KBD_CMD_ALT_B_DEFAULT" in code,
+        "контроллеру не сказано, какую яркость ставить по Alt+B: он вернёт свою "
+        "половинную, а не ту, что светит на плате",
+    )
+    ctx.check(
+        "клавиатуру ждут на старте и переспрашивают потом",
+        "KBD_BOOT_WAIT_MS" in code and "KBD_REPROBE_MS" in code,
+        "без ожидания контроллер клавиатуры (ESP32-C3 грузится около секунды) не "
+        "успевает отозваться, и плата остаётся без клавиатуры до перезагрузки",
+    )
 
 
 def status_clock_contrast_test(ctx):
@@ -1618,18 +1774,24 @@ def status_clock_contrast_test(ctx):
         ctx.note("     SKIP status_clock_contrast_test: рисования рядом нет")
         return
     d, p = draw.read_text(encoding="utf-8"), pal.read_text(encoding="utf-8")
-    ctx.check("чистый белый есть в палитре",
-              re.search(r"#define\s+COL_WHITE\s+0xFFFF", p) is not None,
-              "белого в палитре нет: контраст придётся набирать случайными числами")
+    ctx.check(
+        "чистый белый есть в палитре",
+        re.search(r"#define\s+COL_WHITE\s+0xFFFF", p) is not None,
+        "белого в палитре нет: контраст придётся набирать случайными числами",
+    )
     # Между условием и вызовом допускается что угодно, кроме точки с запятой: к «часы
     # есть» с тех пор добавилось «и журнал не показывает свою строку», а проверка цвета
     # требовала закрывающей скобки сразу после s.clock[0] и объявляла белые часы мягкими.
-    ctx.check("часы рисуются белым",
-              re.search(r"s\.clock\[0\][^;]*textAtF\([^;]*COL_WHITE", d) is not None,
-              "часы рисуются мягким цветом: на живой панели они сливаются с полосой")
-    ctx.check("часы рисуются шрифтом значений",
-              re.search(r"s\.clock\[0\][^;]*textAtF\([^;]*FONT_VALUE", d) is not None,
-              "часы мельче, чем нужно: на полосе 26 px они теряются среди пиктограмм")
+    ctx.check(
+        "часы рисуются белым",
+        re.search(r"s\.clock\[0\][^;]*textAtF\([^;]*COL_WHITE", d) is not None,
+        "часы рисуются мягким цветом: на живой панели они сливаются с полосой",
+    )
+    ctx.check(
+        "часы рисуются шрифтом значений",
+        re.search(r"s\.clock\[0\][^;]*textAtF\([^;]*FONT_VALUE", d) is not None,
+        "часы мельче, чем нужно: на полосе 26 px они теряются среди пиктограмм",
+    )
 
 
 def shadow_frame_test(ctx):
@@ -1657,25 +1819,28 @@ def shadow_frame_test(ctx):
     except RuntimeError:
         ctx.check("вывод кадра на месте", False, "display() не нашлась — драйвер перестроен?")
         return
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in disp.splitlines())
-    ctx.check("вывод кадра закрыт от повторного входа",
-              re.search(r"if\s*\(\s*_inDisplay\s*\)\s*return\s*;", code) is not None,
-              "display() пускает вложенный вызов: он вытолкнет недорисованный кадр и "
-              "запишет его строки в теневую копию как выведенные")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in disp.splitlines())
+    ctx.check(
+        "вывод кадра закрыт от повторного входа",
+        re.search(r"if\s*\(\s*_inDisplay\s*\)\s*return\s*;", code) is not None,
+        "display() пускает вложенный вызов: он вытолкнет недорисованный кадр и "
+        "запишет его строки в теневую копию как выведенные",
+    )
     # Сторож обязан сниматься на КАЖДОМ выходе после подъёма, иначе первый же ранний
     # возврат выключит вывод кадров навсегда — экран замрёт целиком, и это хуже мешанины.
     # Считаем только то, что ПОСЛЕ подъёма: выходы до него сторожа не трогают.
     raised = code.find("_inDisplay = true")
     tail = code[raised:] if raised >= 0 else ""
-    ctx.check("сторож снимается на каждом выходе",
-              raised >= 0
-              and tail.count("_inDisplay = false") >= tail.count("return;") + 1,
-              "у display() есть выход, на котором сторож остаётся поднятым: следующий "
-              "кадр не выведется никогда")
-    ctx.check("теневая копия обновляется только выведенным",
-              "memcpy(_srow(" in code or "memcpy(_shadow" in code,
-              "строки больше не переносятся в теневую копию — вывод по разнице сломан")
+    ctx.check(
+        "сторож снимается на каждом выходе",
+        raised >= 0 and tail.count("_inDisplay = false") >= tail.count("return;") + 1,
+        "у display() есть выход, на котором сторож остаётся поднятым: следующий кадр не выведется никогда",
+    )
+    ctx.check(
+        "теневая копия обновляется только выведенным",
+        "memcpy(_srow(" in code or "memcpy(_shadow" in code,
+        "строки больше не переносятся в теневую копию — вывод по разнице сломан",
+    )
     # Вывод строк обязан идти ОДНОЙ транзакцией с опущенным CS: окно адреса, команда
     # записи и пиксели неразрывно. Подъём CS между командой и данными для ST7789 — конец
     # потока команды, и на шине, общей с картой и радио, в этот зазор встревает чужой
@@ -1686,41 +1851,48 @@ def shadow_frame_test(ctx):
     except RuntimeError:
         ctx.check("вывод строк на месте", False, "_pushRows не нашлась — драйвер перестроен?")
         return
-    pcode = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                       for ln in push.splitlines())
-    ctx.check("вывод строк идёт одной транзакцией",
-              pcode.count("SPI.beginTransaction") == 1 and pcode.count("_cs, LOW") == 1,
-              "окно адреса и пиксели снова уходят разными транзакциями: CS поднимается "
-              "между командой записи и данными, и строка может не лечь на панель")
-    ctx.check("внутри вывода не зовутся самостоятельные команды",
-              "command(" not in pcode and "spiData(" not in pcode,
-              "в _pushRows вернулись command()/spiData() — они берут транзакцию сами и "
-              "рвут вывод на части")
+    pcode = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in push.splitlines())
+    ctx.check(
+        "вывод строк идёт одной транзакцией",
+        pcode.count("SPI.beginTransaction") == 1 and pcode.count("_cs, LOW") == 1,
+        "окно адреса и пиксели снова уходят разными транзакциями: CS поднимается "
+        "между командой записи и данными, и строка может не лечь на панель",
+    )
+    ctx.check(
+        "внутри вывода не зовутся самостоятельные команды",
+        "command(" not in pcode and "spiData(" not in pcode,
+        "в _pushRows вернулись command()/spiData() — они берут транзакцию сами и рвут вывод на части",
+    )
     # Полоса сверки: теневая копия — догадка о панели, проверить её нечем, поэтому часть
     # экрана уходит на панель помимо сравнения. Без неё одно расхождение живёт вечно.
-    ctx.check("часть экрана уходит помимо сравнения",
-              re.search(r"#define\s+ST7789_SCRUB_ROWS\s+[1-9]", d) is not None
-              and "_scrubY" in code,
-              "полосы сверки нет: разойдись теневая копия с панелью — эти строки не "
-              "выведутся больше никогда")
+    ctx.check(
+        "часть экрана уходит помимо сравнения",
+        re.search(r"#define\s+ST7789_SCRUB_ROWS\s+[1-9]", d) is not None and "_scrubY" in code,
+        "полосы сверки нет: разойдись теневая копия с панелью — эти строки не выведутся больше никогда",
+    )
     # Замер вывода кадра пишет на панель мимо теневой копии — и обязан признаться в этом.
     try:
         bench = ctx.grab(drv, "void benchPush(")
-        ctx.check("замер кадра требует полного вывода после себя",
-                  "_pushAll = true" in bench,
-                  "benchPush оставляет панель расходиться с теневой копией: он пишет "
-                  "кадры мимо неё, и последние — без перестановки байт")
+        ctx.check(
+            "замер кадра требует полного вывода после себя",
+            "_pushAll = true" in bench,
+            "benchPush оставляет панель расходиться с теневой копией: он пишет "
+            "кадры мимо неё, и последние — без перестановки байт",
+        )
     except RuntimeError:
-        pass          # замера нет — и расходиться нечему
-    ctx.check("драйвер не выдумывает время рисования",
-              re.search(r"tdeckProfFrame\s*\(\s*0\s*,", d) is None,
-              "драйвер снова передаёт за рисование ноль: журнал будет печатать "
-              "«рисование 0 мс» на кадрах любой тяжести")
+        pass  # замера нет — и расходиться нечему
+    ctx.check(
+        "драйвер не выдумывает время рисования",
+        re.search(r"tdeckProfFrame\s*\(\s*0\s*,", d) is None,
+        "драйвер снова передаёт за рисование ноль: журнал будет печатать «рисование 0 мс» на кадрах любой тяжести",
+    )
     ui = ctx.root / "src" / "tdeck_ui.cpp"
     if ui.is_file():
-        ctx.check("время рисования меряет тот, кто рисует",
-                  "tdeckProfFrameDraw(" in ui.read_text(encoding="utf-8"),
-                  "никто не сообщает профилю время рисования — в журнале оно будет нулём")
+        ctx.check(
+            "время рисования меряет тот, кто рисует",
+            "tdeckProfFrameDraw(" in ui.read_text(encoding="utf-8"),
+            "никто не сообщает профилю время рисования — в журнале оно будет нулём",
+        )
 
 
 def elf_iram_access_test(ctx):
@@ -1741,47 +1913,58 @@ def elf_iram_access_test(ctx):
         ctx.note("     SKIP elf_iram_access_test: загрузчика рядом нет")
         return
     t = elf.read_text(encoding="utf-8")
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in t.splitlines())
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in t.splitlines())
 
     # Одна память, два окна. Живая плата прошла через ОБА падения подряд, и проверка
     # держит именно их: сначала LoadStoreError (образ собирали по адресу окна команд, а
     # байтовый доступ там запрещён), потом InstructionFetchError (всё перевели в окно
     # данных, включая точки входа, и процессор пошёл выполнять код из окна данных).
-    ctx.check("образ собирается по адресу окна данных",
-              "MAP_IRAM_TO_DRAM" in code,
-              "образ собирается по адресу окна команд: любое байтовое обращение к нему "
-              "(релокация, строка, статика) роняет узел LoadStoreError")
-    ctx.check("переход в окно данных сверяется с диапазоном",
-              re.search(r"SOC_DIRAM_IRAM_LOW", code) is not None
-              and re.search(r"SOC_DIRAM_IRAM_HIGH", code) is not None,
-              "адрес переводится в другое окно без проверки диапазона: окно данных есть "
-              "только у совмещённой области, промах — это запись мимо своей памяти")
-    ctx.check("релокации считаются под окно данных",
-              re.search(r"base\s*=\s*\(uint32_t\)\(uintptr_t\)mem", code) is not None,
-              "адреса данных приложения пересчитаны под окно команд — байтовое чтение "
-              "собственных строк уронит приложение")
-    ctx.check("точки входа считаются под окно команд",
-              len(re.findall(r"lo,\s*deltaExec,", code)) >= 2,
-              "точки входа пересчитаны под окно данных: процессор пойдёт выполнять код "
-              "оттуда и упадёт InstructionFetchError")
-    ctx.check("конструкторы зовутся через окно команд",
-              re.search(r"addr\s*=\s*\(uint32_t\)\(\(int32_t\)addr\s*-\s*delta\s*\+\s*deltaExec\)",
-                        code) is not None,
-              "конструктор зовётся по адресу окна данных — то же падение, только раньше")
+    ctx.check(
+        "образ собирается по адресу окна данных",
+        "MAP_IRAM_TO_DRAM" in code,
+        "образ собирается по адресу окна команд: любое байтовое обращение к нему "
+        "(релокация, строка, статика) роняет узел LoadStoreError",
+    )
+    ctx.check(
+        "переход в окно данных сверяется с диапазоном",
+        re.search(r"SOC_DIRAM_IRAM_LOW", code) is not None and re.search(r"SOC_DIRAM_IRAM_HIGH", code) is not None,
+        "адрес переводится в другое окно без проверки диапазона: окно данных есть "
+        "только у совмещённой области, промах — это запись мимо своей памяти",
+    )
+    ctx.check(
+        "релокации считаются под окно данных",
+        re.search(r"base\s*=\s*\(uint32_t\)\(uintptr_t\)mem", code) is not None,
+        "адреса данных приложения пересчитаны под окно команд — байтовое чтение собственных строк уронит приложение",
+    )
+    ctx.check(
+        "точки входа считаются под окно команд",
+        len(re.findall(r"lo,\s*deltaExec,", code)) >= 2,
+        "точки входа пересчитаны под окно данных: процессор пойдёт выполнять код оттуда и упадёт InstructionFetchError",
+    )
+    ctx.check(
+        "конструкторы зовутся через окно команд",
+        re.search(r"addr\s*=\s*\(uint32_t\)\(\(int32_t\)addr\s*-\s*delta\s*\+\s*deltaExec\)", code) is not None,
+        "конструктор зовётся по адресу окна данных — то же падение, только раньше",
+    )
 
     # --- защита от приложения, которое роняет плату ---
-    ctx.check("имя приложения отмечается в NVS до загрузки",
-              "elfMarkLoading(" in code and "Preferences" in t,
-              "нет отметки о начатой загрузке: приложение, роняющее узел, будет ронять его "
-              "на каждом старте — плата уходит в циклическую перезагрузку")
-    ctx.check("отметка снимается после возврата",
-              re.search(r'elfMarkLoading\(""\)', code) is not None,
-              "отметка не снимается: после первой же успешной загрузки приложение будет "
-              "считаться опасным и больше не запустится")
-    ctx.check("опасное приложение пропускается",
-              re.search(r"strcmp\(elfBlocked,\s*apps\[i\]\.folder\)", code) is not None,
-              "отметка есть, а пропуска нет: плата всё равно повторит падение")
+    ctx.check(
+        "имя приложения отмечается в NVS до загрузки",
+        "elfMarkLoading(" in code and "Preferences" in t,
+        "нет отметки о начатой загрузке: приложение, роняющее узел, будет ронять его "
+        "на каждом старте — плата уходит в циклическую перезагрузку",
+    )
+    ctx.check(
+        "отметка снимается после возврата",
+        re.search(r'elfMarkLoading\(""\)', code) is not None,
+        "отметка не снимается: после первой же успешной загрузки приложение будет "
+        "считаться опасным и больше не запустится",
+    )
+    ctx.check(
+        "опасное приложение пропускается",
+        re.search(r"strcmp\(elfBlocked,\s*apps\[i\]\.folder\)", code) is not None,
+        "отметка есть, а пропуска нет: плата всё равно повторит падение",
+    )
 
 
 def apps_relative_data_only_test(ctx):
@@ -1798,50 +1981,53 @@ def apps_relative_data_only_test(ctx):
     текстовую секцию — и схему надо менять (придётся разносить код и данные по разным
     блокам), поэтому лучше узнать об этом здесь, чем по панике на плате."""
     import struct as _st
+
     apps = sorted((ctx.root / "apps").glob("*/*.elf"))
     if not apps:
         ctx.note("     SKIP apps_relative_data_only_test: собранных приложений рядом нет")
         return
-    R_XTENSA_RELATIVE = 5
+    r_xtensa_relative = 5
     for elf in apps:
         b = elf.read_bytes()
         if len(b) < 64 or b[:4] != b"\x7fELF":
             ctx.check("приложение %s читается" % elf.parent.name, False, "это не ELF")
             continue
-        e_shoff, = _st.unpack_from("<I", b, 0x20)
+        (e_shoff,) = _st.unpack_from("<I", b, 0x20)
         e_shentsize, e_shnum, e_shstrndx = _st.unpack_from("<HHH", b, 0x2E)
         secs = []
         for i in range(e_shnum):
             o = e_shoff + i * e_shentsize
             nm, typ, flags, addr, off, size = _st.unpack_from("<6I", b, o)
-            secs.append(dict(nm=nm, typ=typ, flags=flags, addr=addr, off=off, size=size))
+            secs.append({"nm": nm, "typ": typ, "flags": flags, "addr": addr, "off": off, "size": size})
         sh = secs[e_shstrndx]
         for s in secs:
             end = b.index(b"\0", sh["off"] + s["nm"])
-            s["name"] = b[sh["off"] + s["nm"]:end].decode(errors="replace")
-        text = [s for s in secs if s["flags"] & 0x4]          # SHF_EXECINSTR
+            s["name"] = b[sh["off"] + s["nm"] : end].decode(errors="replace")
+        text = [s for s in secs if s["flags"] & 0x4]  # SHF_EXECINSTR
         rela = [s for s in secs if s["name"] == ".rela.dyn"]
         if not text or not rela:
-            ctx.check("у %s есть код и релокации" % elf.parent.name, False,
-                      "нет текстовой секции или .rela.dyn")
+            ctx.check("у %s есть код и релокации" % elf.parent.name, False, "нет текстовой секции или .rela.dyn")
             continue
         tlo = min(s["addr"] for s in text)
         thi = max(s["addr"] + s["size"] for s in text)
         bad = 0
         for i in range(rela[0]["size"] // 12):
             off, info, add = _st.unpack_from("<III", b, rela[0]["off"] + i * 12)
-            if (info & 0xFF) != R_XTENSA_RELATIVE:
+            if (info & 0xFF) != r_xtensa_relative:
                 continue
             src = [s for s in secs if s["typ"] != 8 and s["addr"] <= off < s["addr"] + s["size"]]
             if not src:
                 continue
-            val, = _st.unpack_from("<I", b, src[0]["off"] + (off - src[0]["addr"]))
+            (val,) = _st.unpack_from("<I", b, src[0]["off"] + (off - src[0]["addr"]))
             if tlo <= val < thi:
                 bad += 1
-        ctx.check("%s: пересчитываемых адресов кода нет" % elf.parent.name, bad == 0,
-                  "в приложении %d адрес(ов) собственного кода хранится в данных: при "
-                  "загрузке они укажут в окно данных, и первый же вызов уронит узел "
-                  "InstructionFetchError" % bad)
+        ctx.check(
+            "%s: пересчитываемых адресов кода нет" % elf.parent.name,
+            bad == 0,
+            "в приложении %d адрес(ов) собственного кода хранится в данных: при "
+            "загрузке они укажут в окно данных, и первый же вызов уронит узел "
+            "InstructionFetchError" % bad,
+        )
 
 
 def wifi_switch_test(ctx):
@@ -1865,45 +2051,59 @@ def wifi_switch_test(ctx):
         return
     a, w, u = (f.read_text(encoding="utf-8") for f in (apps, wifi, ui))
 
-    ctx.check("выключатель радио есть в прошивочной части",
-              "void tdeckWifiSetEnabled" in w and "bool tdeckWifiEnabled" in w,
-              "радио нечем выключить: раздел сети сможет только искать и подключаться")
-    ctx.check("состояние выключателя переживает перезагрузку",
-              "Preferences" in w and re.search(r'putBool\(WIFI_NVS_KEY', w) is not None,
-              "состояние не сохраняется: выключенная сеть вернётся сама при первом же "
-              "включении платы")
-    ctx.check("выключенное радио не поднимается само",
-              re.search(r"void tdeckWifiBegin\(\)\s*\{[^}]*tdeckWifiEnabled", w) is not None,
-              "старт прошивки поднимает радио мимо выключателя")
-    ctx.check("рисование не трогает радио напрямую",
-              "tdeckWifiSetEnabled" not in a,
-              "раздел сети зовёт радио из рисования: тот же файл собирается в макет экрана "
-              "на настольной машине, где радио нет")
-    ctx.check("переключение идёт просьбой",
-              "tdeckWifiToggleRequested" in a and "tdeckWifiToggleRequested" in u,
-              "просьбы переключить нет: выключатель нарисован, а нажатие ничего не делает")
-    ctx.check("состояние выключателя приходит в кадре",
-              re.search(r"(?m)^\s*bool\s+wifiEnabled;",
-                        (ctx.root / "include" / "tdeck_ui.h").read_text(encoding="utf-8"))
-              is not None and "s->wifiEnabled" in a,
-              "рисование не видит состояния радио и покажет выключатель наугад")
-    ctx.check("включение сразу ищет сети",
-              re.search(r"tdeckWifiSetEnabled\(on\);\s*\n\s*if \(on\) tdeckWifiScan\(\)", u)
-              is not None,
-              "после включения список сетей остаётся пустым до отдельного действия")
+    ctx.check(
+        "выключатель радио есть в прошивочной части",
+        "void tdeckWifiSetEnabled" in w and "bool tdeckWifiEnabled" in w,
+        "радио нечем выключить: раздел сети сможет только искать и подключаться",
+    )
+    ctx.check(
+        "состояние выключателя переживает перезагрузку",
+        "Preferences" in w and re.search(r"putBool\(WIFI_NVS_KEY", w) is not None,
+        "состояние не сохраняется: выключенная сеть вернётся сама при первом же включении платы",
+    )
+    ctx.check(
+        "выключенное радио не поднимается само",
+        re.search(r"void tdeckWifiBegin\(\)\s*\{[^}]*tdeckWifiEnabled", w) is not None,
+        "старт прошивки поднимает радио мимо выключателя",
+    )
+    ctx.check(
+        "рисование не трогает радио напрямую",
+        "tdeckWifiSetEnabled" not in a,
+        "раздел сети зовёт радио из рисования: тот же файл собирается в макет экрана "
+        "на настольной машине, где радио нет",
+    )
+    ctx.check(
+        "переключение идёт просьбой",
+        "tdeckWifiToggleRequested" in a and "tdeckWifiToggleRequested" in u,
+        "просьбы переключить нет: выключатель нарисован, а нажатие ничего не делает",
+    )
+    ctx.check(
+        "состояние выключателя приходит в кадре",
+        re.search(r"(?m)^\s*bool\s+wifiEnabled;", (ctx.root / "include" / "tdeck_ui.h").read_text(encoding="utf-8"))
+        is not None
+        and "s->wifiEnabled" in a,
+        "рисование не видит состояния радио и покажет выключатель наугад",
+    )
+    ctx.check(
+        "включение сразу ищет сети",
+        re.search(r"tdeckWifiSetEnabled\(on\);\s*if\s*\(on\)\s*tdeckWifiScan\(\)", u) is not None,
+        "после включения список сетей остаётся пустым до отдельного действия",
+    )
 
     # Заход в раздел при живом подключении обязан показывать АДРЕС: за ним сюда и
     # заходят. Плата, подключившаяся к сохранённой сети сама, иначе не показывала его
     # вовсе — заход всегда открывал список и запускал поиск.
-    ctx.check("подключённая плата показывает адрес сразу",
-              re.search(r"lastState\.wifiState == 3 \|\| lastState\.wifiState == 2",
-                        a) is not None,
-              "заход в раздел всегда открывает список: у автоматически подключённой платы "
-              "адрес увидеть негде")
-    ctx.check("при выключенном радио поиск не запускается",
-              re.search(r"!lastState\.wifiEnabled\) return;", a) is not None,
-              "заход в раздел с выключенным радио просит поиск: искать нечем, и список "
-              "останется пустым с бесполезной надписью")
+    ctx.check(
+        "подключённая плата показывает адрес сразу",
+        re.search(r"lastState\.wifiState == 3 \|\| lastState\.wifiState == 2", a) is not None,
+        "заход в раздел всегда открывает список: у автоматически подключённой платы адрес увидеть негде",
+    )
+    ctx.check(
+        "при выключенном радио поиск не запускается",
+        re.search(r"!lastState\.wifiEnabled\)\s*return;", a) is not None,
+        "заход в раздел с выключенным радио просит поиск: искать нечем, и список "
+        "останется пустым с бесполезной надписью",
+    )
 
     # Веб-интерфейс — это открытый порт на плате. Выключили радио — он обязан закрыться,
     # и зависеть это должно от самого выключателя, а не от того, успело ли обновиться
@@ -1911,31 +2111,36 @@ def wifi_switch_test(ctx):
     web = ctx.root / "src" / "tdeck_web.cpp"
     if web.is_file():
         wt = web.read_text(encoding="utf-8")
-        ctx.check("веб-интерфейс закрывается вместе с радио",
-                  re.search(r"tdeckWifiEnabled\(\)\s*&&\s*tdeckWifiState\(\)\s*==\s*TWIFI_ONLINE",
-                            wt) is not None,
-                  "сервер держится только на состоянии подключения: при выключенном радио "
-                  "порт останется открытым, пока состояние не обновится")
-        ctx.check("остановка сервера называет причину",
-                  re.search(r"Wi-Fi выключен", wt) is not None,
-                  "в журнале не отличить «нет адреса» от «радио выключено» — а чинят их "
-                  "по-разному")
+        ctx.check(
+            "веб-интерфейс закрывается вместе с радио",
+            re.search(r"tdeckWifiEnabled\(\)\s*&&\s*tdeckWifiState\(\)\s*==\s*TWIFI_ONLINE", wt) is not None,
+            "сервер держится только на состоянии подключения: при выключенном радио "
+            "порт останется открытым, пока состояние не обновится",
+        )
+        ctx.check(
+            "остановка сервера называет причину",
+            re.search(r"Wi-Fi выключен", wt) is not None,
+            "в журнале не отличить «нет адреса» от «радио выключено» — а чинят их по-разному",
+        )
 
     # --- пароль ---
-    ctx.check("последний знак пароля показывается открытым",
-              "PASS_REVEAL_MS" in a and re.search(r"shown\[n - 1\]\s*=\s*wifiPassBuf\[n - 1\]", a)
-              is not None,
-              "пароль сразу закрывается звёздочками: на мелкой клавиатуре не видно, что "
-              "именно нажалось")
-    ctx.check("открытый знак прячется по времени, а не по событию",
-              re.search(r"millis\(\) - wifiPassCharMs\) < PASS_REVEAL_MS", a) is not None
-              and re.search(r"wifiPassCharMs != 0", a) is not None,
-              "знак прячется только на следующем нажатии: убрал руки — и он остался на "
-              "экране открытым")
-    ctx.check("кадр обновляется, когда знак прячется",
-              re.search(r"age / 100u", a) is not None,
-              "признак кадра не меняется со временем: звёздочка появится не по времени, а "
-              "по следующему событию — то есть может не появиться вовсе")
+    ctx.check(
+        "последний знак пароля показывается открытым",
+        "PASS_REVEAL_MS" in a and re.search(r"shown\[n - 1\]\s*=\s*wifiPassBuf\[n - 1\]", a) is not None,
+        "пароль сразу закрывается звёздочками: на мелкой клавиатуре не видно, что именно нажалось",
+    )
+    ctx.check(
+        "открытый знак прячется по времени, а не по событию",
+        re.search(r"millis\(\) - wifiPassCharMs\) < PASS_REVEAL_MS", a) is not None
+        and re.search(r"wifiPassCharMs != 0", a) is not None,
+        "знак прячется только на следующем нажатии: убрал руки — и он остался на экране открытым",
+    )
+    ctx.check(
+        "кадр обновляется, когда знак прячется",
+        re.search(r"age / 100u", a) is not None,
+        "признак кадра не меняется со временем: звёздочка появится не по времени, а "
+        "по следующему событию — то есть может не появиться вовсе",
+    )
 
 
 def snake_moves_test(ctx):
@@ -1953,21 +2158,24 @@ def snake_moves_test(ctx):
         ctx.note("     SKIP snake_moves_test: приложения apps/snake рядом нет")
         return
     body = ctx.grab(app, "uint32_t appFrameKey(")
-    code = "\n".join((ln if ln.find("//") < 0 else ln[:ln.find("//")])
-                      for ln in body.splitlines())
-    ctx.check("в признаке кадра есть время партии",
-              re.search(r"millis\(\)\s*/\s*stepMs", code) is not None,
-              "признак кадра не зависит от времени: ход считается в рисовании, а рисование "
-              "просят по изменению признака — игра замрёт после первого кадра")
-    ctx.check("время входит в признак только на ходу игры",
-              re.search(r"state\s*==\s*ST_PLAY", code) is not None,
-              "время в признаке и на паузе: плата будет перерисовывать неподвижный экран "
-              "по десять раз в секунду")
+    code = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in body.splitlines())
+    ctx.check(
+        "в признаке кадра есть время партии",
+        re.search(r"millis\(\)\s*/\s*stepMs", code) is not None,
+        "признак кадра не зависит от времени: ход считается в рисовании, а рисование "
+        "просят по изменению признака — игра замрёт после первого кадра",
+    )
+    ctx.check(
+        "время входит в признак только на ходу игры",
+        re.search(r"state\s*==\s*ST_PLAY", code) is not None,
+        "время в признаке и на паузе: плата будет перерисовывать неподвижный экран по десять раз в секунду",
+    )
     ms = ctx.grab(app, "uint16_t appFrameMs(")
-    ctx.check("частый кадр просится только на ходу игры",
-              re.search(r"state\s*!=\s*ST_PLAY\)\s*return 0", ms) is not None,
-              "частый кадр просится всегда: шина SPI общая с радио, и неподвижный экран "
-              "отнимал бы приём")
+    ctx.check(
+        "частый кадр просится только на ходу игры",
+        re.search(r"state\s*!=\s*ST_PLAY\)\s*return 0", ms) is not None,
+        "частый кадр просится всегда: шина SPI общая с радио, и неподвижный экран отнимал бы приём",
+    )
 
 
 def touch_calibration_test(ctx):
@@ -1989,62 +2197,79 @@ def touch_calibration_test(ctx):
         return
     i, a = inp.read_text(encoding="utf-8"), apps.read_text(encoding="utf-8")
 
-    ctx.check("оси касания — величины, а не макросы",
-              re.search(r"static uint8_t touchSwap\s*=", i) is not None
-              and re.search(r"static uint8_t touchFlipX\s*=", i) is not None,
-              "оси зашиты макросами: поправить их можно только новой сборкой и прошивкой")
+    ctx.check(
+        "оси касания — величины, а не макросы",
+        re.search(r"static uint8_t touchSwap\s*=", i) is not None
+        and re.search(r"static uint8_t touchFlipX\s*=", i) is not None,
+        "оси зашиты макросами: поправить их можно только новой сборкой и прошивкой",
+    )
     # Поворотов и зеркал мало: панель вправе сообщать координаты в СВОЁМ диапазоне, и
     # тогда ни одна из восьми раскладок не ложится — живая плата отвечала «try again» на
     # любую попытку. Поэтому считается настоящее линейное преобразование по трём точкам.
-    ctx.check("подбор считает масштаб, а не только повороты",
-              re.search(r"bool tdeckTouchCalibrate3", i) is not None
-              and re.search(r"touchKx\s*=\s*\(int16_t\)", i) is not None,
-              "подбор умеет только поворот и зеркала: панель с другим диапазоном сырых "
-              "координат так не описывается, и подбор всегда будет отвечать «ещё раз»")
-    ctx.check("поворот осей определяется ходом пальца",
-              re.search(r"abs\(dAy\) > abs\(dAx\)", i) is not None,
-              "поворот осей угадывается, а не измеряется: от первой мишени ко второй палец "
-              "идёт только по горизонтали, и этого достаточно, чтобы его узнать")
-    ctx.check("короткий ход сырых осей отвергается",
-              re.search(r"abs\(hx\) < 16 \|\| abs\(vy\) < 16", i) is not None,
-              "подбор делит на ход осей без проверки: касание мимо мишеней даст деление на "
-              "почти ноль и запишет мусор")
-    ctx.check("подобранное переживает перезагрузку",
-              re.search(r'putShort\("kx"', i) is not None
-              and re.search(r'putUChar\("aff"', i) is not None,
-              "преобразование не сохраняется: после перезагрузки экран снова не слушается "
-              "пальца")
-    ctx.check("результат сверяется на точках подбора",
-              re.search(r"return err <= 50", i) is not None,
-              "подбор принимает любой результат: касание мимо мишеней запишет заведомо "
-              "неверное преобразование, и экран станет хуже, чем был")
-    ctx.check("преобразование не выпускает палец за экран",
-              re.search(r"sx >= SCREEN_WIDTH", i) is not None,
-              "неточный подбор отправит касание за границы экрана — это промах по всем "
-              "плиткам сразу")
-    ctx.check("подбор идёт по трём точкам",
-              re.search(r"touchRx\[3\]", a) is not None
-              and re.search(r"touchTargetPos", a) is not None,
-              "точек меньше трёх: по двум диагональным углам поворот осей и зеркала "
-              "неразличимы, а масштаб не вычислить")
+    ctx.check(
+        "подбор считает масштаб, а не только повороты",
+        re.search(r"bool tdeckTouchCalibrate3", i) is not None
+        and re.search(r"touchKx\s*=\s*\(int16_t\)", i) is not None,
+        "подбор умеет только поворот и зеркала: панель с другим диапазоном сырых "
+        "координат так не описывается, и подбор всегда будет отвечать «ещё раз»",
+    )
+    ctx.check(
+        "поворот осей определяется ходом пальца",
+        re.search(r"abs\(dAy\) > abs\(dAx\)", i) is not None,
+        "поворот осей угадывается, а не измеряется: от первой мишени ко второй палец "
+        "идёт только по горизонтали, и этого достаточно, чтобы его узнать",
+    )
+    ctx.check(
+        "короткий ход сырых осей отвергается",
+        re.search(r"abs\(hx\) < 16 \|\| abs\(vy\) < 16", i) is not None,
+        "подбор делит на ход осей без проверки: касание мимо мишеней даст деление на почти ноль и запишет мусор",
+    )
+    ctx.check(
+        "подобранное переживает перезагрузку",
+        re.search(r'putShort\("kx"', i) is not None and re.search(r'putUChar\("aff"', i) is not None,
+        "преобразование не сохраняется: после перезагрузки экран снова не слушается пальца",
+    )
+    ctx.check(
+        "результат сверяется на точках подбора",
+        re.search(r"return err <= 50", i) is not None,
+        "подбор принимает любой результат: касание мимо мишеней запишет заведомо "
+        "неверное преобразование, и экран станет хуже, чем был",
+    )
+    ctx.check(
+        "преобразование не выпускает палец за экран",
+        re.search(r"sx >= SCREEN_WIDTH", i) is not None,
+        "неточный подбор отправит касание за границы экрана — это промах по всем плиткам сразу",
+    )
+    ctx.check(
+        "подбор идёт по трём точкам",
+        re.search(r"touchRx\[3\]", a) is not None and re.search(r"touchTargetPos", a) is not None,
+        "точек меньше трёх: по двум диагональным углам поворот осей и зеркала неразличимы, а масштаб не вычислить",
+    )
     # Разбор ответа панели: запись точки начинается С КООРДИНАТЫ. Живая плата сообщала
     # «6144, 11008, 9984» — ровные кратные 256, чего у настоящих координат не бывает:
     # читался старший байт X вместе с младшим байтом Y, то есть со сдвигом на байт.
-    ctx.check("координаты точки читаются с начала записи",
-              re.search(r"rx = p\[0\] \| \(p\[1\] << 8\)", i) is not None
-              and re.search(r"ry = p\[2\] \| \(p\[3\] << 8\)", i) is not None,
-              "запись точки читается со сдвигом: в координаты попадут чужие байты, и "
-              "касание будет промахиваться мимо всего")
+    ctx.check(
+        "координаты точки читаются с начала записи",
+        re.search(r"rx = p\[0\] \| \(p\[1\] << 8\)", i) is not None
+        and re.search(r"ry = p\[2\] \| \(p\[3\] << 8\)", i) is not None,
+        "запись точки читается со сдвигом: в координаты попадут чужие байты, и касание будет промахиваться мимо всего",
+    )
 
-    ctx.check("калибровка берёт СЫРЫЕ координаты",
-              "tdeckTouchLastRaw" in a,
-              "подбор считает по экранным координатам, которые сам же и должен исправить")
-    ctx.check("в настройках есть раздел касания",
-              "SET_TOUCH" in a and re.search(r'return "Touch"', a) is not None,
-              "подбор некуда вызвать: раздел в списке настроек отсутствует")
-    ctx.check("мишени стоят по осям, а не по диагонали",
-              re.search(r"x = TOUCH_TARGET_PAD;\s+y = TOUCH_TARGET_TOP", a) is not None
-              and re.search(r"x = W - TOUCH_TARGET_PAD;\s+y = TOUCH_TARGET_TOP", a) is not None
-              and re.search(r"y = H - TOUCH_TARGET_PAD", a) is not None,
-              "мишени расставлены иначе: ход пальца между первой и второй обязан быть "
-              "чисто горизонтальным, между первой и третьей — чисто вертикальным")
+    ctx.check(
+        "калибровка берёт СЫРЫЕ координаты",
+        "tdeckTouchLastRaw" in a,
+        "подбор считает по экранным координатам, которые сам же и должен исправить",
+    )
+    ctx.check(
+        "в настройках есть раздел касания",
+        "SET_TOUCH" in a and re.search(r'return "Touch"', a) is not None,
+        "подбор некуда вызвать: раздел в списке настроек отсутствует",
+    )
+    ctx.check(
+        "мишени стоят по осям, а не по диагонали",
+        re.search(r"x = TOUCH_TARGET_PAD;\s+y = TOUCH_TARGET_TOP", a) is not None
+        and re.search(r"x = W - TOUCH_TARGET_PAD;\s+y = TOUCH_TARGET_TOP", a) is not None
+        and re.search(r"y = H - TOUCH_TARGET_PAD", a) is not None,
+        "мишени расставлены иначе: ход пальца между первой и второй обязан быть "
+        "чисто горизонтальным, между первой и третьей — чисто вертикальным",
+    )
