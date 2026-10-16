@@ -2273,3 +2273,49 @@ def touch_calibration_test(ctx):
         "мишени расставлены иначе: ход пальца между первой и второй обязан быть "
         "чисто горизонтальным, между первой и третьей — чисто вертикальным",
     )
+
+
+def auto_brightness_shim_test(ctx):
+    """Числа расписания ночной яркости в подмене для предпросмотра совпадают с ядром.
+
+    host_render/shim/config.h подменяет зонтик ядра: предпросмотру нужны из config.h ровно
+    четыре константы расписания, а тащить на хост радиостек и криптографию ради них
+    незачем. Цена подмены — продублированные числа, и без этой проверки они разъедутся
+    молча: макет нарисует одно расписание, плата будет жить по другому, и расхождение
+    увидят на картинке, которой верят.
+    """
+    shim = ctx.root / "host_render" / "shim" / "config.h"
+    core = ctx.core / "include" / "config.h"
+    if not shim.is_file():
+        ctx.note("     SKIP auto_brightness_shim_test: подмены config.h в предпросмотре нет")
+        return
+    names = (
+        "AUTO_BRIGHTNESS_NIGHT_START",
+        "AUTO_BRIGHTNESS_NIGHT_END",
+        "AUTO_BRIGHTNESS_NIGHT_LEVEL",
+        "AUTO_BRIGHTNESS_CHECK_MS",
+    )
+
+    def values(path):
+        txt = path.read_text(encoding="utf-8")
+        out = {}
+        for n in names:
+            m = re.search(r"(?m)^\s*#define\s+%s\s+(\S+)" % n, txt)
+            out[n] = m.group(1) if m else None
+        return out
+
+    want, got = values(core), values(shim)
+    missing = [n for n in names if want[n] is None]
+    ctx.check(
+        "расписание ночной яркости объявлено в ядре",
+        not missing,
+        "в config.h ядра нет: %s — подмену сверять не с чем" % ", ".join(missing),
+    )
+    if missing:
+        return
+    bad = ["%s: ядро %s, подмена %s" % (n, want[n], got[n]) for n in names if want[n] != got[n]]
+    ctx.check(
+        "подмена config.h для предпросмотра совпадает с ядром",
+        not bad,
+        "разъехалось — %s; правьте host_render/shim/config.h" % "; ".join(bad),
+    )
