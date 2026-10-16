@@ -25,6 +25,7 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.flood_gap_test(ctx)
     suite_core.ota_first_burst_test(ctx)
     suite_core.ota_slow_test(ctx)
+    suite_core.ota_data_protocol_test(ctx)
     suite_core.ota_slow_recovery_test(ctx)
     suite_core.ota_slow_applied_test(ctx)
     suite_core.weak_hooks_test(ctx)

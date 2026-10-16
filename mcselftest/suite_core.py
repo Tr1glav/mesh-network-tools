@@ -4132,10 +4132,36 @@ def ota_slow_test(ctx):
     m = re.search(r"otaSlowTotal\s*=\s*(\w+)\s*;", start)
     ctx.check("медленный режим объявляет размер образа", m is not None, "в otaSlowStart нет присваивания otaSlowTotal")
     if m:
+        # Проверяется запрет, а не одно разрешённое имя. Источник размера сменился: раньше
+        # брали глобал прошивки otaImgSize, теперь — поле из заголовка груза (у .otaz и .tapp
+        # он одинаков, и в нём лежит размер РАСПАКОВАННОГО). Менять «otaImgSize» на
+        # «declared» значило бы переписывать проверку при каждом таком переносе, а ловить
+        # она должна одно: чтобы в объявление не уехала длина СЖАТОГО потока.
+        banned = {"zsize", "otaFwSize", "otaSlowZSize", "streamSize"}
         ctx.check(
             "объявляется размер РАСПАКОВАННОГО образа, а не сжатого потока",
-            m.group(1) == "otaImgSize",
+            m.group(1) not in banned,
             "otaSlowTotal = %s; сжатый размер узлу не годится — он им открывает раздел и проверяет CRC" % m.group(1),
+        )
+        # И источник не должен быть «любым числом»: размер с CRC берутся из заголовка груза,
+        # а магия сверяется — иначе в эфир уехал бы файл, который пакетом только называется.
+        # Смотрим в шов источника (otaSlowSrcOpen), а не в otaSlowStart: где именно лежит
+        # груз, знает источник, и в этом весь смысл его выделения — отправка про файлы
+        # больше не знает.
+        src_open = ctx.grab(src_path, "static bool otaSlowSrcOpen(")
+        ctx.check(
+            "размер и CRC берутся из заголовка груза, и магия сверяется",
+            "OTA_Z_HDR" in src_open and re.search(r"memcmp\s*\(\s*hdr\s*,", src_open) is not None,
+            "в otaSlowSrcOpen нет чтения OTA_Z_HDR с проверкой магии: протокол обязан брать "
+            "размер из самого груза, а не из прошивочных глобалов",
+        )
+        # Отправка не должна снова знать про файлы: это и есть «протокол передачи данных».
+        ctx.check(
+            "отправка не открывает файлы сама",
+            "LittleFS.open" not in start,
+            "в otaSlowStart вернулось LittleFS.open: источник груза обязан жить в одном "
+            "месте, иначе обратное направление (узел отдаёт ведущему) придётся вшивать "
+            "правкой самой отправки",
         )
 
     # ...и это объявление должно быть видно самому ядру: раньше otaImgSize объявлялся только
@@ -4402,10 +4428,17 @@ def ota_slow_recovery_test(ctx):
         # и забытое в сверке, превращает повтор СВОЕГО объявления в объявление чужого.
         # Берём аргументы snprintf и отбрасываем и поля через точку (otaSlowTarget.c_str()),
         # и приведения типа ((unsigned)otaSlowTotal) — нужны только голые имена.
+        # Суффиксы Tx/Rx отбрасываем: одно и то же поле сессии у отправителя и приёмника
+        # хранится в разных переменных (вид груза — otaSlowKindTx и otaSlowKindRx), и
+        # сравнивать их по имени буква в букву значило бы требовать одну переменную на две
+        # стороны. Инвариант от этого не слабеет: проверяется набор ПОЛЕЙ, а не имён.
+        def field(name):
+            return name[:-2] if name.endswith(("Tx", "Rx")) else name
+
         call = re.search(r"snprintf\s*\((.*?)\)\s*;", send, re.S)
         args = call.group(1) if call else ""
-        announced = set(re.findall(r"(?<![\w.])otaSlow\w+\b(?!\s*\.)", args))
-        compared = {b for _, b in pairs}
+        announced = {field(n) for n in re.findall(r"(?<![\w.])otaSlow\w+\b(?!\s*\.)", args)}
+        compared = {field(b) for _, b in pairs}
         ctx.check(
             "объявление несёт ровно те поля образа, что сверяет приёмник",
             bool(announced) and announced == compared,
@@ -5220,4 +5253,106 @@ def ota_screen_progress_test(ctx):
     print(
         "     сводка: экран держится на otaAnySessionActive(), счётчик пакетов один на "
         "все три экрана (две прошивки и проект платы T-Deck)"
+    )
+
+
+def ota_data_protocol_test(ctx):
+    """Mesh OTA — доставка ДАННЫХ, а не прошивки: смысл груза живёт в одном месте.
+
+    Главный инвариант модернизации: протокол везёт N байт с CRC, а что с ними делать,
+    решает приёмник по виду груза из объявления сессии. Пока это так, пакет приложения
+    едет тем же механизмом, что прошивка, — окна, подтверждения, повторы, разжатие на
+    лету и бюджеты эфира ему достаются бесплатно.
+
+    Разваливается это одним движением: достаточно позвать Update.* из общего пути приёма,
+    и протокол снова станет «доставкой прошивки», а пакет поедет в раздел флеша. Поэтому
+    проверяется не наличие вида груза, а именно запертость работы с разделом.
+    """
+    rx_path = ctx.core / "src/ota_receiver.cpp"
+    if not rx_path.is_file():
+        ctx.check("ota_receiver.cpp найден", False, str(rx_path))
+        return
+    rx = rx_path.read_text(encoding="utf-8")
+
+    # --- 1. Update.* только внутри «прошивочного» приёмника ---
+    # Границы: от первой функции приёмника потока до конца otaSinkAbort. Всё, что снаружи и
+    # трогает Update, — это протокол, полезший в раздел флеша.
+    sink_from = rx.find("static bool otaSinkBegin(")
+    sink_to = rx.find("static bool otaKindNeedsReboot(")
+    ctx.check(
+        "приёмник потока на месте",
+        sink_from >= 0 and sink_to > sink_from,
+        "в ota_receiver.cpp нет otaSinkBegin/otaKindNeedsReboot: протокол снова знает, что везёт",
+    )
+    if sink_from < 0 or sink_to <= sink_from:
+        return
+    outside = rx[:sink_from] + rx[sink_to:]
+    # Комментарии выкидываем: в них Update упоминается по делу (объяснение границы раздела).
+    outside = "\n".join((ln if ln.find("//") < 0 else ln[: ln.find("//")]) for ln in outside.splitlines())
+    stray = sorted(set(re.findall(r"\bUpdate\.\w+", outside)))
+    ctx.check(
+        "работа с разделом прошивки заперта в своём приёмнике",
+        not stray,
+        "вне otaSink* зовётся %s: протокол снова кладёт груз в раздел флеша, и пакет "
+        "приложения туда же и поедет" % ", ".join(stray),
+    )
+
+    # --- 2. Маркер платы — свойство прошивки, а не потока ---
+    sink = rx[sink_from:sink_to]
+    ctx.check(
+        "маркер платы ищется только в прошивке",
+        "fwScanFeed" in sink and "fwScanFeed" not in outside,
+        "сканер маркера платы живёт в общем пути приёма: у пакета такого маркера нет, и "
+        "проверка на нём либо врёт, либо отвергает годный груз",
+    )
+
+    # --- 3. Неизвестный вид груза — отказ, а не «считаем прошивкой» ---
+    ota_cpp = (ctx.core / "src/ota.cpp").read_text(encoding="utf-8")
+    from_wire = ctx.grab(ctx.core / "src/ota.cpp", "bool otaKindFromWire(")
+    ctx.check(
+        "вид груза разбирается в одном месте",
+        "otaKindFromWire" in ota_cpp and "otaKindWire" in ota_cpp,
+        "нет otaKindWire/otaKindFromWire: слово вида пишут два отправителя и читает приёмник, и разъехаться им нельзя",
+    )
+    # Последний выход функции — именно отказ. Проверяется он, а не наличие слова «false»
+    # где-то в теле: «считаем прошивкой по умолчанию» выглядело бы как return true в конце,
+    # и прошивка приняла бы в раздел груз неизвестного вида.
+    returns = re.findall(r"return\s+(\w+)\s*;", from_wire)
+    ctx.check(
+        "неизвестный вид груза отвергается",
+        bool(returns) and returns[-1] == "false",
+        "последний выход otaKindFromWire — return %s: на незнакомом слове вид груза нельзя "
+        "угадывать, иначе старая прошивка примет неизвестно что в раздел прошивки" % (returns[-1] if returns else "—"),
+    )
+
+    # --- 4. Быстрый режим возит только прошивку ---
+    # В нём узел уходит на FSK и глохнет ко всей сети, а кончается сессия перезагрузкой.
+    # Для прошивки это оправданная плата, для пакета в десятки килобайт — нет.
+    handle = ctx.grab(rx_path, "void otaSensorHandle(")
+    ctx.check(
+        "быстрый режим отказывает не-прошивке",
+        re.search(r"kind\s*!=\s*OTA_KIND_FIRMWARE", handle) is not None,
+        "быстрое объявление принимает любой вид груза: узел уйдёт на FSK и оглохнет ради "
+        "пакета, который спокойно доехал бы медленным режимом",
+    )
+
+    # --- 5. Успех пакета не перезагружает узел ---
+    slow_path = ctx.core / "src/ota_slow.cpp"
+    rxdata = ctx.grab(slow_path, "void otaSlowRxData(")
+    reboot_at = rxdata.find("ESP.restart()")
+    guard_at = rxdata.find("otaSlowStreamNeedsReboot()")
+    ctx.check(
+        "перезагрузка после приёма — только для прошивки",
+        guard_at >= 0 and reboot_at > guard_at,
+        "узел перезагружается после любого принятого груза: пакет уже установлен, и "
+        "перезагрузка ради него обрывает связь ни за что",
+    )
+
+    # --- 6. Повтор объявления сверяется и по виду груза ---
+    rxstart = ctx.grab(slow_path, "void otaSlowRxStart(")
+    ctx.check(
+        "повтор объявления сверяется по виду груза",
+        re.search(r"kind\s*==\s*otaSlowKindRx", rxstart) is not None,
+        "в ветке «приём уже идёт» вид груза не сверяется: объявление другого груза с тем "
+        "же размером и CRC сошло бы за повтор своего, и поток поехал бы не туда",
     )
