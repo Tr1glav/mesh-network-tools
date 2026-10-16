@@ -105,6 +105,7 @@ def run_fork(ctx):
     # Страница проверяется цепочкой: page_js_test читает web/app.js и передаёт его дальше —
     # разбор разметки, маршруты и поля /info нужны все от одного и того же текста.
     suite_fork.page_js_test(ctx)
+    suite_fork.page_app_send_test(ctx)
 
 
 def run_tdeck(ctx):
