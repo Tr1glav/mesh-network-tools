@@ -140,6 +140,7 @@ def run_tdeck(ctx):
     suite_tdeck.trackball_step_debounce_test(ctx)
     suite_tdeck.status_clock_contrast_test(ctx)
     suite_tdeck.auto_brightness_shim_test(ctx)
+    suite_tdeck.apps_rebuild_wired_test(ctx)
     suite_font.cyrillic_font_test(ctx)
 
 

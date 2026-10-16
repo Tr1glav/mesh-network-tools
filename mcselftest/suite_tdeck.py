@@ -7,6 +7,8 @@
 """
 
 import io
+import json
+import os
 import pathlib
 import re
 import shutil
@@ -34,10 +36,20 @@ def tapp_test(ctx):
             capture_output=True,
             text=True,
         )
-        out = pathlib.Path(tmp) / "calendar.tapp"
-        ctx.check("mkapp собирает пакет", r.returncode == 0 and out.exists(), (r.stdout + r.stderr).strip()[:300])
-        if not out.exists():
+        # Имя пакета несёт версию («calendar_v1.0.2.tapp»), поэтому ищем глобом, а не по
+        # прибитому имени: иначе проверка ломается на каждом бампе версии приложения.
+        made = sorted(pathlib.Path(tmp).glob("*.tapp"))
+        ctx.check("mkapp собирает пакет", r.returncode == 0 and len(made) == 1, (r.stdout + r.stderr).strip()[:300])
+        if not made:
             return
+        out = made[0]
+        want = json.loads((app / "setting.json").read_text(encoding="utf-8")).get("version")
+        ctx.check(
+            "в имени пакета есть версия",
+            out.name == "calendar_v%s.tapp" % want,
+            "пакет называется %s, а версия в setting.json — %s: по имени файла не понять, "
+            "что приехало на карту" % (out.name, want),
+        )
         blob = out.read_bytes()
         ctx.check("пакет: заголовок TAPP", blob[:4] == b"TAPP")
         size, crc = struct.unpack("<II", blob[4:12])
@@ -2319,3 +2331,90 @@ def auto_brightness_shim_test(ctx):
         not bad,
         "разъехалось — %s; правьте host_render/shim/config.h" % "; ".join(bad),
     )
+
+
+def apps_rebuild_wired_test(ctx):
+    """Приложения пересобираются вместе с прошивкой, и пакетов остаётся три последних.
+
+    Приложение связывается с прошивкой по экспортной таблице (src/tdeck_symtab.cpp), а
+    таблица живёт В ПРОШИВКЕ: правка прошивки меняет набор и адреса символов, и пакет,
+    собранный против прежней таблицы, после обновления либо не загрузится, либо уедет не
+    туда. Пока сборка была ручной, об этом узнавали на плате. Поэтому проверяется не
+    наличие скрипта, а именно проводка: пост-действие объявлено И стоит ПЕРЕД
+    copy_firmware.py — тот коммитит результат сборки, и приложения обязаны быть готовы
+    раньше, иначе в коммит уедет прошивка с пакетами от предыдущей сборки.
+    """
+    ini = (ctx.root / "platformio.ini").read_text(encoding="utf-8")
+    apps_at = ini.find("post:scripts/build_apps.py")
+    copy_at = ini.find("post:scripts/copy_firmware.py")
+    ctx.check(
+        "приложения пересобираются при сборке прошивки",
+        apps_at >= 0,
+        "в extra_scripts нет post:scripts/build_apps.py — пакеты останутся от прошлой сборки",
+    )
+    ctx.check(
+        "пересборка приложений идёт до коммита прошивки",
+        apps_at >= 0 and copy_at >= 0 and apps_at < copy_at,
+        "build_apps.py стоит после copy_firmware.py: тот уже закоммитит сборку, и в неё уедут пакеты от предыдущей",
+    )
+    script = ctx.root / "scripts" / "build_apps.py"
+    ctx.check(
+        "пост-действие приложений на месте",
+        script.is_file(),
+        "scripts/build_apps.py нет, а platformio.ini на него ссылается — сборка упадёт",
+    )
+    if script.is_file():
+        txt = script.read_text(encoding="utf-8")
+        ctx.check(
+            "неудачная сборка приложения валит сборку прошивки",
+            "env.Exit" in txt,
+            "провал приложения проходит молча: прошивка уедет с пакетом, который к ней "
+            "не подходит, и выяснится это на плате",
+        )
+        ctx.check(
+            "пересборку приложений можно выключить на разовую сборку",
+            "NOAPPS" in txt,
+            "нет аварийного выключателя: сборка прошивки с незаконченным приложением станет невозможной",
+        )
+
+    # Уборка старых пакетов — поведением, а не чтением кода: собираем пакет в пустой
+    # каталог, подкладываем заведомо старые версии и смотрим, что осталось.
+    mk = ctx.root / "scripts" / "mkapp.py"
+    app = ctx.root / "apps" / "calendar"
+    if not (mk.is_file() and (app / "setting.json").is_file()):
+        ctx.note("     SKIP уборка пакетов: нет mkapp.py или apps/calendar")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        out = pathlib.Path(tmp)
+        r = subprocess.run([sys.executable, str(mk), str(app), "-o", str(out)], capture_output=True, text=True)
+        if r.returncode != 0:
+            ctx.check("уборка пакетов: пакет собрался", False, (r.stdout + r.stderr).strip()[:300])
+            return
+        made = next(iter(out.glob("*.tapp")))
+        # Четыре «прошлых» пакета и один по старой схеме, без версии.
+        for i, ver in enumerate(("0.9.7", "0.9.8", "0.9.9", "1.0.0")):
+            old = out / ("calendar_v%s.tapp" % ver)
+            old.write_bytes(made.read_bytes())
+            os.utime(old, (1_700_000_000 + i, 1_700_000_000 + i))
+        legacy = out / "calendar.tapp"
+        legacy.write_bytes(made.read_bytes())
+
+        r = subprocess.run([sys.executable, str(mk), str(app), "-o", str(out)], capture_output=True, text=True)
+        left = sorted(p.name for p in out.glob("*.tapp"))
+        ctx.check(
+            "пакетов одного приложения остаётся три",
+            r.returncode == 0 and len(left) == 3,
+            "в каталоге осталось %d: %s — старые пакеты копятся, как копились образы "
+            "прошивки до KEEP" % (len(left), ", ".join(left)),
+        )
+        ctx.check(
+            "пакет без версии в имени убирается",
+            "calendar.tapp" not in left,
+            "остался calendar.tapp от прежней схемы: обход приложений возьмёт имя из имени "
+            "файла и увидит приложение дважды",
+        )
+        ctx.check(
+            "остаются самые свежие, а не случайные",
+            made.name in left,
+            "только что собранного пакета (%s) в каталоге нет: уборка снесла свежее вместо старого" % made.name,
+        )
