@@ -5356,3 +5356,101 @@ def ota_data_protocol_test(ctx):
         "в ветке «приём уже идёт» вид груза не сверяется: объявление другого груза с тем "
         "же размером и CRC сошло бы за повтор своего, и поток поехал бы не туда",
     )
+
+
+def ota_package_transfer_test(ctx):
+    """Пакет приложения едет тем же mesh OTA: отправка с координатора, приём на плате.
+
+    Проверяется обвязка, а не протокол (им занят ota_data_protocol_test): кто кладёт груз,
+    кто его отдаёт и кто принимает. Каждая из проверок закрывает отказ, который иначе
+    проходит молча — сессия идёт часами, и «ничего не произошло» выясняется в конце.
+    """
+    # --- Координатор: заливка пакета ---
+    web = ctx.tree / "meshcore-fork" / "lib" / "meshcore" / "src" / "web.cpp"
+    if not web.is_file():
+        ctx.note("     SKIP ota_package_transfer_test: web.cpp координатора рядом нет")
+        return
+    wtxt = web.read_text(encoding="utf-8")
+    ctx.check(
+        "координатор принимает пакет приложения",
+        "/apps/save" in wtxt and "otaHandleSaveApp" in wtxt,
+        "в web.cpp нет /apps/save: пакет на координатор не положить, и отправлять нечего",
+    )
+    save = ctx.span(web, "void otaHandleSaveApp()", "\n}\n")
+    ctx.check(
+        "заливка пакета отказывает во время медленной сессии",
+        "otaSlowOn" in save,
+        "otaHandleSaveApp не смотрит на otaSlowOn: открытие файла на запись обрежет его "
+        "под хэндлом идущей сессии, а она читает его часами",
+    )
+    ctx.check(
+        "заливка сверяет, что это пакет",
+        "TDECK_TAPP_MAGIC_WIRE" in save and "LittleFS.remove" in save,
+        "otaHandleSaveApp не проверяет магию или не убирает негодный файл: отправка потом "
+        "упрётся в него же, и причина будет не здесь",
+    )
+    ctx.check(
+        "пакет кладётся туда, откуда его берёт отправитель",
+        "OTA_SLOW_APP_FILE" in save,
+        "otaHandleSaveApp пишет не в OTA_SLOW_APP_FILE: отправитель ищет груз именно там, "
+        "и путь нельзя держать в двух местах",
+    )
+
+    # --- Координатор: запуск сессии с пакетом ---
+    start = ctx.span(web, "void otaHandleStartOta()", "\n}\n")
+    ctx.check(
+        "запуск сессии знает про вид груза",
+        "OTA_KIND_APP_WIRE" in start and "OTA_KIND_PACKAGE" in start,
+        "/ota/start не умеет kind=app: пакет отправить нечем",
+    )
+    ctx.check(
+        "пакет не пускают в быстрый режим",
+        re.search(r'sendApp\s*&&\s*otaServer\.arg\("slow"\)\s*!=\s*"1"', start) is not None,
+        "/ota/start пускает пакет в быстрый режим: узел уйдёт на FSK и оглохнет ко всей "
+        "сети, а кончится сессия перезагрузкой — ради пакета это ни к чему",
+    )
+    ctx.check(
+        "готовность прошивки не требуется для пакета",
+        re.search(r"!sendApp\s*&&\s*!otaFwReady", start) is not None,
+        "/ota/start требует otaFwReady и для пакета: без загруженной прошивки пакет "
+        "отправить было бы нельзя, хотя он к ней отношения не имеет",
+    )
+
+    # --- Плата: приём ---
+    if not harness.firmware_present(ctx.tree, "tdeck"):
+        ctx.note("     tdeck рядом нет — приёмная сторона не проверяется")
+        return
+    plat = (ctx.tree / "tdeck" / "src" / "mc_platform.cpp").read_text(encoding="utf-8")
+    # Ищем ОПРЕДЕЛЕНИЕ, а не упоминание: по подстроке переименованный хук
+    # (mcOtaDataAbortRenamed) сошёл бы за переопределённый, и вместо него тихо сработала бы
+    # слабая заглушка ядра.
+    missing = [
+        h
+        for h in ("mcOtaDataBegin", "mcOtaDataWrite", "mcOtaDataApply", "mcOtaDataAbort")
+        if re.search(r"\b%s\s*\([^)]*\)\s*\{" % h, plat) is None
+    ]
+    ctx.check(
+        "плата закрывает все хуки приёма данных",
+        not missing,
+        "не переопределены: %s — сработает слабая заглушка ядра, и сессия будет молча отвергаться" % ", ".join(missing),
+    )
+    store = (ctx.tree / "tdeck" / "src" / "tdeck_store.cpp").read_text(encoding="utf-8")
+    recv = ctx.span(ctx.tree / "tdeck" / "src" / "tdeck_store.cpp", "bool tdeckStoreRecvWrite(", "\n}\n")
+    ctx.check(
+        "принятое идёт прямо в разборщик, без второй копии на карте",
+        "tarFeed" in recv,
+        "приём пакета не отдаёт байты tarFeed: промежуточный файл означает пакет на карте "
+        "дважды, а места там ровно столько, сколько есть",
+    )
+    abort = ctx.span(ctx.tree / "tdeck" / "src" / "tdeck_store.cpp", "void tdeckStoreRecvAbort()", "\n}\n")
+    ctx.check(
+        "срыв приёма не удаляет приложение",
+        "remove" not in abort.lower(),
+        "в tdeckStoreRecvAbort есть удаление: одна неудачная попытка обновления снесла бы "
+        "РАБОЧЕЕ приложение, а это хуже неполной папки, которой всё равно нет в меню",
+    )
+    ctx.check(
+        "приём отказывается без карты",
+        "tdeckSdReady" in store,
+        "приём пакета не спрашивает про карту: ядро начнёт сессию на часы, а класть принятое будет некуда",
+    )
