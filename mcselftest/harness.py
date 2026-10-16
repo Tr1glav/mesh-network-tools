@@ -46,6 +46,17 @@ def _sig_re(signature):
     return re.sub(r"\s+", _space, pat)
 
 
+def repo_present(tree, sub):
+    """Выложен ли рядом репозиторий `sub` — по-настоящему, а не пустым каталогом.
+
+    Парная к firmware_present, но вопрос другой: проверки вроде ci_present_test смотрят и
+    на ядро с набором проверок, а platformio.ini есть только у прошивок. Признак — свой
+    .git: пустой каталог-заглушка (gitlink надстройки в CI, clone без --recursive) его не
+    имеет, и проверка честно пропускается вместо провала «у tdeck нет workflow».
+    """
+    return (tree / sub / ".git").exists()
+
+
 def firmware_present(tree, sub):
     """Лежит ли рядом прошивка `sub` — по-настоящему, а не одним пустым каталогом.
 

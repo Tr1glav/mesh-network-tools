@@ -107,7 +107,7 @@ def ci_present_test(ctx, tree):
     seen = 0
     for sub, why in want.items():
         repo = pathlib.Path(tree) / sub
-        if not repo.is_dir():
+        if not harness.repo_present(pathlib.Path(tree), sub):
             continue
         seen += 1
         snap = _snapshot_ref(repo)
@@ -368,7 +368,7 @@ def solo_tree_test(ctx, tree):
     tree = pathlib.Path(tree)
     for sub in ("meshcore-fork", "tdeck"):
         src = tree / sub
-        if not src.is_dir():
+        if not harness.firmware_present(tree, sub):
             continue  # прошивки нет рядом — проверять нечего
         with tempfile.TemporaryDirectory(prefix="solo-") as tmp:
             root = pathlib.Path(tmp)
