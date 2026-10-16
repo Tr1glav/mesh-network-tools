@@ -46,6 +46,19 @@ def _sig_re(signature):
     return re.sub(r"\s+", _space, pat)
 
 
+def firmware_present(tree, sub):
+    """Лежит ли рядом прошивка `sub` — по-настоящему, а не одним пустым каталогом.
+
+    Проверять через is_dir() нельзя. Пустой каталог прошивки появляется сам: это
+    gitlink в надстройке (её checkout в CI создаёт заглушки под все сабмодули), и он же
+    остаётся после `git clone` без --recursive. Для is_dir() такой каталог ничем не
+    отличается от настоящей прошивки, и проверка вместо честного SKIP падала с
+    FileNotFoundError на первом же чтении. Признак наличия — platformio.ini: без него
+    это не прошивка, а место, где она должна быть.
+    """
+    return (tree / sub / "platformio.ini").is_file()
+
+
 def src_search(text, fragment, pos=0):
     r"""Границы фрагмента исходника: (начало, конец) либо None.
 

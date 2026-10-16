@@ -3057,7 +3057,9 @@ def sensor_tasks_in_core_test(ctx):
     # Хук экрана обязаны закрыть обе прошивки: заглушка здесь — экран, который не гаснет.
     for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
         root = ctx.tree / sub
-        if not root.is_dir():
+        # firmware_present, а не is_dir: у пустого каталога-заглушки glob не находит ничего,
+        # и проверка решала бы, что прошивка хук не переопределяет, вместо честного пропуска.
+        if not harness.firmware_present(ctx.tree, sub):
             continue
         own = "\n".join(f.read_text(encoding="utf-8") for f in sorted((root / "src").glob("*.cpp")) if f.is_file())
         ctx.check(
@@ -3151,7 +3153,7 @@ def button_in_core_test(ctx):
 
     # --- 2. прошивка закрывает хуки и отдаёт фронт ядру ---
     fork = ctx.tree / "meshcore-fork"
-    if not fork.is_dir():
+    if not harness.firmware_present(ctx.tree, "meshcore-fork"):
         ctx.note("     meshcore-fork рядом нет — железная половина кнопки не проверяется")
     else:
         own = fork / "src" / "mc_platform.cpp"
@@ -4789,7 +4791,7 @@ def weak_hooks_test(ctx):
         # вторая просто не лежит на диске. Тогда у этой проверки для неё предмета нет — молчание
         # честнее выдуманного «OK» (так и написано в targets.py). А вот прошивка, которая
         # есть, но потеряла обе папки с исходниками, — это поломка, и о ней сказать надо.
-        if not (ctx.tree / sub).is_dir():
+        if not harness.firmware_present(ctx.tree, sub):
             ctx.note("     %s рядом нет — хуки не проверяются" % sub)
             continue
         files = _own_sources(ctx, sub)
@@ -4880,7 +4882,7 @@ def weak_hooks_test(ctx):
         "mcBatteryVoltage",
     )
     for sub in ("meshcore-fork", "tdeck"):
-        if not (ctx.tree / sub).is_dir():
+        if not harness.firmware_present(ctx.tree, sub):
             continue  # см. выше: прошивки рядом может не быть вовсе
         strong = set()
         files = _own_sources(ctx, sub)
@@ -4892,7 +4894,7 @@ def weak_hooks_test(ctx):
             "не переопределены: %s" % ", ".join(sorted(set(must) - strong)),
         )
 
-    if (ctx.tree / "meshcore-fork").is_dir() and (ctx.tree / "tdeck").is_dir():
+    if harness.firmware_present(ctx.tree, "meshcore-fork") and harness.firmware_present(ctx.tree, "tdeck"):
         print(
             "     сводка: хуков объявлено ядром %d, из них обязательных для обеих прошивок %d; "
             "закрыто форком %d, tdeck — %d"
@@ -5107,7 +5109,7 @@ def ota_screen_progress_test(ctx):
         # Прошивки рядом может не быть: CI клонирует одну прошивку рядом с ядром, и второй на
         # диске просто нет. Молчание честнее выдуманного «OK» (см. targets.py). Есть
         # прошивка, но нет в ней экрана — другое дело, об этом сказать надо.
-        if not (ctx.tree / sub).is_dir():
+        if not harness.firmware_present(ctx.tree, sub):
             ctx.note("     %s рядом нет — экран не проверяется" % sub)
             continue
         rel = "lib/meshcore/src/display.cpp"
@@ -5168,7 +5170,7 @@ def ota_screen_progress_test(ctx):
         )
 
     for sub, rel in (("meshcore-fork", "src/mc_platform.cpp"), ("tdeck", "src/mc_platform.cpp")):
-        if not (ctx.tree / sub).is_dir():
+        if not harness.firmware_present(ctx.tree, sub):
             continue  # прошивки рядом нет — см. выше
         path = ctx.tree / sub / rel
         if not path.is_file():
@@ -5197,7 +5199,7 @@ def ota_screen_progress_test(ctx):
     # T-Deck рисует прошивку проект платы, а не общий хук: там своя ячейка, и её надо проверить
     # отдельно, иначе правка пройдёт мимо.
     tdeck_dir = ctx.tree / "tdeck"
-    if not tdeck_dir.is_dir():
+    if not harness.firmware_present(ctx.tree, "tdeck"):
         ctx.note("     tdeck рядом нет — ячейка RECEIVED не проверяется")
     else:
         ui = (tdeck_dir / "src/tdeck_ui.cpp").read_text(encoding="utf-8")
