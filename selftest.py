@@ -107,10 +107,13 @@ def main():
     suite_meta.shims_test(meta, TREE)
     suite_meta.solo_tree_test(meta, TREE)
     suite_meta.ci_present_test(meta, TREE)
+    suite_meta.readme_present_test(meta, TREE)
     suite_meta.no_secrets_test(meta, TREE)
     suite_meta.pipeline_test(meta, TREE)
     suite_meta.lint_scope_test(meta, TREE)
     suite_meta.lint_suppressions_test(meta, TREE)
+    suite_meta.lint_target_version_test(meta, TREE)
+    suite_meta.tidy_target_env_test(meta, TREE)
     failures += ["набор проверок: %s" % f for f in meta.failures]
 
     for i, name in enumerate(todo):

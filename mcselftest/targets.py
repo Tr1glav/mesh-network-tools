@@ -57,6 +57,7 @@ def _core_checks(ctx, host_extra=None, pure_extra=None):
     suite_core.provision_console_budget_test(ctx)
     suite_core.flood_gap_name_test(ctx)
     suite_core.tools_ref_branch_test(ctx)
+    suite_core.core_version_test(ctx)
     suite_core.flood_tx_queue_test(ctx)
     suite_core.str_append_test(ctx)
     suite_core.hot_path_crypto_test(ctx)

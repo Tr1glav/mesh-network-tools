@@ -12,6 +12,7 @@
 не получилось бы держать внутри одного из них.
 """
 
+import json
 import pathlib
 import random
 import re
@@ -3003,6 +3004,108 @@ def tools_ref_branch_test(ctx):
         ctx.note("SKIP tools_ref_branch_test: прошивок рядом нет")
 
 
+def _semver(text):
+    """`0.23.0` или `v0.23.0` -> (0, 23, 0); всё остальное -> None."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", text.strip())
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def _core_tags(ctx):
+    """Теги версий ядра, от старшего к младшему. Пусто, если тегов рядом нет.
+
+    В CI ядра их нет вовсе: `actions/checkout` берёт один коммит без тегов. Поэтому
+    отсутствие тегов — не провал, а просто половина проверки, которую здесь не выполнить."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(ctx.core), "tag", "--list", "v*"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    vs = [v for v in (_semver(l) for l in out.stdout.splitlines() if l.strip()) if v]
+    return sorted(vs, reverse=True)
+
+
+def core_version_test(ctx):
+    """Номер в `library.json` ядра не отстаёт ни от тега, ни от пина прошивок.
+
+    У ядра три разных места, где записана его версия, и они умеют разъезжаться молча:
+    тег в git (его ставит владелец при выпуске), `core.ref` каждой прошивки (по нему CI
+    прошивки выкачивает ядро) и `"version"` в `library.json` (его читает PlatformIO и
+    печатает в журнал сборки). Ничего из этого не выводится одно из другого, и
+    расхождение не ломает сборку: 19.10.2026 ядро стояло на теге `v0.23.0`, обе прошивки
+    пинились на `v0.23.0`, а `library.json` объявлял `0.17.0` — шесть минорных назад.
+    Сборка при этом зелёная, а журнал врёт про то, какая библиотека собрана.
+
+    Проверяется неравенство, а не равенство: между выпусками ядро живёт впереди тега —
+    правка уже в `main`, номер в `library.json` поднят, тега ещё нет, и `core.ref`
+    прошивок указывает на предыдущую версию (их поднимают после тега — порядок выпуска:
+    тег ядра → `core.ref` прошивок → отправка прошивок). Запрещено ровно обратное:
+    объявленный номер НИЖЕ того, что уже выпущено или уже используется потребителем.
+
+    Выбор номера остаётся за владельцем (минорный, когда у ядра меняется состав и
+    прошивки не соберутся со старым тегом) — проверка в это не вмешивается, она только
+    не даёт номеру отстать."""
+    lib = ctx.core / "library.json"
+    if not lib.is_file():
+        ctx.note("SKIP core_version_test: library.json ядра рядом нет")
+        return
+    # Ядро рядом с прошивкой выложено по её `core.ref` — на отсоединённой голове у тега.
+    # Номер в выпущенном теге правится только следующим выпуском, и прошивка с этим не
+    # сделает ничего: провал означал бы не поломку, а возраст пина (см. harness.snapshot_ref).
+    snap = harness.snapshot_ref(ctx.core)
+    if snap:
+        ctx.note("SKIP core_version_test: ядро выложено по пину (%s) — номер правится в его ветке" % snap)
+        return
+    try:
+        data = json.loads(lib.read_text(encoding="utf-8"))
+    except ValueError as e:
+        ctx.check("library.json ядра разбирается", False, "не JSON: %s" % e)
+        return
+    raw = str(data.get("version", ""))
+    ver = _semver(raw)
+    ctx.check(
+        "library.json ядра объявляет версию X.Y.Z",
+        ver is not None,
+        "в library.json стоит %r — PlatformIO не на что сослаться" % raw,
+    )
+    if ver is None:
+        return
+    shown = ".".join(str(n) for n in ver)
+
+    tags = _core_tags(ctx)
+    if tags:
+        top = ".".join(str(n) for n in tags[0])
+        ctx.check(
+            "library.json ядра не ниже последнего тега (v%s)" % top,
+            ver >= tags[0],
+            "в library.json %s, а выпущен уже v%s: журнал сборки назовёт не ту версию" % (shown, top),
+        )
+    else:
+        ctx.note("   (тегов ядра рядом нет — сверка с тегом пропущена)")
+
+    seen = 0
+    for name, sub in (("форка", "meshcore-fork"), ("tdeck", "tdeck")):
+        f = ctx.tree / sub / "core.ref"
+        if not f.is_file():
+            continue
+        pin = _semver(f.read_text(encoding="utf-8").strip().splitlines()[0])
+        if pin is None:
+            continue  # форму core.ref проверяет tools_ref_branch_test
+        seen += 1
+        ctx.check(
+            "library.json ядра не ниже core.ref %s" % name,
+            ver >= pin,
+            "прошивка берёт ядро по v%s, а библиотека объявляет %s" % (".".join(str(n) for n in pin), shown),
+        )
+    if not seen:
+        ctx.note("   (прошивок рядом нет — сверка с core.ref пропущена)")
+
+
 def sensor_tasks_in_core_test(ctx):
     """Расписание задач узла живёт в ядре, а платформенное из него — за хуками.
 
@@ -3640,7 +3743,8 @@ def relay_policy_test(ctx):
             row = tables[name][1:]
             ctx.check(
                 "допуск %s не растёт с размером хэша" % name,
-                all(a >= b for a, b in zip(row, row[1:])),
+                # strict=False намеренно: пары соседних элементов, второй список короче на один.
+                all(a >= b for a, b in zip(row, row[1:], strict=False)),
                 "%s = %s: чем длиннее хэш, тем МЕНЬШЕ случайных совпадений, значит "
                 "допуск обязан сужаться" % (name, tables[name]),
             )

@@ -14,9 +14,11 @@
 import ast
 import contextlib
 import io
+import json
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 
 from . import harness, suite_core
@@ -43,26 +45,12 @@ def _called_names(path):
 
 
 def _snapshot_ref(repo):
-    """Если репозиторий рядом — не рабочая копия, а снимок прошлого, вернуть его описание.
+    """Снимок по пину или живая копия — см. harness.snapshot_ref.
 
-    В CI прошивки соседние репозитории выкладываются по пину: ядро — по `core.ref`, то есть
-    на отсоединённой голове у тега. Проверять по такому снимку, КАК репозиторий
-    поддерживается сегодня, нельзя, и это не теория: 1 октября 2026 CI форка покраснел на
-    проверке «mesh-network-core игнорирует .env». Правило в ядре к тому моменту стояло, но в
-    теге v0.9.0, по которому ядро и выкладывается, его ещё не было — а исправить тег форк
-    не может никак. Красный CI означал не поломку, а возраст пина.
-
-    Граница проходит по тому, что утверждает проверка: НАЙДЕННОЕ в снимке (секрет в
-    отслеживаемом файле) остаётся находкой, где бы его ни увидели; ОТСУТСТВИЕ правила
-    поддержки (строка в .gitignore, задание в workflow) про снимок ничего не говорит, и
-    такие проверки пропускаются с записью в журнал. На ветке — в рабочем дереве и в своём
-    CI репозитория — проверяется всё.
+    Обёртка осталась затем, что вопрос «снимок или рабочая копия» задают и проверки ядра
+    (номер версии в library.json), и реализация должна быть одна.
     """
-    r = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=str(repo), capture_output=True, text=True)
-    if r.returncode == 0:
-        return None  # голова на ветке — это живая копия, а не снимок
-    d = subprocess.run(["git", "describe", "--tags", "--always"], cwd=str(repo), capture_output=True, text=True)
-    return (d.stdout or "").strip() or "отсоединённая голова"
+    return harness.snapshot_ref(repo)
 
 
 def _job_block(txt, name):
@@ -128,13 +116,55 @@ def ci_present_test(ctx, tree):
         ctx.note("SKIP ci_present_test: репозиториев рядом нет")
 
 
+def readme_present_test(ctx, tree):
+    """У каждого репозитория есть README, и он не пустая заглушка.
+
+    Правило 5 требует дополнять описания вместе с кодом, но первым описанием репозитория
+    служит README — то, что человек видит, открыв его на GitHub. У `mesh-network-core` его
+    не было вовсе: единственный из четырёх, где на входе не сказано ни что это, ни как
+    собирается, при том что собрать его отдельно нельзя вообще (библиотека без
+    `platformio.ini`), и без README это выглядит как сломанный репозиторий.
+
+    Порог в 2000 байт выбран как «описание, а не отписка»: README из трёх строк формально
+    закрывает проверку на наличие файла и не отвечает ни на один вопрос читателя. У
+    существующих README размер от 3 КБ."""
+    want = {
+        "mesh-network-core": "библиотека без своей сборки: без README не видно, как её вообще собирать",
+        "mesh-network-tools": "точка входа в проверки: что запускать и как добавить свою",
+        "meshcore-fork": "прошивки Heltec: окружения, роли, выпуск",
+        "tdeck": "прошивка T-Deck: окружение, приложения, выпуск",
+    }
+    seen = 0
+    for sub, why in want.items():
+        repo = pathlib.Path(tree) / sub
+        if not harness.repo_present(pathlib.Path(tree), sub):
+            continue
+        seen += 1
+        snap = _snapshot_ref(repo)
+        if snap:
+            ctx.note("SKIP %s: выложен по пину (%s), а не рабочей копией" % (sub, snap))
+            continue
+        f = repo / "README.md"
+        if not ctx.check("у %s есть README.md" % sub, f.is_file(), "нет README.md — %s" % why):
+            continue
+        size = len(f.read_text(encoding="utf-8").encode("utf-8"))
+        ctx.check(
+            "README %s — описание, а не заглушка" % sub,
+            size >= 2000,
+            "README.md на %d байт: %s" % (size, why),
+        )
+    if not seen:
+        ctx.note("SKIP readme_present_test: репозиториев рядом нет")
+
+
 def no_secrets_test(ctx, tree):
     """Ни один репозиторий не держит у себя токен или приватный ключ.
 
-    Токен GitHub лежит в `.env` в корне рабочего дерева, а корень под git НЕ находится — туда
-    он и положен затем, чтобы физически не попасть ни в один коммит. Внутри репозитория такой
-    файл попал бы, и цена ошибки — секрет в истории публичного репозитория, откуда его уже не
-    убрать переписыванием.
+    Токен GitHub лежит в `.env` в корне рабочего дерева. Корень сам стал репозиторием
+    (публичный `mesh-network-lint`, 16.10.2026), поэтому «вне git» больше не защита: `.env`
+    держится закрытым `.gitignore` корня и убран из индекса. Внутри любого из четырёх
+    репозиториев такой файл попал бы в коммит, и цена ошибки — секрет в истории публичного
+    репозитория, откуда его уже не убрать переписыванием.
 
     Проверка ищет не конкретное значение (хранить его здесь означало бы ровно то, от чего
     защищаемся), а признаки формата: префиксы токенов GitHub и шапку приватного ключа. Смотрит
@@ -484,6 +514,200 @@ def lint_scope_test(ctx, tree):
         "в PY_DIRS нет каталогов без Python",
         not stale,
         "каталог в охвате, а .py в нём нет: " + ", ".join(stale),
+    )
+
+
+_FAKE_TARGET_CC = """#!/usr/bin/env python3
+# Поддельный целевой компилятор: отвечает ровно на те два вопроса, которые задаёт
+# tools/clang_tidy.py. Нужен затем, чтобы проверка не требовала установленного xtensa-gcc.
+import sys
+
+args = sys.argv[1:]
+inc = sys.argv[0] + ".inc"
+if "-dM" in args:
+    print("#define __XTENSA__ 1")
+    print("#define __SIZEOF_POINTER__ 4")
+    print("#define __FLT32_MAX__ 3.40282346638528859812e+38F32")
+    print("#define __GNUC__ 8")
+else:
+    sys.stderr.write("#include <...> search starts here:\\n %s\\nEnd of search list.\\n" % inc)
+"""
+
+_FAKE_HOST_CLANG = """#!/usr/bin/env python3
+# Поддельный хостовый clang: предопределений xtensa у него нет (как у настоящего), а
+# -mlongcalls он не знает (как настоящий).
+import sys
+
+args = sys.argv[1:]
+if "-dM" in args:
+    print("#define __GNUC__ 4")
+    print("#define __SIZEOF_POINTER__ 8")
+elif any(a.startswith("-mlongcalls") for a in args):
+    sys.stderr.write("error: unknown argument '-mlongcalls'\\n")
+    sys.exit(1)
+"""
+
+
+def lint_target_version_test(ctx, tree):
+    """`target-version` линтера не ниже самого старого Python, на котором код запускают.
+
+    Занижение здесь не ошибка сборки, а молчаливый запрет: ruff не предлагает идиом новее
+    указанной версии, и часть правил UP просто не срабатывает. В корне стояло `py39` при
+    Python 3.11 в CI обеих прошивок и 3.12 в CI ядра — то есть линтер судил код по
+    требованиям, которых к нему никто не предъявляет.
+
+    Сравнение идёт с самой СТАРОЙ версией из workflow: на ней код обязан работать, и
+    разрешать линтеру идиомы новее неё нельзя — CI прошивки упадёт на синтаксисе. Поэтому
+    проверка двусторонняя: занижение прячет правила, завышение ломает сборку.
+
+    MeshCore не считается: это апстрим рядом с деревом, он не наш и в линт не входит.
+    """
+    tree = pathlib.Path(tree)
+    cfg = tree / "pyproject.toml"
+    if not cfg.is_file():
+        ctx.note("SKIP lint_target_version_test: корневого pyproject.toml рядом нет")
+        return
+    m = re.search(r'(?m)^\s*target-version\s*=\s*"py(\d)(\d+)"', cfg.read_text(encoding="utf-8"))
+    if not ctx.check("pyproject объявляет target-version", m is not None, "в pyproject.toml его нет"):
+        return
+    declared = (int(m.group(1)), int(m.group(2)))
+
+    found = {}
+    for sub in ("mesh-network-core", "mesh-network-tools", "meshcore-fork", "tdeck"):
+        wf = tree / sub / ".github" / "workflows"
+        if not harness.repo_present(tree, sub) or not wf.is_dir():
+            continue
+        for f in sorted(wf.glob("*.yml")) + sorted(wf.glob("*.yaml")):
+            for ver in re.findall(r"(?m)^\s*python-version:\s*'?\"?(\d+)\.(\d+)", f.read_text(encoding="utf-8")):
+                found[(int(ver[0]), int(ver[1]))] = "%s/%s" % (sub, f.name)
+    if not found:
+        ctx.note("SKIP lint_target_version_test: workflow с python-version рядом нет")
+        return
+    oldest = min(found)
+    ctx.check(
+        "target-version совпадает с самым старым Python в CI (%d.%d)" % oldest,
+        declared == oldest,
+        "в pyproject py%d%d, а в %s стоит Python %d.%d: %s"
+        % (
+            declared[0],
+            declared[1],
+            found[oldest],
+            oldest[0],
+            oldest[1],
+            "линтер молча не предлагает новые идиомы"
+            if declared < oldest
+            else "линтер разрешит идиомы, на которых CI упадёт",
+        ),
+    )
+
+
+def tidy_target_env_test(ctx, tree):
+    """clang-tidy разбирает код как ЦЕЛЕВОЙ компилятор, а не как хостовый.
+
+    Так это было сломано, и сломано молча. Стандартные заголовки в базе компиляции не
+    перечислены — компилятор знает их сам, и у xtensa-gcc это newlib, а у clang хостовые
+    /usr/include. Разбор шёл против glibc и давал «function-like macro '__GLIBC_USE' is not
+    defined», «unknown type name '__mbstate_t'», а после десятка таких — «too many errors
+    emitted, stopping now»: НАСТОЯЩИЕ замечания в этом файле не считались вовсе, и файл при
+    этом выглядел проверенным. На полном прогоне 19.10.2026 так терялось 761 замечание.
+
+    Вторая половина той же поломки: без `-m32` указатель на хосте 8 байт, и заголовки
+    ESP-IDF ругались на приведение указателя к uint32_t; без `__XTENSA__` заголовки уходили
+    в ветку «не xtensa», где лежит `#include "../hal.h"` — файла с таким путём в этой
+    раскладке SDK нет, и разбор падал на первом же Arduino.h.
+
+    Проверка не требует ни xtensa-gcc, ни clang: оба подменяются скриптами, которые
+    отвечают на те же два вопроса (`-E -v` и `-dM -E`). Смотрим на ОЧИЩЕННУЮ базу — именно
+    её читает clang-tidy, и именно в неё должны попасть флаги цели."""
+    tree = pathlib.Path(tree)
+    script = tree / "tools" / "clang_tidy.py"
+    if not script.is_file():
+        ctx.note("SKIP tidy_target_env_test: корневого tools/clang_tidy.py рядом нет")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        proj = tmp / "proj"
+        proj.mkdir()
+        cc = tmp / "fake-target-gcc"
+        cc.write_text(_FAKE_TARGET_CC, encoding="utf-8")
+        cc.chmod(0o755)
+        sysinc = pathlib.Path(str(cc) + ".inc")  # каталог «стандартных заголовков» цели
+        sysinc.mkdir()
+        clang = tmp / "fake-host-clang"
+        clang.write_text(_FAKE_HOST_CLANG, encoding="utf-8")
+        clang.chmod(0o755)
+        (proj / "a.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+        (proj / "compile_commands.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "directory": str(proj),
+                        "file": "a.cpp",
+                        "arguments": [str(cc), "-Iinclude", "-mlongcalls", "-c", "-o", "a.o", "a.cpp"],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        out = tmp / "out"
+        run = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--project",
+                str(proj),
+                "--out",
+                str(out),
+                "--clang",
+                str(clang),
+                "--tidy",
+                str(clang),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        clean = out / "proj" / "compile_commands.json"
+        if not ctx.check(
+            "clang_tidy.py пишет очищенную базу",
+            clean.is_file(),
+            "очищенной базы нет: %s%s" % (run.stdout.strip(), run.stderr.strip()),
+        ):
+            return
+        args = json.loads(clean.read_text(encoding="utf-8"))[0]["arguments"]
+
+    ctx.check(
+        "очищенная база вырезает хостовые заголовки (-nostdinc)",
+        "-nostdinc" in args,
+        "флага нет: clang разберёт код против /usr/include и утонет в clang-diagnostic-error",
+    )
+    ctx.check(
+        "очищенная база подставляет заголовки цели (-isystem)",
+        "-isystem" in args and str(sysinc) in args,
+        "каталогов целевого компилятора нет: %s" % " ".join(args),
+    )
+    ctx.check(
+        "очищенная база учитывает разрядность цели (-m32)",
+        "-m32" in args,
+        "флага нет: указатель хоста 8 байт, и заголовки ESP-IDF дадут ошибку приведения",
+    )
+    ctx.check(
+        "очищенная база несёт опознавательные макросы цели",
+        "-D__XTENSA__" in args or "-D__XTENSA__=1" in args,
+        "макроса нет: заголовки уйдут в ветку «не xtensa» и упрутся в '../hal.h'",
+    )
+    # Числовые пределы цели подменять незачем: модель чисел у clang своя, а сломать ими
+    # разбор заголовков легко. В отбор проходят только признаки (пустое значение или 1).
+    ctx.check(
+        "числовые предопределения цели не подставляются",
+        not any(a.startswith("-D__FLT32_MAX__") for a in args),
+        "в базу уехал числовой предел: %s" % " ".join(a for a in args if a.startswith("-D__FLT")),
+    )
+    # Прежнее поведение на месте: чужие для clang флаги по-прежнему вырезаются.
+    ctx.check(
+        "чужие флаги по-прежнему вырезаются",
+        "-mlongcalls" not in args and "-c" not in args,
+        "в очищенной базе остался флаг, которого clang не понимает: %s" % " ".join(args),
     )
 
 
