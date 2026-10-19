@@ -115,6 +115,33 @@ def ci_present_test(ctx, tree):
     if not seen:
         ctx.note("SKIP ci_present_test: репозиториев рядом нет")
 
+    # Пятый репозиторий — сам корень дерева (`mesh-network-lint`), и про него забыли ровно
+    # потому, что он не в списке выше: в нём лежит линт-конвейер ВСЕГО дерева, его цели
+    # зовёт CI обеих прошивок по ветке по умолчанию и без пина, а своего прогона у него не
+    # было ни одного. То есть поломка в `Makefile` или `tools/clang_tidy.py` краснела в
+    # чужих репозиториях, а в своём не проверялась никак.
+    tree = pathlib.Path(tree)
+    if not (tree / ".git").exists() or not (tree / "Makefile").is_file():
+        ctx.note("   (корень дерева рядом не репозиторий — свой CI не проверяем)")
+        return
+    if _snapshot_ref(tree):
+        ctx.note("   (корень выложен по пину — свой CI проверяется по ветке)")
+        return
+    wf = tree / ".github" / "workflows"
+    files = sorted(wf.glob("*.yml")) + sorted(wf.glob("*.yaml")) if wf.is_dir() else []
+    if not ctx.check(
+        "у корня дерева (линт-конвейер) есть workflow",
+        bool(files),
+        "в .github/workflows нет ни одного файла: цели конвейера проверяются только чужим CI",
+    ):
+        return
+    txt = "\n".join(f.read_text(encoding="utf-8") for f in files)
+    ctx.check(
+        "CI корня гоняет линт Python своими целями",
+        "make lint-py" in txt and "make format-py-check" in txt,
+        "workflow есть, но цели make не зовёт — проверяется не тот конвейер, что у прошивок",
+    )
+
 
 def readme_present_test(ctx, tree):
     """У каждого репозитория есть README, и он не пустая заглушка.
