@@ -397,3 +397,143 @@ def solo_tree_test(ctx, tree):
                 "упали без второй прошивки на диске: %s — по правилу из targets.py "
                 "молчание честнее выдуманного «OK»" % ", ".join(solo.failures[:6]),
             )
+
+
+def _py_dirs_from_makefile(txt, var="PY_DIRS_ALL"):
+    """Каталоги из переменной охвата в корневом Makefile."""
+    m = re.search(r"(?m)^%s\s*=\s*((?:[^\n]*\\\n)*[^\n]*)" % re.escape(var), txt)
+    if not m:
+        return None
+    return {p for p in m.group(1).replace("\\", " ").split() if p}
+
+
+def lint_scope_test(ctx, tree):
+    """Линтер Python обязан смотреть на ВЕСЬ наш Python, а не на часть.
+
+    Как это было сломано: переменная PY_DIRS называлась PY_FILES, перечисляла файлы и не
+    использовалась ни одной целью — цели (`lint-py`, `format-py`, `format-py-check`)
+    перечисляли пути сами, и там стоял только `mesh-network-tools`. Снаружи это выглядело
+    благополучно: `make lint-py` печатал «All checks passed», CI обеих прошивок звал именно
+    его и был зелёным, — а `ruff check .` из корня показывал 23 замечания, все до единого в
+    скриптах сборки прошивок, которых цель не видела. Проверка ровно про это: охват
+    описан в одном месте и покрывает каждый каталог, где лежит наш .py.
+
+    Чужой Python не считается: .pio/libdeps выкачивает PlatformIO, MeshCore — апстрим рядом.
+    """
+    tree = pathlib.Path(tree)
+    mk = tree / "Makefile"
+    if not mk.is_file():
+        ctx.note("SKIP lint_scope_test: корневого Makefile рядом нет")
+        return
+    txt = mk.read_text(encoding="utf-8")
+
+    declared = _py_dirs_from_makefile(txt)
+    ctx.check(
+        "охват Python описан переменной PY_DIRS_ALL",
+        declared is not None,
+        "в Makefile нет PY_DIRS_ALL: охват снова размазан по целям, и расширить его в одном месте нельзя",
+    )
+    if declared is None:
+        return
+
+    # ruff падает с E902 на пути, которого нет, а в CI прошивки рядом лежит РОВНО ОДНА
+    # (вторая не выкачивается). Поэтому цели получают не объявленный список, а отфильтрованный
+    # по существующим каталогам — иначе сборка tdeck красная из-за meshcore-fork и наоборот.
+    ctx.check(
+        "охват отфильтрован по существующим каталогам",
+        re.search(r"(?m)^PY_DIRS\s*=\s*\$\(wildcard\s+\$\(PY_DIRS_ALL\)\)", txt) is not None,
+        "PY_DIRS не фильтруется через $(wildcard): в CI рядом одна прошивка, и ruff упадёт "
+        "с E902 на каталоге второй — у обеих прошивок красный CI",
+    )
+
+    # Цель, перечисляющая пути сама, обходит PY_DIRS — именно так охват и потерялся.
+    for target in ("lint-py", "format-py", "format-py-check"):
+        body = re.search(r"(?m)^%s:\n((?:\t[^\n]*\n)+)" % re.escape(target), txt)
+        ctx.check(
+            "цель %s есть в Makefile" % target,
+            body is not None,
+            "цель исчезла — конвейер её больше не зовёт",
+        )
+        if not body:
+            continue
+        ctx.check(
+            "цель %s берёт охват из PY_DIRS" % target,
+            "$(PY_DIRS)" in body.group(1),
+            "%s перечисляет пути сама: охват разойдётся с PY_DIRS молча" % target,
+        )
+
+    # Каждый каталог с нашим .py обязан быть в охвате. Прошивки рядом может и не быть —
+    # CI клонирует одну (см. solo_tree_test), поэтому отсутствующие каталоги пропускаются.
+    skip = ("MeshCore", ".pio", "__pycache__", ".git", ".ruff_cache")
+    missing = []
+    for path in sorted(tree.rglob("*.py")):
+        rel = path.relative_to(tree)
+        if any(part in skip for part in rel.parts):
+            continue
+        if str(rel.parent) not in declared:
+            missing.append(str(rel))
+    ctx.check(
+        "каждый наш .py лежит в каталоге из PY_DIRS",
+        not missing,
+        "вне охвата линтера: " + ", ".join(missing[:8]),
+    )
+
+    # Обратная сторона: объявлен каталог, которого нет и который ничего не покрывает.
+    stale = [d for d in sorted(declared) if (tree / d).exists() and not list((tree / d).glob("*.py"))]
+    ctx.check(
+        "в PY_DIRS нет каталогов без Python",
+        not stale,
+        "каталог в охвате, а .py в нём нет: " + ", ".join(stale),
+    )
+
+
+def lint_suppressions_test(ctx, tree):
+    """Послабления линтера адресны и не переживают файл, которому были нужны.
+
+    F821 в скриптах PlatformIO подавлен потому, что `env` и `Import` впрыскивает SCons —
+    в файле их определения нет и быть не может. Подавление сделано пофайлово в
+    pyproject.toml, а не глобально через `builtins`: глобально оно скрыло бы настоящую
+    опечатку в любом файле дерева. Опасность такого списка — он живёт дольше причины:
+    файл переименовали или F821 из него ушёл, а послабление осталось и уже прячет ошибку.
+    """
+    tree = pathlib.Path(tree)
+    cfg = tree / "pyproject.toml"
+    if not cfg.is_file():
+        ctx.note("SKIP lint_suppressions_test: pyproject.toml рядом нет")
+        return
+    txt = cfg.read_text(encoding="utf-8")
+
+    block = txt.split("[tool.ruff.lint.per-file-ignores]", 1)
+    if len(block) == 1:
+        ctx.note("SKIP lint_suppressions_test: послаблений нет — проверять нечего")
+        return
+    listed = re.findall(r'(?m)^"([^"]+)"\s*=\s*\[([^\]]*)\]', block[1])
+    ctx.check("послабления разобрались", bool(listed), "секция per-file-ignores есть, а записей в ней нет")
+
+    # Глобального подавления быть не должно: оно и есть то, чего список избегает.
+    ctx.check(
+        "F821 не подавлен глобально",
+        not re.search(r"(?m)^\s*builtins\s*=", txt) and '"*" = ' not in block[1],
+        "F821 выключен глобально — настоящая опечатка в любом файле станет невидимой",
+    )
+
+    for name, codes in listed:
+        path = tree / name
+        # Прошивки рядом может не быть: CI клонирует одну.
+        top = name.split("/", 1)[0]
+        if not (tree / top).exists():
+            continue
+        ctx.check(
+            "послабление указывает на существующий файл (%s)" % name,
+            path.is_file(),
+            "в per-file-ignores путь, которого нет: послабление мёртвое, а выглядит живым",
+        )
+        if not path.is_file():
+            continue
+        # Послабление без причины — повод его снять, иначе список растёт и прячет ошибки.
+        if "F821" in codes:
+            ctx.check(
+                "послаблению F821 есть причина (%s)" % name,
+                "Import(" in path.read_text(encoding="utf-8"),
+                "F821 подавлен, а SCons-впрыска (Import) в файле нет — послабление лишнее",
+            )
