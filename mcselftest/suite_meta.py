@@ -519,9 +519,14 @@ def lint_suppressions_test(ctx, tree):
 
     for name, codes in listed:
         path = tree / name
-        # Прошивки рядом может не быть: CI клонирует одну.
-        top = name.split("/", 1)[0]
-        if not (tree / top).exists():
+        # Прошивки рядом может не быть: CI клонирует одну. Но проверять через exists()
+        # нельзя — пустой каталог прошивки появляется САМ: это gitlink надстройки, и её
+        # checkout в CI создаёт заглушки под ВСЕ сабмодули (та же ловушка расписана в
+        # harness.firmware_present). Для exists() заглушка не отличается от настоящей
+        # прошивки, и проверка падала в CI форка на послаблениях tdeck: каталог есть,
+        # файлов в нём нет. Признак — непустота: заглушка пуста, прошивка нет.
+        top = tree / name.split("/", 1)[0]
+        if not top.is_dir() or next(top.iterdir(), None) is None:
             continue
         ctx.check(
             "послабление указывает на существующий файл (%s)" % name,
